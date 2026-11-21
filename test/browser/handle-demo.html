@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>wland handle demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #15171c; color: #d8dbe2; font: 13px/1.4 ui-monospace, monospace; }
+  body { display: flex; }
+  #panel { width: 340px; flex: none; padding: 12px 14px; box-sizing: border-box; overflow: auto; border-right: 1px solid #2a2e38; }
+  #panel h1 { font-size: 14px; margin: 0 0 4px; }
+  #panel p { margin: 0 0 10px; color: #8a90a0; }
+  #panel pre { margin: 8px 0; white-space: pre-wrap; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .row span { width: 64px; color: #8a90a0; }
+  button { background: #252934; color: inherit; border: 1px solid #3a4050; border-radius: 4px; padding: 2px 8px; font: inherit; cursor: pointer; }
+  button.on { background: #3d6cd9; border-color: #3d6cd9; color: #fff; }
+  .good { color: #6cd98a; } .bad { color: #ff6b5e; }
+  #violations { color: #ff6b5e; padding-left: 18px; margin: 4px 0; }
+  /* the wland container: windows are absolutely positioned in here, and its
+     client size is the output size the apps see */
+  #desktop { position: relative; flex: 1; overflow: hidden;
+             background: radial-gradient(circle at 30% 20%, #2b3242, #15171c 70%); }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>wland handle demo</h1>
+  <p>Link v2 handle path in one page: synthetic Wayland clients, a JS relay, kwshm-style
+     buffer handles, the wland engine and view. No server.</p>
+  <div class="row"><span>webgl</span><div id="opt-webgl"></div></div>
+  <div class="row"><span>async</span><div id="opt-async"></div></div>
+  <div class="row"><span>link</span><div id="opt-link"></div></div>
+  <div class="row"><span>gpu</span><div id="opt-gpu"></div></div>
+  <div class="row"><span></span><button id="spawn">add window</button></div>
+  <pre id="stats"></pre>
+  <div>violations: <b id="violation-count">0</b></div>
+  <ul id="violations"></ul>
+  <p>Click a window, type, move it by its title bar, resize it by the bottom-right grip,
+     toggle maximize (green) or close it (red).</p>
+</div>
+<div id="desktop"></div>
+<script type="module" src="/handle-demo.js"></script>
+</body>
+</html>

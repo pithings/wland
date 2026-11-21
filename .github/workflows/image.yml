@@ -1,0 +1,142 @@
+# Image: build the demo container image (docker/Dockerfile: wlandr, its page,
+# chromium and pcmanfm) for linux/amd64 and linux/arm64 and push it to
+# ghcr.io/<owner>/<repo>.
+#
+# Runs only by hand, from main (Actions > Image > Run workflow). Tags:
+#   <package.json version>-<YYMMDD>-<commit>   the release workflow's scheme
+#   latest
+# plus one per-arch tag (<version>-amd64, <version>-arm64) that the two
+# multi-arch tags point at. Unchecking "publish" makes it a dry run: both
+# images are built, nothing is pushed.
+#
+# Each arch builds on its own native runner (no QEMU: the final stage runs
+# apt for the target arch), with the runner's docker and nothing else; the
+# last job joins the two into one multi-arch tag. Re-runnable: a run for the
+# same commit pushes the same tags again.
+name: Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push to ghcr.io as <version>-<YYMMDD>-<commit> and latest (unchecked = dry run, build only)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Check the ref and pick the version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.version.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: version
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] ||
+            { echo "::error::the image is built only from main, not $GITHUB_REF"; exit 1; }
+          base="$(jq -r .version package.json)"
+          date="$(TZ=UTC git show -s --date=format-local:%y%m%d --format=%cd "$GITHUB_SHA")"
+          version="$base-$date-${GITHUB_SHA::7}"
+          # a docker tag: [A-Za-z0-9_.-], at most 128 characters (the arch suffix included)
+          [[ "$version-arm64" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
+            { echo "::error::$version is not usable as an image tag"; exit 1; }
+          {
+            echo "version=$version"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" # image names are lowercase
+          } >> "$GITHUB_OUTPUT"
+          echo "ok: $GITHUB_SHA → ghcr.io/${GITHUB_REPOSITORY,,}:$version"
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ needs.version.outputs.image }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The source label is what links the ghcr package to this repository.
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker build -f docker/Dockerfile -t "$TAG" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            .
+          docker image inspect "$TAG" --format '{{.Os}}/{{.Architecture}} {{.Size}} bytes'
+
+      # What a user's first run does: the relay comes up and serves the page.
+      - name: Smoke test
+        run: |
+          docker run -d --name wland -p 127.0.0.1:8080:8080 "$TAG"
+          for i in $(seq 50); do
+            curl -fsS -o /dev/null http://127.0.0.1:8080/ && break
+            [ "$i" -lt 50 ] || { docker logs wland; echo "::error::the page was not served"; exit 1; }
+            sleep 0.2
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8080/wland.wasm
+          docker logs wland
+          docker stop -t 10 wland
+
+      - name: Push
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$TAG"
+
+  manifest:
+    name: Publish the multi-arch tags
+    needs: [version, build]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    env:
+      IMAGE: ${{ needs.version.outputs.image }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Join the per-arch images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          echo "published $IMAGE:$VERSION and $IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"

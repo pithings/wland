@@ -1,0 +1,1217 @@
+// Browser E2E: every check that needs a real browser, driven over CDP against
+// the pages in test/browser (wland/client in a bare document; `build <dir>`
+// bundles them into a web root). One phase per run; tools/run-poc.sh builds
+// the pages, starts the server, chromium and the apps, and calls the phases
+// in order.
+//
+//   bun tools/browser-e2e.ts <phase> [cdp_port=9222] [args...]
+//
+// These cover the browser surface only: lib/view.ts, present.ts, input.ts,
+// wm.ts and client.ts. What an app does through the compositor is checked
+// without a browser, by tools/headless-e2e-test.ts. Run them when that surface changed (see
+// .agents/testing.md "What to run"); core, relay and engine behaviour is
+// covered without a browser (zig build test, node --test, relay-e2e-test).
+//
+// The apps are test/support/apps.ts's: wland-fixture modes by default
+// (`term` for foot, `files` for nautilus, `cursor` for weston-flower,
+// `constraints` for weston-constraints), the real ones with
+// WLAND_E2E_APPS=real. run-poc starts them from the same table.
+//
+// Phases (the app each expects is run-poc's to start, unless noted):
+//   terminal     foot: typed keys (KeyboardEvent → evdev) render glyphs
+//   sweep        any toplevel: pointer sweep, clicks, wheel; motion coalescing;
+//                a drag out of the window keeps the pressed surface (implicit grab)
+//   layout       foot: CSD subsurfaces assembled around the grid
+//   resize       any toplevel: drag the app's own resize border
+//   hole         foot + a second term over it (Alt+dragged: the box captures)
+//                with a border-only input region: a click in the hole reaches
+//                the term behind (focus, raise); the border and the
+//                fullscreen backdrop keep theirs
+//   cursor       weston-flower: its cursor surface is the CSS cursor
+//                (set_cursor, no cursor-shape); drawn as an element it
+//                follows the pointer and takes no input; leaving resets it
+//   constraints  weston-constraints (spawned with WAYLAND_DEBUG, read back):
+//                a press confines to its subsurface and a drag out keeps the
+//                motion clamped (pointer capture); the next press locks — the
+//                browser grants Pointer Lock, relative motion only — and an
+//                exit the page didn't ask for reaches the app as unlocked
+//   dnd          fixture `files` only: its file dragged onto its folder (the
+//                browser's pointer → wm dnd → wl_data_device) arrives
+//   gtk          nautilus: popup opens, outside click dismisses, navigation
+//   csd          nautilus: headerbar drag moves, maximize and restore buttons
+//   states       ?browserfs=1, spawns foot: Alt+F11 fills the desktop and
+//                takes the browser's fullscreen, leaving that ends foot's;
+//                Alt+F9 hides it, windows()[0].raise() restores it focused
+//   retina       dpr 2 → 2x buffers shown at logical size (spawns foot)
+//   takeover     the first tab after a second connected: notice, no reload
+//   webgl        forced GL present path, software GL at dpr 1 (spawns foot)
+//   handle-demo [origin]   /handle-demo.html: link v2 handle path in one page
+// Drivers, for exploring by hand (tools/dnd-test.sh uses `drag`):
+//   drag x1 y1 x2 y2   slow drag, px relative to nautilus's main canvas
+//   shot <file.png>    page screenshot      log [grep]   window.wlandLog tail
+
+import { app as appFor, type AppRole } from "../test/support/apps.ts";
+
+const [phase = "", cdpPort = "9222", ...args] = process.argv.slice(2);
+
+/** Start the app for `role` (fixture or real, test/support/apps.ts). */
+function spawnApp(role: AppRole, opts: { env?: Record<string, string>; stderr?: "pipe" | "ignore" } = {}) {
+  const a = appFor(role);
+  return Bun.spawn([a.cmd, ...a.args], { stdout: "ignore", stderr: opts.stderr ?? "ignore", env: { ...process.env, ...a.env, ...opts.env } });
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function fail(msg: string): never {
+  console.error(`${phase} FAIL: ${msg}`);
+  process.exit(1);
+}
+
+// --- CDP -------------------------------------------------------------------
+
+async function cdpTarget(): Promise<string> {
+  for (let i = 0; i < 50; i++) {
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json();
+      const pages = list.filter((t: any) => t.type === "page");
+      // handle-demo with an explicit origin takes any tab (it navigates it)
+      const page = pages.find((t: any) => t.url.includes("127.0.0.1")) ??
+        (phase === "handle-demo" && args[0] ? pages[0] : undefined);
+      if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
+    } catch {}
+    await sleep(200);
+  }
+  throw new Error("no CDP page target found");
+}
+
+let ws!: WebSocket;
+let nextId = 1;
+const pending = new Map<number, (v: any) => void>();
+
+async function connect() {
+  ws = new WebSocket(await cdpTarget());
+  await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(String(ev.data));
+    if (msg.id && pending.has(msg.id)) { pending.get(msg.id)!(msg); pending.delete(msg.id); }
+  };
+}
+
+// a hung renderer (software GL in headless) makes Runtime.evaluate never
+// return — race a timeout so it fails loudly instead of hanging
+function call(method: string, params: any = {}, tmo = 12000): Promise<any> {
+  const id = nextId++;
+  ws.send(JSON.stringify({ id, method, params }));
+  return Promise.race([
+    new Promise<any>((r) => pending.set(id, r)),
+    new Promise<any>((r) => setTimeout(() => r({ __timeout: true }), tmo)),
+  ]);
+}
+
+async function evalJs(expr: string): Promise<any> {
+  const r = await call("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true });
+  if (r.__timeout) fail(`renderer hung evaluating: ${expr.slice(0, 80)}`);
+  if (r.result?.exceptionDetails) fail(`page exception: ${JSON.stringify(r.result.exceptionDetails).slice(0, 400)}`);
+  return r.result?.result?.value;
+}
+
+const mouse = (type: string, x: number, y: number, more: any = {}) =>
+  call("Input.dispatchMouseEvent", { type, x, y, ...more });
+
+/** Move there, press and release the left button. `up` is the `buttons`
+ *  value on release (CDP callers disagree; apps don't care). */
+async function click(x: number, y: number, settle = 0, up = 0) {
+  await mouse("mouseMoved", x, y);
+  if (settle) await sleep(settle);
+  await mouse("mousePressed", x, y, { button: "left", buttons: 1, clickCount: 1 });
+  if (settle) await sleep(60);
+  await mouse("mouseReleased", x, y, { button: "left", buttons: up, clickCount: 1 });
+}
+
+/** Press at `from`, move to `to` in `steps`, release there. */
+async function drag(from: [number, number], to: [number, number], steps: number, pace: number, up = 1) {
+  await mouse("mousePressed", from[0], from[1], { button: "left", buttons: 1, clickCount: 1 });
+  for (let i = 1; i <= steps; i++) {
+    await mouse("mouseMoved", from[0] + ((to[0] - from[0]) * i) / steps, from[1] + ((to[1] - from[1]) * i) / steps,
+      { button: "left", buttons: 1 });
+    await sleep(pace);
+  }
+  await mouse("mouseReleased", to[0], to[1], { button: "left", buttons: up, clickCount: 1 });
+}
+
+async function key(k: string, code: string, text?: string) {
+  await call("Input.dispatchKeyEvent", { type: "keyDown", key: k, code, text });
+  await call("Input.dispatchKeyEvent", { type: "keyUp", key: k, code });
+}
+
+// --- page-side probes ------------------------------------------------------
+
+// the largest visible canvas: an app's main plane (CSD borders are small)
+const MAIN = `(() => {
+  const cs = [...document.querySelectorAll('#desktop canvas')].filter(c => c.style.display !== 'none');
+  return cs.length ? cs.reduce((a, b) => (a.width * a.height >= b.width * b.height ? a : b)) : null;
+})()`;
+
+interface Sample {
+  key: string; w: number; h: number; cssW: number; cssH: number;
+  /** viewport rect */
+  x: number; y: number; cw: number; ch: number;
+  /** checksum of every pixel, and how many are not near-black */
+  sum: number; colored: number;
+}
+
+/** The main canvas: geometry and a 2D readback (null: none shown yet). */
+const sample = (): Promise<Sample | null> => evalJs(`(() => {
+  const c = ${MAIN};
+  if (!c) return null;
+  const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+  let sum = 0, colored = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    sum = (sum * 31 + d[i] + d[i+1] * 7 + d[i+2] * 13) >>> 0;
+    if (d[i] + d[i+1] + d[i+2] > 30) colored++;
+  }
+  const r = c.getBoundingClientRect();
+  return { key: c.dataset.wland, w: c.width, h: c.height,
+           cssW: parseFloat(c.style.width), cssH: parseFloat(c.style.height),
+           x: r.left, y: r.top, cw: r.width, ch: r.height, sum, colored };
+})()`);
+
+async function waitMain(tries = 75): Promise<Sample> {
+  for (let i = 0; i < tries; i++) {
+    await sleep(200);
+    const s = await sample();
+    if (s) return s;
+  }
+  return fail("no canvas appeared");
+}
+
+/** nautilus's main canvas key (the first canvas at least `minWidth` wide). */
+async function waitWide(minWidth: number): Promise<string> {
+  for (let i = 0; i < 100; i++) {
+    await sleep(200);
+    const k = await evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const c = [...document.querySelectorAll('#desktop canvas')].find(c => c.width >= ${minWidth});
+      return c ? c.dataset.wland : "";
+    })()`);
+    if (k) return k;
+  }
+  return fail("nautilus canvas never appeared");
+}
+
+async function waitOnline() {
+  for (let i = 0; i < 75; i++) {
+    if (await evalJs("!!(window.wlandStatus && window.wlandStatus.websocket === true)")) return;
+    await sleep(200);
+  }
+  fail("page did not come online");
+}
+
+const tag = (s: Sample) => `${s.w}x${s.h}:${s.sum}:${s.colored}`;
+
+// --- phases ----------------------------------------------------------------
+
+const phases: Record<string, () => Promise<void>> = {
+  // M4: `echo hi` + Enter through Input.dispatchKeyEvent; the terminal's
+  // pixels must change at each step
+  async terminal() {
+    await waitMain();
+    await sleep(1500); // let the prompt settle
+    // preventScroll: viewport-relative CDP coordinates must stay valid
+    // (programmatic focus scrolls by default)
+    await evalJs(`(() => { window.scrollTo(0, 0); ${MAIN}.focus({ preventScroll: true }); })()`);
+    const before = (await sample())!;
+    console.log(`before: ${tag(before)}`);
+    const CODES: Record<string, string> = { e: "KeyE", c: "KeyC", h: "KeyH", o: "KeyO", i: "KeyI", " ": "Space" };
+    for (const ch of "echo hi") {
+      await key(ch, CODES[ch]!, ch);
+      await sleep(50);
+    }
+    await sleep(700);
+    const typed = (await sample())!;
+    console.log(`typed:  ${tag(typed)}`);
+    await key("Enter", "Enter", "\r");
+    await sleep(1000);
+    const after = (await sample())!;
+    console.log(`after:  ${tag(after)}`);
+    if (typed.sum === before.sum) fail("typing did not change the terminal");
+    if (after.sum === typed.sum) fail("enter did not change the terminal");
+    console.log("terminal ok: typing renders");
+  },
+
+  // M7.4, and the check for input changes: many fast moves, left/right
+  // click, wheel. The app must survive, and no more motions may ship than
+  // raw pointermoves arrived.
+  async sweep() {
+    await evalJs(`(() => { const c = ${MAIN}; if (c) c.scrollIntoView({ block: 'center', inline: 'center' }); })()`);
+    const rect = (await sample()) ?? fail("no canvas to sweep");
+    console.log(`sweeping ${rect.cw}x${rect.ch} at (${rect.x},${rect.y}); stats before: ${await evalJs("JSON.stringify(window.wland.engine.stats)")}`);
+    // 3 rows × 40 moves, fired WITHOUT awaiting each ack — awaiting round-trips
+    // paces the events slower than rAF and defeats coalescing (measured: 1 move
+    // per frame). A burst is also what real high-rate mice deliver.
+    for (const fy of [0.25, 0.5, 0.75]) {
+      const acks: Promise<any>[] = [];
+      for (let i = 0; i <= 40; i++) acks.push(mouse("mouseMoved", rect.x + (rect.cw * i) / 40, rect.y + rect.ch * fy));
+      await Promise.all(acks);
+      await sleep(100);
+    }
+    const cx = rect.x + rect.cw / 2, cy = rect.y + rect.ch / 2;
+    const press = (x: number, y: number, button: string, buttons: number) =>
+      mouse("mousePressed", x, y, { button, buttons, clickCount: 1 })
+        .then(() => mouse("mouseReleased", x, y, { button, buttons, clickCount: 1 }));
+    await press(cx, cy, "left", 1);
+    await sleep(300);
+    // right click (may open a menu popup), then an outside click to dismiss
+    await press(cx, cy, "right", 2);
+    await sleep(700);
+    await press(rect.x + 5, rect.y + 5, "left", 1);
+    await sleep(300);
+    await mouse("mouseWheel", cx, cy, { deltaX: 0, deltaY: 120 });
+    await mouse("mouseWheel", cx, cy, { deltaX: 0, deltaY: -120 });
+    await sleep(500);
+
+    const stats = await evalJs("window.wland.engine.stats");
+    console.log(`stats after: ${JSON.stringify(stats)}`);
+    const alive = await sample();
+    // Chromium itself coalesces pointermove to ≤1/frame (123 dispatched
+    // events yielded 11 pointermoves), so huge raw counts are impossible here;
+    // our rAF flush is the structural cap + backpressure gate on top.
+    if (stats.motions < 6) fail(`sweep barely hit the canvas (motions=${stats.motions})`);
+    if (stats.sentMotions < 1) fail("no motions shipped at all");
+    if (stats.sentMotions > stats.motions) fail("more motions shipped than raw moves?!");
+    if (!alive || alive.colored < 100) fail(`canvas blank/dead after sweep (colored=${alive?.colored})`);
+    console.log(`sweep ok: app survived; ${stats.motions} raw moves → ${stats.sentMotions} shipped motions, ${stats.backpressured} backpressured`);
+
+    // the implicit grab (pointer capture): a press, then a drag out of the
+    // window keeps the pointer on the pressed surface — motion in its local
+    // px past its edge, no leave — until the release, which brings the leave
+    await evalJs(`(() => {
+      const e = window.wland.engine, seen = window.grabSeen = [];
+      for (const name of ['pointerLeave', 'pointerEnter', 'pointerMotion', 'pointerButton']) {
+        const orig = e[name];
+        e['_' + name] = orig;
+        e[name] = (...a) => { seen.push([name, ...a]); return orig(...a); };
+      }
+    })()`);
+    const outX = rect.x + rect.cw + 60, outY = rect.y + rect.ch / 2;
+    await mouse("mouseMoved", cx, cy);
+    await sleep(100);
+    await drag([cx, cy], [outX, outY], 6, 40);
+    await sleep(300);
+    const seen: any[][] = await evalJs(`(() => {
+      const e = window.wland.engine;
+      for (const name of ['pointerLeave', 'pointerEnter', 'pointerMotion', 'pointerButton']) e[name] = e['_' + name];
+      return window.grabSeen;
+    })()`);
+    const up = seen.findIndex((c) => c[0] === "pointerButton" && c[4] === false);
+    const before = up < 0 ? seen : seen.slice(0, up);
+    console.log(`drag out: ${seen.map((c) => c[0] === "pointerMotion" ? `motion(${Math.round(c[3])})` : c[0]).join(" ")}`);
+    if (up < 0) fail("the release did not reach the pressed surface");
+    if (before.some((c) => c[0] === "pointerLeave" || c[0] === "pointerEnter")) fail("the pointer left the pressed surface while the button was held");
+    if (!before.some((c) => c[0] === "pointerMotion" && c[3] > rect.cw)) fail("no motion past the surface's edge while the button was held");
+    if (!seen.slice(up).some((c) => c[0] === "pointerLeave")) fail("no leave after the release outside the window");
+    console.log("implicit grab ok: a held button keeps the pressed surface; the leave comes with the release");
+  },
+
+  // M5: foot's CSD subsurfaces sit around the main grid (titlebar above,
+  // borders around) inside one window element — not stacked
+  async layout() {
+    const read = async (): Promise<any[]> => JSON.parse(await evalJs(`JSON.stringify(
+      [...document.querySelectorAll('#desktop .wland-window')].map(box => ({
+        canvases: [...box.querySelectorAll('canvas')].map(c => {
+          const r = c.getBoundingClientRect();
+          return { w: c.width, h: c.height, left: r.left, top: r.top, right: r.right, bottom: r.bottom,
+                   visible: c.style.display !== 'none' };
+        }),
+      })))`));
+    // wait until a window holds foot's full canvas set (grid + decorations)
+    let windows: any[] = [];
+    for (let i = 0; i < 75; i++) {
+      await sleep(200);
+      windows = await read();
+      if (windows.some((w) => w.canvases.length >= 5)) break;
+    }
+    const win = windows.find((w) => w.canvases.length >= 5) ?? fail(`no assembled window found: ${JSON.stringify(windows)}`);
+    const visible = win.canvases.filter((c: any) => c.visible);
+    const grid = visible.reduce((a: any, b: any) => (a.w * a.h >= b.w * b.h ? a : b));
+    // titlebar: a wide and short canvas that is not the grid
+    const titlebar = visible.find((c: any) => c !== grid && c.w > 4 * c.h && c.w > grid.w * 0.8) ??
+      fail("no titlebar-shaped canvas found");
+    console.log(`grid: ${grid.w}x${grid.h} at (${grid.left},${grid.top})`);
+    console.log(`titlebar: ${titlebar.w}x${titlebar.h} at (${titlebar.left},${titlebar.top})`);
+    if (!(titlebar.bottom <= grid.top + 2)) fail("titlebar is not above the grid — still stacked?");
+    const overlap = Math.min(titlebar.right, grid.right) - Math.max(titlebar.left, grid.left);
+    if (overlap < grid.w * 0.5) fail("titlebar does not horizontally overlap the grid");
+    // every decoration within a sane bounding box of the grid (±64px)
+    for (const c of visible) {
+      if (c.left < grid.left - 64 || c.top < grid.top - 64 || c.right > grid.right + 64 || c.bottom > grid.bottom + 64) {
+        fail(`canvas ${c.w}x${c.h} at (${c.left},${c.top}) is far from the window`);
+      }
+    }
+    console.log("layout ok: CSD assembled around the grid");
+  },
+
+  // wl_pointer.set_cursor with a surface (weston's toytoolkit, as older
+  // toolkits and X apps through satellite do): hovering the app, its window
+  // element's CSS cursor is that surface's buffer as an image-set data URL
+  // with the hotspot. The element fallback (images CSS can't show) is
+  // forced by replaying the event with a hotspot off the image.
+  async cursor() {
+    await evalJs(`(() => { window.scrollTo(0, 0); window.wlandCursor = undefined; })()`);
+    const s = await waitMain();
+    const cx = Math.round(s.x + s.cw / 2), cy = Math.round(s.y + s.ch / 2);
+    for (const d of [-6, -3, 0]) { await mouse("mouseMoved", cx + d, cy + d); await sleep(50); }
+    const css = `(${MAIN}).closest('.wland-window').style.cursor`;
+    let cursor = "";
+    for (let i = 0; i < 50 && !/image-set\(url\("data:image\/png/.test(cursor); i++) {
+      await sleep(100);
+      cursor = await evalJs(css);
+    }
+    const m = /image-set\(url\("([^"]+)"\) ([\d.]+)x\) (-?\d+) (-?\d+), /.exec(cursor) ??
+      fail(`no cursor image on the window: "${cursor.slice(0, 120)}"`);
+    const [, url, scale, hx, hy] = m;
+    const img = await evalJs(`(async () => {
+      const i = new Image();
+      i.src = ${JSON.stringify(url)};
+      await i.decode();
+      const c = document.createElement('canvas');
+      c.width = i.naturalWidth; c.height = i.naturalHeight;
+      const g = c.getContext('2d');
+      g.drawImage(i, 0, 0);
+      const d = g.getImageData(0, 0, c.width, c.height).data;
+      let opaque = 0;
+      for (let k = 3; k < d.length; k += 4) if (d[k] > 128) opaque++;
+      return { w: i.naturalWidth, h: i.naturalHeight, opaque };
+    })()`);
+    console.log(`cursor image ${img.w}x${img.h} at ${scale}x, hotspot ${hx},${hy}, ${img.opaque} opaque px`);
+    if (!(img.w > 0 && img.opaque > 10)) fail("the cursor image is empty");
+    if (!(+hx >= 0 && +hy >= 0 && +hx < img.w / +scale && +hy < img.h / +scale)) fail("hotspot outside the image");
+    const ev = await evalJs("window.wlandCursor");
+    if (!ev || !ev.surface || ev.hotspotX !== +hx || ev.hotspotY !== +hy) fail(`cursor event ${JSON.stringify(ev)}`);
+    // (through surfaceOf: the target may be an input region's hit element)
+    const hit = `window.wland.view.surfaceOf(document.elementFromPoint(X, Y))?.surface`;
+    const main = await evalJs(`window.wland.view.surfaceOf(${MAIN}).surface`);
+    if (await evalJs(hit.replace("X", String(cx)).replace("Y", String(cy))) !== main) fail("the cursor surface took the pointer");
+
+    // the element fallback: a hotspot CSS can't take puts the cursor canvas
+    // at the pointer, with cursor: none, and the app keeps the hit-testing
+    await evalJs(`window.wland.view.handle({ ...window.wlandCursor, hotspotX: -4, hotspotY: -4 })`);
+    await mouse("mouseMoved", cx + 10, cy + 10);
+    await sleep(100);
+    const el = await evalJs(`(() => {
+      const c = document.querySelector('canvas[data-wland="c${ev.conn}s${ev.surface}"]');
+      const r = c && c.getBoundingClientRect();
+      return c && { display: c.style.display, left: r.left, top: r.top, css: ${css} };
+    })()`);
+    console.log(`element fallback: ${JSON.stringify(el)}`);
+    if (!el || el.display !== "block" || el.css !== "none") fail("the cursor canvas is not shown in place of the CSS cursor");
+    if (Math.abs(el.left - (cx + 14)) > 1 || Math.abs(el.top - (cy + 14)) > 1) fail("the cursor canvas does not follow the pointer");
+    if (await evalJs(hit.replace("X", String(cx + 16)).replace("Y", String(cy + 16))) !== main) fail("the cursor canvas intercepts the pointer");
+    await evalJs(`window.wland.view.handle(window.wlandCursor)`);
+    if (!/^image-set\(/.test(await evalJs(css))) fail("back to the CSS cursor");
+
+    // off the window: the default pointer again
+    const box = await evalJs(`(${MAIN}).closest('.wland-window').getBoundingClientRect().toJSON()`);
+    const ox = box.right + 40 < 1590 ? box.right + 40 : 5, oy = Math.min(box.bottom + 40, 1090);
+    await mouse("mouseMoved", ox, oy);
+    for (let i = 0; i < 30 && (cursor = await evalJs(css)) !== ""; i++) await sleep(100);
+    if (cursor !== "") fail(`leaving kept the cursor: "${cursor.slice(0, 80)}"`);
+    console.log("cursor ok: the app's cursor surface is the pointer; the element fallback follows it; leaving resets it");
+  },
+
+  // pointer-constraints in a real browser, against a real client: the
+  // browser's Pointer Lock (requested by input.ts when the core wants the
+  // lock: the CDP press is the user activation) and the implicit grab
+  // keeping a confined drag clamped. The client's side is its own
+  // WAYLAND_DEBUG log. CDP's Escape doesn't exit a lock in headless
+  // chromium, so the user's exit is document.exitPointerLock() from here:
+  // one input.ts didn't ask for, which is what Esc is to it.
+  async constraints() {
+    const app = spawnApp("constraints", { stderr: "pipe", env: { WAYLAND_DEBUG: "1" } });
+    let log = "";
+    (async () => { for await (const c of app.stderr) log += new TextDecoder().decode(c); })();
+    const after = (re: RegExp, from: number) => re.exec(log.slice(from));
+    const waitLog = async (re: RegExp, from: number, what: string) => {
+      for (let i = 0; i < 50 && !after(re, from); i++) await sleep(100);
+      if (!after(re, from)) { app.kill(); fail(`no ${what} in the client's log`); }
+      return from + after(re, from)!.index;
+    };
+    try {
+      // its gray subsurface: the second canvas of its window, 125x100
+      let sub: any = null;
+      for (let i = 0; i < 75 && !sub; i++) {
+        await sleep(200);
+        sub = await evalJs(`(() => {
+          window.scrollTo(0, 0);
+          const c = [...document.querySelectorAll('#desktop canvas')].find(c => c.width === 125 && c.height === 100 && c.style.display !== 'none');
+          if (!c) return null;
+          const r = c.getBoundingClientRect();
+          return { key: c.dataset.wland, x: r.left, y: r.top, w: r.width, h: r.height };
+        })()`);
+      }
+      if (!sub) fail("weston-constraints' subsurface never appeared");
+      await evalJs(`(() => {
+        const e = window.wland.engine, seen = window.lockSeen = [];
+        for (const name of ['pointerLockGranted', 'pointerLockLost', 'pointerMotion']) {
+          const orig = e['_' + name] = e[name];
+          e[name] = (...a) => { seen.push([name, ...a]); return orig(...a); };
+        }
+      })()`);
+      const cx = Math.round(sub.x + sub.w / 2), cy = Math.round(sub.y + sub.h / 2);
+      await mouse("mouseMoved", cx, cy);
+      await sleep(200);
+      // press 1: confined to the subsurface; dragged out with the button held
+      // the client sees the pointer stop at its edge
+      await mouse("mousePressed", cx, cy, { button: "left", buttons: 1, clickCount: 1 });
+      const confined = await waitLog(/zwp_confined_pointer_v1#\d+\.confined\(\)/, 0, "confined()");
+      for (const dx of [30, 60, 90, 120]) {
+        await mouse("mouseMoved", cx + dx, cy, { button: "left", buttons: 1 });
+        await sleep(50);
+      }
+      await waitLog(/wl_pointer#\d+\.motion\(\d+, 124\.\d+, /, confined, "a motion clamped to the subsurface's edge");
+      console.log("confined: a drag 120 px out of the 125 px subsurface stops at x=124.99");
+      await mouse("mouseMoved", cx, cy, { button: "left", buttons: 1 });
+      await mouse("mouseReleased", cx, cy, { button: "left", buttons: 0, clickCount: 1 });
+      await sleep(300);
+
+      // press 2: the lock — the core wants it, input.ts asks the browser
+      // (the press's activation), the browser grants, the app hears locked
+      const from = log.length;
+      await click(cx, cy);
+      const locked = await waitLog(/zwp_locked_pointer_v1#\d+\.locked\(\)/, from, "locked()");
+      const el = await evalJs(`(() => { const e = document.pointerLockElement; return e && window.wland.view.surfaceOf(e); })()`);
+      if (!el || `c${el.conn}s${el.surface}` !== sub.key) fail(`the browser's pointer lock is on ${JSON.stringify(el)}, not ${sub.key}`);
+      console.log(`locked: the browser's Pointer Lock is on ${sub.key}, the app got locked()`);
+      // moves under the lock: movementX/Y, clientX/Y frozen → relative only
+      for (const [x, y] of [[cx + 15, cy + 5], [cx + 30, cy + 10], [cx + 10, cy + 10]]) {
+        await mouse("mouseMoved", x, y);
+        await sleep(60);
+      }
+      await waitLog(/relative_motion\(/, locked, "relative_motion");
+      const rel = [...log.slice(locked).matchAll(/relative_motion\(\d+, \d+, (-?[\d.]+), (-?[\d.]+), /g)].map((m) => [+m[1], +m[2]]);
+      const sum = rel.reduce((a, r) => [a[0] + r[0], a[1] + r[1]], [0, 0]);
+      console.log(`relative motion: ${JSON.stringify(rel)} (sum ${sum})`);
+      if (sum[0] !== 10 || sum[1] !== 10) fail("the relative motion does not add up to the moves (10, 10)");
+      if (after(/wl_pointer#\d+\.motion\(/, locked)) fail("a wl_pointer.motion while locked");
+      // the user leaves the lock (what Esc does): unlocked
+      await evalJs("document.exitPointerLock()");
+      await waitLog(/zwp_locked_pointer_v1#\d+\.unlocked\(\)/, locked, "unlocked()");
+      const seen: any[][] = await evalJs("window.lockSeen");
+      const names = seen.filter((c) => c[0] !== "pointerMotion").map((c) => c[0]);
+      if (names.join() !== "pointerLockGranted,pointerLockLost") fail(`engine calls: ${names}`);
+      console.log("constraints ok: confined drag clamped; Pointer Lock granted → locked, relative motion only; the exit → unlocked");
+    } finally {
+      app.kill();
+      await evalJs(`(() => { const e = window.wland.engine; for (const n of ['pointerLockGranted', 'pointerLockLost', 'pointerMotion']) if (e['_' + n]) e[n] = e['_' + n]; })()`);
+    }
+  },
+
+  // A hole in an input region INSIDE the window geometry passes the pointer
+  // to what is behind: the window element takes none (canvases and hit
+  // elements say auto). A second term maps over the first, is Alt+dragged
+  // until its right edge sticks out (the box captures the pointer although
+  // it is pointer-events: none), and gets a border-only region (fed to the
+  // view as the core sends it: no installed app sets a holed one); a click
+  // in its middle focuses and raises the term behind, one on its border
+  // takes it back; fullscreen, the hole lands on the black backdrop, never
+  // on the window behind.
+  async hole() {
+    await waitMain();
+    const before: string[] = await evalJs("window.wland.view.windows().map((w) => w.key)");
+    const top = spawnApp("term");
+    const st = (): Promise<any> => evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const wl = window.wland, vws = wl.view.windows(), es = wl.windows();
+      const i = vws.findIndex((w) => !${JSON.stringify(before)}.includes(w.key));
+      const j = vws.findIndex((w) => w.key === ${JSON.stringify(before[0] ?? "")});
+      if (i < 0 || j < 0) return null;
+      const t = vws[i], b = vws[j], c = wl.view.canvas(t.conn, t.surface), r = c.getBoundingClientRect();
+      const backRight = Math.max(...[...b.element.querySelectorAll('canvas')].filter((c) => c.style.display !== 'none')
+        .map((c) => c.getBoundingClientRect().right));
+      return { key: t.key, conn: t.conn, surface: t.surface, x: r.left, y: r.top, w: parseFloat(c.style.width), h: parseFloat(c.style.height),
+        left: t.element.offsetLeft, topZ: Number(t.element.style.zIndex), backZ: Number(b.element.style.zIndex),
+        topFocused: es[i].focused, backFocused: es[j].focused, fs: es[i].fullscreen, back: [b.conn, b.surface], backRight };
+    })()`);
+    const until = async (ok: (s: any) => boolean, what: string) => {
+      let s = await st();
+      for (let i = 0; i < 50 && !(s && ok(s)); i++) { await sleep(200); s = await st(); }
+      if (!(s && ok(s))) fail(`${what}: ${JSON.stringify(s)}`);
+      return s;
+    };
+    // what the browser's hit-test finds at a point: [conn, root], or the element
+    const at = (x: number, y: number): Promise<any> => evalJs(`(() => {
+      const e = document.elementFromPoint(${x}, ${y}), s = window.wland.view.surfaceOf(e);
+      return s ? [s.conn, s.root] : e ? (e.dataset.wlandWindow || e.id || e.tagName) : null;
+    })()`);
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    try {
+      if (!before.length) fail("no window to hide behind (foot's, from run-poc)");
+      const s0 = await until((s) => s.w > 100 && s.h > 100 && s.topFocused, "the second term mapped on top, focused");
+      const B = 12, { w, h } = s0;
+
+      // Alt+drag it right until its right border is clear of the term behind
+      const shift = Math.max(60, Math.ceil(s0.backRight - (s0.x + w) + B + 20));
+      const ax = s0.x + 40, ay = s0.y + h / 2;
+      await mouse("mouseMoved", ax, ay);
+      await mouse("mousePressed", ax, ay, { button: "left", buttons: 1, clickCount: 1, modifiers: 1 });
+      await evalJs(`window.__moves = []; document.addEventListener('pointermove', window.__movesFn = (e) =>
+        window.__moves.push(e.target.dataset && e.target.dataset.wlandWindow || e.target.tagName), true)`);
+      for (let i = 1; i <= 8; i++) {
+        await mouse("mouseMoved", ax + (shift * i) / 8, ay, { button: "left", buttons: 1, modifiers: 1 });
+        await sleep(30);
+      }
+      await mouse("mouseReleased", ax + shift, ay, { button: "left", buttons: 0, clickCount: 1, modifiers: 1 });
+      const moves: string[] = await evalJs(`(() => {
+        document.removeEventListener('pointermove', window.__movesFn, true);
+        return window.__moves;
+      })()`);
+      const s1 = await until((s) => Math.abs(s.left - (s0.left + shift)) <= 1, `Alt+drag moves the window ${shift} px`);
+      console.log(`Alt+drag: box ${s0.left} → ${s1.left}; motion targets ${JSON.stringify([...new Set(moves)])}`);
+      if (!moves.length || moves.some((m) => m !== s0.key)) fail("the Alt+drag's motion did not go to the captured window box");
+
+      // a border-only region
+      await evalJs(`window.wland.view.handle({ type: 'input-region', conn: ${s0.conn}, surface: ${s0.surface},
+        region: new Int32Array([0, 0, ${w}, ${B}, 0, ${h - B}, ${w}, ${B}, 0, ${B}, ${B}, ${h - 2 * B}, ${w - B}, ${B}, ${B}, ${h - 2 * B}]) })`);
+      const cx = s1.x + w / 2, cy = s1.y + h / 2, bx = s1.x + w - B / 2;
+      if (!(cx < s1.backRight - 10 && bx > s1.backRight)) fail(`layout: hole ${cx}, border ${bx}, the term behind ends at ${s1.backRight}`);
+      const hole = await at(cx, cy), border = await at(bx, cy);
+      console.log(`hit-test: hole ${JSON.stringify(hole)}, border ${JSON.stringify(border)} (behind: ${JSON.stringify(s1.back)})`);
+      if (!same(hole, s1.back)) fail("the hole does not show the window behind to the hit-test");
+      if (!same(border, [s0.conn, s0.surface])) fail("the border lost the pointer");
+
+      await click(cx, cy, 100);
+      await until((s) => s.backFocused && !s.topFocused && s.backZ > s.topZ, "a click in the hole: the window behind focused and raised");
+      console.log("click in the hole: the window behind is focused and raised");
+      await click(bx, cy, 100);
+      await until((s) => s.topFocused && s.topZ > s.backZ, "a click on the border: the holed window focused and raised");
+      console.log("click on the border: the holed window takes it back");
+
+      // fullscreen: the black backdrop covers what is below, the hole too
+      await evalJs(`window.wland.wm.setFullscreen(${s0.conn}, ${s0.surface}, true)`);
+      await until((s) => s.fs, "fullscreen");
+      await sleep(500);
+      const fsHit = await at(cx, cy);
+      console.log(`fullscreen hit-test in the hole: ${JSON.stringify(fsHit)}`);
+      if (fsHit !== s0.key) fail("the fullscreen backdrop lets the pointer through to what is below");
+      await evalJs(`window.wland.wm.setFullscreen(${s0.conn}, ${s0.surface}, false)`);
+      await until((s) => !s.fs, "out of fullscreen");
+      console.log("hole ok: a hole in the region passes clicks to the window behind; the border, Alt+drag and the fullscreen backdrop keep theirs");
+    } finally {
+      top.kill();
+      await sleep(300);
+    }
+  },
+
+  // M7.3: drag the app's OWN resize border (xdg_toplevel.resize → wm grab);
+  // the app must re-render larger. Where the band is depends on the app:
+  // foot's CSD border subsurfaces sit just OUTSIDE the window box, GTK's
+  // band just INSIDE its edge — so offsets around the bottom-right corner
+  // are tried until one produces growth.
+  async resize() {
+    await waitMain();
+    await sleep(800);
+    const before = (await sample())!;
+    console.log(`before: ${before.w}x${before.h} colored=${before.colored}`);
+    const corner = await evalJs(`(() => {
+      const c = ${MAIN};
+      if (!c) return null;
+      const r = c.closest('.wland-window').getBoundingClientRect();
+      return { right: r.right, bottom: r.bottom };
+    })()`) ?? fail("no window box found");
+    if (corner.bottom < 0 || corner.bottom > 1100 || corner.right < 0 || corner.right > 1600) {
+      fail(`corner off-viewport at ${corner.right},${corner.bottom}`);
+    }
+    const DX = 140, DY = 90;
+    let after = before;
+    const grew = () => after.w > before.w + 40;
+    for (const [ox, oy] of [[2, 2], [-3, -3], [-8, -8], [-14, -14]] as const) {
+      const sx = corner.right + ox, sy = corner.bottom + oy;
+      await mouse("mouseMoved", sx, sy);
+      await sleep(100);
+      await drag([sx, sy], [sx + DX, sy + DY], 7, 60);
+      // the app re-renders asynchronously; poll for the canvas to grow
+      for (let i = 0; i < 20 && !grew(); i++) {
+        await sleep(200);
+        after = (await sample()) ?? after;
+      }
+      if (grew()) break;
+      console.log(`corner offset (${ox},${oy}) did not resize; trying next`);
+    }
+    console.log(`after:  ${after.w}x${after.h} colored=${after.colored}`);
+    // terminals snap to the cell grid, so exact-match is wrong; require real growth
+    if (!grew()) fail("canvas width did not grow after grip drag");
+    if (after.colored < 100) fail("resized canvas looks blank");
+    console.log(`resize ok: ${before.w}x${before.h} → ${after.w}x${after.h}, content rendered`);
+  },
+
+  // M6: nautilus renders, the hamburger menu opens (xdg_popup), an outside
+  // click dismisses it (popup_done → unmap), double-clicking the folder
+  // navigates (title change)
+  async gtk() {
+    const mainKey = await waitWide(900);
+    const title0 = await evalJs("document.title");
+    console.log(`nautilus canvas: ${mainKey}, title: ${title0}`);
+    await sleep(1500);
+    const origin = async (): Promise<{ l: number; t: number }> => evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const r = document.querySelector('[data-wland="${mainKey}"]').getBoundingClientRect();
+      return { l: r.left, t: r.top };
+    })()`);
+    const popupVisible = (): Promise<boolean> => evalJs(
+      `[...document.querySelectorAll('#desktop canvas')].some(c => c.style.zIndex === '20' && c.style.display !== 'none')`);
+    const plainClick = async (x: number, y: number) => {
+      await mouse("mouseMoved", x, y);
+      await mouse("mousePressed", x, y, { button: "left", clickCount: 1 });
+      await mouse("mouseReleased", x, y, { button: "left", clickCount: 1 });
+    };
+
+    // GTK's input region (frame + resize margin) is applied: the canvas is
+    // inert, its hit element takes the pointer; the outer shadow falls
+    // through to what is below, the margin just outside the frame does not
+    const region = await evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const c = document.querySelector('[data-wland="${mainKey}"]');
+      const hit = document.querySelector('[data-wland-hit="${mainKey}"]');
+      const r = c.getBoundingClientRect(), box = c.closest('.wland-window').getBoundingClientRect();
+      const mine = (x, y) => { const e = document.elementFromPoint(x, y); return e === hit || e === c; };
+      return { hit: !!hit, inert: c.style.pointerEvents === 'none', shadow: mine(r.left + 2, r.top + 2),
+               margin: mine(box.left - 2, box.top + 100), inside: mine(box.left + 100, box.top + 100) };
+    })()`);
+    console.log(`input region: ${JSON.stringify(region)}`);
+    if (!region.hit || !region.inert || region.shadow || !region.margin || !region.inside) fail("nautilus's input region is not applied");
+
+    let cr = await origin();
+    await plainClick(cr.l + 184, cr.t + 48);
+    await sleep(1500);
+    if (!(await popupVisible())) fail("hamburger menu popup did not open");
+    console.log("menu popup opened");
+
+    cr = await origin();
+    await plainClick(cr.l + 500, cr.t + 450);
+    await sleep(1500);
+    if (await popupVisible()) fail("popup did not dismiss on outside click");
+    console.log("menu popup dismissed");
+
+    // the first icon, ~(307,145) in nautilus's default view (run-poc opens
+    // a fixture directory whose only entry is a folder)
+    cr = await origin();
+    const fx = cr.l + 307, fy = cr.t + 145;
+    await mouse("mouseMoved", fx, fy);
+    for (const n of [1, 2]) {
+      await mouse("mousePressed", fx, fy, { button: "left", clickCount: n });
+      await mouse("mouseReleased", fx, fy, { button: "left", clickCount: n });
+    }
+    let title1 = title0;
+    for (let i = 0; i < 25 && title1 === title0; i++) {
+      await sleep(200);
+      title1 = await evalJs("document.title");
+    }
+    console.log(`title after double-click: ${title1}`);
+    if (title1 === title0) fail("double-click did not navigate");
+    console.log("gtk ok: nautilus renders, menu opens+dismisses, navigation works");
+  },
+
+  // drag and drop through the browser, within one client: the `files`
+  // fixture's second icon (file.txt) dragged onto its first (the folder).
+  // CDP's drag is the user's; the press starts the app's start_drag, the wm
+  // carries it (enter/motion/drop over the same surface) and the app retitles
+  // itself once the drop's data arrived. (Real nautilus: tools/dnd-test.sh.)
+  async dnd() {
+    const mainKey = await waitWide(900);
+    await sleep(500);
+    const r = await evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const r = document.querySelector('[data-wland="${mainKey}"]').getBoundingClientRect();
+      return { l: r.left, t: r.top };
+    })()`);
+    const from: [number, number] = [r.l + 427, r.t + 145], to: [number, number] = [r.l + 307, r.t + 145];
+    await mouse("mouseMoved", from[0], from[1]);
+    await sleep(100);
+    await drag(from, to, 12, 50, 0);
+    let title = "";
+    // (the page titles itself "<focused window's title> — wland")
+    for (let i = 0; i < 25 && !title.startsWith("moved file.txt"); i++) {
+      await sleep(200);
+      title = await evalJs("document.title");
+    }
+    if (!title.startsWith("moved file.txt")) fail(`the drop never arrived (title "${title}")`);
+    console.log("dnd ok: file.txt dragged onto the folder through the browser");
+  },
+
+  // CSD window management: dragging nautilus's headerbar MOVES the window
+  // (xdg_toplevel.move → wm grab), its maximize button fills the desktop
+  // (box snapped to 0,0) and its restore button brings back the floating
+  // position
+  async csd() {
+    const mainKey = await waitWide(900);
+    const state = async (): Promise<any> => evalJs(`(() => {
+      const c = document.querySelector('[data-wland="${mainKey}"]');
+      const box = c.closest('.wland-window');
+      const r = c.getBoundingClientRect();
+      const desk = document.getElementById('desktop');
+      return { boxL: box.offsetLeft, boxT: box.offsetTop,
+               cssW: parseFloat(c.style.width), cssH: parseFloat(c.style.height),
+               canvasL: r.left, canvasT: r.top, deskW: desk.clientWidth, deskH: desk.clientHeight };
+    })()`);
+    const until = async (ok: (s: any) => boolean) => {
+      let s = await state();
+      for (let i = 0; i < 50 && !ok(s); i++) {
+        await sleep(200);
+        s = await state();
+      }
+      return s;
+    };
+    const floating = (s: any) => s.cssW < s.deskW - 100;
+
+    // nautilus persists its maximized state — if it started maximized, click
+    // the restore button first so the stages below start from floating
+    let s0 = await state();
+    if (Math.abs(s0.cssW - s0.deskW) <= 2) {
+      console.log("started maximized (saved state) — restoring first");
+      await click(s0.canvasL + s0.cssW - 60, s0.canvasT + 22, 150);
+      s0 = await until(floating);
+      if (!floating(s0)) fail("could not restore startup-maximized window");
+    }
+
+    // 1. headerbar drag. (700, 45) from the canvas corner is empty headerbar
+    // background: clear of GTK's top RESIZE band (~24px, which sends
+    // xdg_toplevel.resize edges=top instead) and left of the buttons. A
+    // small vertical move: the resize phase that follows needs the window's
+    // bottom-right corner to stay inside the desktop.
+    s0 = await state();
+    const hx = s0.canvasL + 700, hy = s0.canvasT + 45;
+    await mouse("mouseMoved", hx, hy);
+    await sleep(100);
+    await drag([hx, hy], [hx + 160, hy + 40], 8, 60);
+    await sleep(500);
+    const s1 = await state();
+    console.log(`headerbar drag: box (${s0.boxL},${s0.boxT}) → (${s1.boxL},${s1.boxT})`);
+    // GTK's drag threshold eats the first ~20px before xdg_toplevel.move arrives
+    if (s1.boxL - s0.boxL < 100 || s1.boxT - s0.boxT < 25) fail("headerbar drag did not move the window (xdg_toplevel.move path)");
+
+    // 2. the window's own maximize button: floating layout, center ≈ (w-86, 48)
+    await click(s1.canvasL + s1.cssW - 86, s1.canvasT + 48, 150);
+    const maxed = (s: any) => s.boxL === 0 && s.boxT === 0 && Math.abs(s.cssW - s.deskW) <= 2;
+    const s2 = await until(maxed);
+    console.log(`maximized: box (${s2.boxL},${s2.boxT}), ${s2.cssW}x${s2.cssH}, desktop ${s2.deskW}x${s2.deskH}`);
+    if (!(maxed(s2) && Math.abs(s2.cssH - s2.deskH) <= 2)) fail("maximize button did not maximize to the desktop");
+
+    // 3. the restore button (the maximized layout loses ~25px of window
+    // border padding: its center shifts to (w-60, 22))
+    await click(s2.canvasL + s2.cssW - 60, s2.canvasT + 22, 150);
+    const s3 = await until(floating);
+    console.log(`restored: box (${s3.boxL},${s3.boxT}), ${s3.cssW}x${s3.cssH}`);
+    // GTK may pick its own floating size when unmaximizing (it saw no floating
+    // configure it considers "user-sized"); assert floating + our exact position
+    if (!floating(s3)) fail("restore button did not unmaximize");
+    if (Math.abs(s3.boxL - s1.boxL) > 2 || Math.abs(s3.boxT - s1.boxT) > 2) {
+      fail(`restore position mismatch: (${s3.boxL},${s3.boxT}) != (${s1.boxL},${s1.boxT})`);
+    }
+    console.log("csd ok: headerbar move, maximize button, restore button");
+  },
+
+  // Retina: at devicePixelRatio 2 apps attach 2x buffers and the page shows
+  // them at buffer/2 CSS px (1:1 device pixels). Emulates dpr 2, reloads,
+  // spawns foot itself (the app must connect AFTER the dpr-2 page owns the
+  // session) and restores dpr 1 at the end.
+  // Window states in a real browser, with createWland's browserFullscreen
+  // (the page reloaded with ?browserfs=1, foot spawned here): Alt+F11 makes
+  // foot fill the desktop (the box at 0,0, data-wland-fullscreen, foot
+  // re-rendered to the size) and puts #desktop in the browser's fullscreen;
+  // the browser leaving it (exitFullscreen: CDP's Escape doesn't reach the
+  // browser's own handler) takes foot out too, back where it was; Alt+F9
+  // hides it, the window list's raise() restores it, focused. The page is
+  // reloaded without the option at the end.
+  async states() {
+    await call("Page.enable");
+    const base = await evalJs("location.origin");
+    await call("Page.navigate", { url: `${base}/?browserfs=1` });
+    await sleep(1000);
+    await waitOnline();
+    const foot = spawnApp("term");
+    const st = (): Promise<any> => evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const w = window.wland.windows()[0];
+      const vw = w && window.wland.view.windows()[0];
+      if (!vw) return null;
+      const el = vw.element, desk = document.getElementById('desktop');
+      const r = el.getBoundingClientRect(), d = desk.getBoundingClientRect();
+      const cs = [...el.querySelectorAll('canvas')].filter((c) => c.style.display !== 'none');
+      const main = cs.reduce((a, b) => (a.width * a.height >= b.width * b.height ? a : b), cs[0]);
+      return { fs: w.fullscreen, min: w.minimized, focused: w.focused, attr: 'wlandFullscreen' in el.dataset,
+        display: el.style.display, left: el.offsetLeft, top: el.offsetTop, x: r.left, y: r.top, w: r.width, h: r.height,
+        deskW: d.width, deskH: d.height, mainW: main ? parseFloat(main.style.width) : 0,
+        browserFs: document.fullscreenElement === desk };
+    })()`);
+    const until = async (ok: (s: any) => boolean, what: string) => {
+      let s = await st();
+      for (let i = 0; i < 50 && !(s && ok(s)); i++) { await sleep(200); s = await st(); }
+      if (!(s && ok(s))) { foot.kill(); fail(`${what}: ${JSON.stringify(s)}`); }
+      return s;
+    };
+    const altKey = async (k: string, vk: number) => {
+      await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code: k, windowsVirtualKeyCode: vk, modifiers: 1 });
+      await call("Input.dispatchKeyEvent", { type: "keyUp", key: k, code: k, windowsVirtualKeyCode: vk, modifiers: 1 });
+    };
+    try {
+      const s0 = await until((s) => s.mainW > 100 && s.focused, "foot's window, focused");
+      // a press in it: focus, and the page's user activation
+      await click(s0.x + 60, s0.y + 80, 100);
+      await altKey("F11", 122);
+      const s1 = await until((s) => s.fs && s.browserFs && Math.abs(s.mainW - s.deskW) < 20, "Alt+F11: fullscreen, browser fullscreen, foot re-rendered");
+      if (!(s1.attr && s1.left === 0 && s1.top === 0 && Math.abs(s1.w - s1.deskW) < 1 && Math.abs(s1.h - s1.deskH) < 1)) {
+        fail(`the window does not fill the desktop: ${JSON.stringify(s1)}`);
+      }
+      console.log(`fullscreen: box ${s1.w}x${s1.h} at ${s1.left},${s1.top}, foot ${s1.mainW} wide, desktop ${s1.deskW}x${s1.deskH} (browser fullscreen)`);
+      // the browser leaves its fullscreen: foot leaves its own, back in place
+      await evalJs("document.exitFullscreen()");
+      const s2 = await until((s) => !s.fs && !s.browserFs && Math.abs(s.mainW - s0.mainW) < 20, "out of the browser's fullscreen: foot back");
+      if (s2.left !== s0.left || s2.top !== s0.top || s2.attr) fail(`not back in place: ${JSON.stringify(s2)} (was ${JSON.stringify(s0)})`);
+      console.log(`browser fullscreen left: foot back to ${s2.mainW} wide at ${s2.left},${s2.top}`);
+      // Alt+F11 twice: in and out, the browser's fullscreen with it
+      await altKey("F11", 122);
+      await until((s) => s.fs && s.browserFs, "Alt+F11 again");
+      await altKey("F11", 122);
+      await until((s) => !s.fs && !s.browserFs && !s.attr, "Alt+F11 out: the page leaves the browser's fullscreen too");
+      // minimize, restore
+      await altKey("F9", 120);
+      await until((s) => s.min && s.display === "none" && !s.focused, "Alt+F9: hidden, unfocused");
+      await sleep(300);
+      await evalJs("window.wland.windows()[0].raise()");
+      const s3 = await until((s) => !s.min && s.display === "" && s.focused, "raise(): restored and focused");
+      if (s3.left !== s0.left || s3.top !== s0.top) fail(`restored elsewhere: ${JSON.stringify(s3)}`);
+      console.log("states ok: Alt+F11 with the browser's fullscreen, its exit ends foot's, Alt+F9 hides, raise() restores");
+    } finally {
+      foot.kill();
+      await call("Page.navigate", { url: `${base}/` });
+      await sleep(1000);
+      await waitOnline();
+    }
+  },
+
+  async retina() {
+    // (persists across reloads while this CDP session lives)
+    await call("Emulation.setDeviceMetricsOverride", { width: 1600, height: 1100, deviceScaleFactor: 2, mobile: false });
+    await call("Page.enable");
+    await call("Page.reload");
+    await sleep(1000);
+    await waitOnline();
+    const dpr = await evalJs("window.devicePixelRatio");
+    if (dpr !== 2) fail(`emulated dpr is ${dpr}, wanted 2`);
+
+    const foot = spawnApp("term");
+    let s: Sample | null = null;
+    for (let i = 0; i < 75 && !s; i++) {
+      await sleep(200);
+      s = await sample();
+    }
+    // The crispness invariant is buffer == 2 × logical (CSS) size, regardless
+    // of mechanism: a fractional-scale-aware client (foot) reaches it via
+    // wp_viewport.set_destination + wp_fractional_scale (buffer_scale stays
+    // 1) instead of set_buffer_scale(2); the CSS box is buffer/2 either way.
+    let failed = "";
+    if (!s) failed = "no canvas appeared under dpr=2";
+    else {
+      console.log(`buffer ${s.w}x${s.h}, css ${s.cssW}x${s.cssH}, colored=${s.colored}`);
+      if (Math.abs(s.w / s.cssW - 2) > 0.01 || Math.abs(s.h / s.cssH - 2) > 0.01) {
+        failed = "canvas CSS box is not buffer/2 — retina buffers not displayed at logical size";
+      } else if (s.colored < 100) failed = "retina canvas looks blank";
+    }
+    // restore dpr 1 for the phases after us, whatever the verdict
+    foot.kill();
+    await call("Emulation.clearDeviceMetricsOverride");
+    await call("Page.reload");
+    await sleep(1000);
+    await waitOnline();
+    if (failed) fail(failed);
+    console.log("retina ok: 2x buffers rendered and displayed at logical size");
+  },
+
+  // After a second browser connects, the FIRST tab shows the "taken over"
+  // notice (WS close code 4000) and does NOT auto-reload (a reload would
+  // steal the session back — ping-pong). run-poc then proves the NEW tab
+  // works by running `terminal` against its CDP port.
+  async takeover() {
+    const status = (): Promise<string> => evalJs("document.getElementById('status')?.innerText ?? ''");
+    let s = "";
+    for (let i = 0; i < 50; i++) {
+      s = await status();
+      if (s.includes("taken over")) break;
+      await sleep(200);
+    }
+    if (!s.includes("taken over")) fail(`old tab never showed the takeover notice; status:\n${s}`);
+    console.log("old tab kicked with takeover notice");
+    // past the 3s auto-reload window: the notice must persist
+    await sleep(4000);
+    s = await status();
+    if (!s.includes("taken over")) fail(`old tab reloaded and stole the session back; status:\n${s}`);
+    console.log("takeover ok: old tab stayed kicked (no reload fight)");
+  },
+
+  // The GL present path. Production uses a WebGL texture per toplevel only
+  // when WebGL is hardware-accelerated; software GL (SwiftShader in headless
+  // CI) falls back to 2d, and in-DOM software GL deadlocks headless
+  // compositing at large/retina sizes — so the other phases run 2d. This one
+  // forces GL on (?webgl=always) at dpr 1, where small buffers are safe, and
+  // asserts the toplevel renders through GL with non-blank pixels: the
+  // channel-order / Y-flip / format canary. Not in run-poc.
+  async webgl() {
+    await call("Page.enable");
+    const hasWebGL = await evalJs(
+      "(()=>{try{const c=document.createElement('canvas');return !!(c.getContext('webgl2')||c.getContext('webgl'));}catch{return false;}})()");
+    if (hasWebGL !== true) {
+      // can't verify the GL path — say so and pass, don't invent a failure
+      console.log("webgl SKIP: no WebGL context available in this browser");
+      return;
+    }
+    await call("Emulation.clearDeviceMetricsOverride");
+    const origin = await evalJs("location.origin");
+    await call("Page.navigate", { url: `${origin}/?webgl=always` });
+    await sleep(1200);
+    await waitOnline();
+
+    const foot = spawnApp("term");
+    let info: any = null;
+    for (let i = 0; i < 75 && !info; i++) {
+      await sleep(300);
+      // pixels through the view's present backend (GL draw + readPixels)
+      info = await evalJs(`(() => {
+        const c = ${MAIN};
+        if (!c) return null;
+        const m = c.dataset.wland.match(/^c(\\d+)s(\\d+)$/);
+        const rb = window.wland.view.readPixels(+m[1], +m[2]);
+        if (!rb) return null;
+        let colored = 0;
+        for (let j = 0; j < rb.data.length; j += 4) if (rb.data[j] + rb.data[j+1] + rb.data[j+2] > 30) colored++;
+        // getContext('2d') is null on a canvas that already holds a GL context
+        return { kind: c.getContext('2d') ? '2d' : 'webgl', w: c.width, h: c.height, colored, pixels: rb.data.length / 4 };
+      })()`);
+    }
+    foot.kill();
+    // a clean (non-forced) page for whatever runs after us
+    await call("Page.navigate", { url: `${origin}/` });
+    await sleep(500);
+    if (!info) fail("no toplevel canvas appeared under forced GL");
+    console.log(`webgl toplevel: ${info.kind} ${info.w}x${info.h}, colored ${info.colored}/${info.pixels}`);
+    if (info.kind !== "webgl") fail(`toplevel used ${info.kind}, not WebGL — GL present path did not engage`);
+    if (info.colored < 1000) fail("GL-rendered canvas is blank (channel/format/flip bug?)");
+    console.log("webgl ok: toplevel rendered through the WebGL present path, pixels non-blank");
+  },
+
+  "handle-demo": handleDemo,
+
+  // --- drivers ---
+  async drag() {
+    const [x1, y1, x2, y2] = args.map(Number) as [number, number, number, number];
+    const k = await waitWide(700);
+    const r = await evalJs(`(() => { const r = document.querySelector('[data-wland="${k}"]').getBoundingClientRect(); return { l: r.left, t: r.top }; })()`);
+    const from: [number, number] = [r.l + x1, r.t + y1], to: [number, number] = [r.l + x2, r.t + y2];
+    await mouse("mouseMoved", from[0], from[1]);
+    await sleep(300);
+    await mouse("mousePressed", from[0], from[1], { button: "left", buttons: 1, clickCount: 1 });
+    await sleep(200);
+    for (let i = 1; i <= 14; i++) {
+      await mouse("mouseMoved", from[0] + ((to[0] - from[0]) * i) / 14, from[1] + ((to[1] - from[1]) * i) / 14,
+        { button: "left", buttons: 1 });
+      await sleep(70);
+    }
+    await sleep(600); // hover: GTK needs time to highlight the drop target
+    await mouse("mouseReleased", to[0], to[1], { button: "left", buttons: 0, clickCount: 1 });
+    await sleep(800);
+    console.log("drag dispatched");
+  },
+  async shot() {
+    const res = await call("Page.captureScreenshot", { format: "png" });
+    await Bun.write(args[0] ?? fail("shot: output file?"), Buffer.from(res.result.data, "base64"));
+    console.log(`wrote ${args[0]} (main canvas: ${JSON.stringify(await evalJs(`(() => { const c = ${MAIN}; if (!c) return null; const r = c.getBoundingClientRect(); return { l: r.left, t: r.top, w: r.width, h: r.height }; })()`))})`);
+  },
+  async log() {
+    const lines = String(await evalJs(`(window.wlandLog || []).slice(-400).join("\\n")`));
+    for (const l of lines.split("\n")) if (!args[0] || l.includes(args[0])) console.log(l);
+  },
+};
+
+// /handle-demo.html — the link-v2 handle path in one page (synthetic
+// clients, a JS relay, kwshm-style handles, the engine + view; no /ws
+// session, so it never takes a session over). Per mode: both windows render
+// non-blank and animate, the relay's counters advance with every COMMIT
+// ACKed and zero violations, every client gets presentation feedback off
+// the rAF clock (vsync, the measured interval; each time checked by the
+// client against the relay's clock), and a click and typed keys reach the
+// client under the pointer. Modes: 2D (core-swizzled rgba) and WebGL (bgra/bgrx
+// rows, shader swizzle), sync and async HandleSource, stream and memory
+// links. args[0]: the origin serving the built pages (default: the tab's).
+async function handleDemo() {
+  await call("Page.enable");
+  await call("Emulation.clearDeviceMetricsOverride");
+  const origin = args[0] ?? await evalJs("location.origin");
+
+  // per window: a point on it that is not covered and not decoration (a
+  // click there is a plain click), and pixel stats from the view's present
+  // backend (2D getImageData or GL draw + readPixels)
+  const SAMPLE = `(() => {
+    const d = window.handleDemo;
+    return d.wl.view.windows().map((w) => {
+      const c = d.wl.view.canvas(w.conn, w.surface);
+      const r = c.getBoundingClientRect();
+      let point = null;
+      for (let y = r.top + 70; y < r.bottom - 40 && !point; y += 13) {
+        for (let x = r.left + 12; x < r.right - 30 && !point; x += 17) {
+          if (document.elementFromPoint(x, y) === c) point = [Math.round(x), Math.round(y)];
+        }
+      }
+      const rb = d.wl.view.readPixels(w.conn, w.surface);
+      let colored = 0, opaque = 0, red = 0, hash = 0;
+      for (let i = 0; i < rb.data.length; i += 4) {
+        if (rb.data[i] + rb.data[i + 1] + rb.data[i + 2] > 30) colored++;
+        // the close box is (220, 80, 70): with B and R swapped it would be blue
+        if (rb.data[i] > 200 && rb.data[i + 1] < 100 && rb.data[i + 2] < 90) red++;
+        if (rb.data[i + 3] === 255) opaque++;
+        hash = (hash * 31 + rb.data[i] + rb.data[i + 1] * 7 + rb.data[i + 2] * 13) | 0;
+      }
+      const client = d.clients[w.conn - 1];
+      return { conn: w.conn, surface: w.surface, w: rb.width, h: rb.height, colored, opaque, red,
+               pixels: rb.data.length / 4, hash, point, frames: client.stats.frames,
+               typed: client.stats.typed, clicks: client.stats.clicks };
+    });
+  })()`;
+
+  // canvas-local point → viewport point for window `conn` (negative: from
+  // the right/bottom edge)
+  async function at(conn: number, x: number, y: number): Promise<[number, number]> {
+    const r = await evalJs(`(() => { const w = handleDemo.wl.view.windows().find((w) => w.conn === ${conn});
+      const b = handleDemo.wl.view.canvas(w.conn, w.surface).getBoundingClientRect();
+      return [b.left, b.top, b.width, b.height]; })()`);
+    return [Math.round(r[0] + (x < 0 ? r[2] + x : x)), Math.round(r[1] + (y < 0 ? r[3] + y : y))];
+  }
+  async function dragTo(from: [number, number], to: [number, number]) {
+    await mouse("mouseMoved", from[0], from[1]);
+    await drag(from, to, 6, 30, 0);
+    await sleep(400);
+  }
+  const clientState = (conn: number) => evalJs(`(() => { const c = handleDemo.clients[${conn - 1}];
+    return { alive: c.stats.alive, reason: c.stats.reason, w: c.width, h: c.height }; })()`);
+
+  // the window decorations: close (the client hangs up: CONN_CLOSE, its
+  // handles go without HANDLE_CLOSE), the resize grip (wm grab → configure →
+  // a new pool and buffers: new handles, the old ones closed once ACKed),
+  // maximize (configure to the desktop size)
+  async function windowOps(mode: string) {
+    await dragTo(await at(2, -15, 14), await at(2, -15, 14)); // close box of window 2
+    if ((await clientState(2)).alive) fail(`[${mode}] window 2 did not close from its close button`);
+    if (await evalJs("handleDemo.wl.view.windows().length") !== 1) fail(`[${mode}] closed window still shown`);
+
+    const before = await clientState(1);
+    const grip = await at(1, -6, -6);
+    await dragTo(grip, [grip[0] + 60, grip[1] + 40]);
+    const resized = await clientState(1);
+    if (!(resized.w >= before.w + 40 && resized.h >= before.h + 25)) fail(`[${mode}] grip resize: ${before.w}x${before.h} → ${resized.w}x${resized.h}`);
+
+    await dragTo(await at(1, -39, 14), await at(1, -39, 14)); // maximize box
+    const max = await clientState(1);
+    const desk = await evalJs("[document.getElementById('desktop').clientWidth, document.getElementById('desktop').clientHeight]");
+    if (max.w !== desk[0] || max.h !== desk[1]) fail(`[${mode}] maximize: ${max.w}x${max.h}, desktop ${desk}`);
+    await sleep(300);
+    const s = await evalJs("handleDemo.stats()");
+    if (s.tokens !== s.handles || s.exports !== s.handles || s.handles > 3) fail(`[${mode}] handles after close/resize/maximize: ${JSON.stringify(s)}`);
+    console.log(`  close ok; grip resize ${before.w}x${before.h} → ${resized.w}x${resized.h}; maximize → ${max.w}x${max.h}; handles ${s.handles}`);
+  }
+
+  async function runMode(mode: string, ops: boolean) {
+    const bad = (msg: string): never => fail(`[${mode}] ${msg}`);
+    await call("Page.navigate", { url: `${origin}/handle-demo.html?${mode}` });
+    let ready = false;
+    for (let i = 0; i < 60 && !ready; i++) {
+      await sleep(250);
+      ready = await evalJs(`!!(window.handleDemo && handleDemo.wl.view.windows().length >= 2 &&
+        handleDemo.clients.every((c) => c.stats.frames > 10))`) === true;
+    }
+    if (!ready) bad(`two animating windows never appeared: ${JSON.stringify(await evalJs("window.handleDemo && { stats: handleDemo.stats(), v: handleDemo.violations, log: handleDemo.log.slice(-15) }"))}`);
+
+    const s0 = await evalJs("handleDemo.stats()");
+    const a = await evalJs(SAMPLE);
+    await sleep(600);
+    const b = await evalJs(SAMPLE);
+    const s1 = await evalJs("handleDemo.stats()");
+    const kind = await evalJs("handleDemo.wl.view.stats.webgl > 0 ? 'webgl' : '2d'");
+    if ((kind === "webgl") !== mode.includes("webgl=always")) bad(`presenter is ${kind}`);
+
+    for (let i = 0; i < 2; i++) {
+      const w0 = a[i], w1 = b[i];
+      console.log(`  window c${w1.conn}s${w1.surface} ${w1.w}x${w1.h}: colored ${w1.colored}/${w1.pixels}, opaque ${w1.opaque}, red ${w1.red}, frames ${w0.frames}→${w1.frames}`);
+      if (w1.colored < w1.pixels * 0.5) bad(`window ${i} is (mostly) blank`);
+      if (w1.opaque < w1.pixels * 0.99) bad(`window ${i} is not opaque (alpha policy: xrgb X=0 must present as 255)`);
+      if (w1.red < 18 * 18) bad(`window ${i}: red close box not found (${w1.red} px) — channel order wrong?`);
+      if (w0.hash === w1.hash) bad(`window ${i} did not change in 600 ms (not animating)`);
+      if (w1.frames <= w0.frames) bad(`client ${i} stopped drawing`);
+    }
+    if (!(s1.commits > s0.commits && s1.acks > s0.acks && s1.releases > s0.releases && s1.presented > s0.presented)) {
+      bad(`counters did not advance: ${JSON.stringify(s0)} → ${JSON.stringify(s1)}`);
+    }
+    if (s1.acks < s1.commits - 4) bad(`ACKs lag COMMITs: ${s1.acks} vs ${s1.commits}`);
+    if (s1.tokens !== s1.handles || s1.exports !== s1.handles) bad(`handle accounting: ${JSON.stringify(s1)}`);
+    if (mode.includes("gpu=1") && !(s1.resolves > s0.resolves && s1.gpuReleased === s1.resolves && s1.reads === 0)) {
+      bad(`gpu mode: resolves/releases/reads ${JSON.stringify(s1)} (every resolve released, no handle reads)`);
+    }
+
+    // a click and typed keys reach the client under the pointer
+    const target = b.find((w: any) => w.point) ?? bad("no uncovered point on any window");
+    await click(target.point[0], target.point[1]);
+    await sleep(150);
+    for (const ch of "wland") await key(ch, `Key${ch.toUpperCase()}`, ch);
+    await sleep(400);
+    const after = (await evalJs(SAMPLE)).find((w: any) => w.conn === target.conn);
+    if (after.clicks !== target.clicks + 1) bad(`click not reflected: clicks ${target.clicks} → ${after.clicks}`);
+    if (!after.typed.endsWith("WLAND")) bad(`keys not reflected: typed "${after.typed}"`);
+    if (after.hash === target.hash) bad("the click/keys did not repaint the window");
+
+    if (ops) await windowOps(mode);
+    const end = await evalJs("handleDemo.stats()");
+    const violations = await evalJs("handleDemo.violations");
+    if (violations.length || end.violations) bad(`violations: ${JSON.stringify(violations)}`);
+    // presentation feedback from the page's rAF clock: presented (each
+    // dated by the JS relay, checked by its client), vsync, the interval
+    // the frame loop measured
+    const fb = end.feedback as [number, number, number][];
+    if (!fb.every(([n, refresh, flags]) => n > 10 && flags === 1 && refresh > 5e6 && refresh < 1e8)) {
+      bad(`presentation feedback [presented, refresh ns, flags] per client: ${JSON.stringify(fb)}`);
+    }
+    console.log(`  ${kind}: COMMIT ${end.commits} ACK ${end.acks} released ${end.releases} presented ${end.presented}, handles ${end.handles}, ` +
+      `feedback ${fb.map(([n, r]) => `${n}@${(r / 1e6).toFixed(1)}ms`).join(' ')} vsync, click+keys ok, 0 violations`);
+  }
+
+  for (const mode of ["webgl=never", "webgl=never&async=1&link=memory", "webgl=always", "webgl=always&async=1", "gpu=1&webgl=never", "gpu=1&webgl=always"]) {
+    console.log(`handle demo: ${mode}`);
+    await runMode(mode, mode === "webgl=never");
+  }
+  await call("Page.navigate", { url: "about:blank" });
+  console.log("handle-demo ok: 2D + WebGL, sync + async source, stream + memory link, virtgpu COMMITs through a gpu source");
+}
+
+// --- main ------------------------------------------------------------------
+
+// `build <dir>`: the pages the phases run against (test/browser), bundled
+// into a web root for `wlandr --web-root`. Nothing here comes from
+// web/: that is a demo, free to change without moving these checks.
+if (phase === "build") {
+  const out = process.argv[3] ?? fail("build: output directory?");
+  const src = new URL("../test/browser/", import.meta.url).pathname;
+  const built = await Bun.build({
+    entrypoints: [`${src}page.ts`, `${src}handle-demo.js`], outdir: out, target: "browser", format: "esm",
+  });
+  if (!built.success) fail(`bundling test/browser: ${built.logs.join("\n")}`);
+  for (const f of ["index.html", "handle-demo.html"]) await Bun.write(`${out}/${f}`, Bun.file(`${src}${f}`));
+  // the engine loads wland.wasm from next to its module: the bundle
+  await Bun.write(`${out}/wland.wasm`, Bun.file(new URL("../lib/wland.wasm", import.meta.url).pathname));
+  console.log(`test pages built in ${out}`);
+  process.exit(0);
+}
+
+const run = phases[phase];
+if (!run) {
+  console.error(`usage: bun tools/browser-e2e.ts <phase> [cdp_port] [args...]\nphases: ${Object.keys(phases).join(" ")}`);
+  process.exit(2);
+}
+await connect();
+await run();
+ws.close();
+process.exit(0);

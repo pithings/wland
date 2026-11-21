@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+/* Semantic tokens; the theme swaps them under [data-theme]. */
+:root,
+[data-theme="dark"] {
+  --bg: #000000;
+  --fg: #ededed;
+  --muted: #a1a1a1;
+  --subtle: #6f6f6f;
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --panel: #0a0a0a;
+  --hover: rgba(255, 255, 255, 0.06);
+  --dot: rgba(255, 255, 255, 0.09);
+  --accent: #3b82f6;
+  --ok: #10b981;
+  --bad: #ef4444;
+  --shadow: rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+}
+[data-theme="light"] {
+  --bg: #ffffff;
+  --fg: #171717;
+  --muted: #666666;
+  --subtle: #8f8f8f;
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.15);
+  --panel: #fafafa;
+  --hover: rgba(0, 0, 0, 0.04);
+  --dot: rgba(0, 0, 0, 0.1);
+  --accent: #2563eb;
+  --ok: #059669;
+  --bad: #dc2626;
+  --shadow: rgba(0, 0, 0, 0.14);
+  color-scheme: light;
+}
+
+@theme inline {
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-bg: var(--bg);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-panel: var(--panel);
+  --color-hover: var(--hover);
+  --color-accent: var(--accent);
+  --color-ok: var(--ok);
+  --color-bad: var(--bad);
+}
+
+html {
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+body {
+  margin: 0;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  background: var(--bg);
+}
+::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+
+/* The compositor's output. The lib owns every child; its client size is the
+   resolution apps see over wl_output. */
+#desktop {
+  position: absolute;
+  inset: 0;
+  isolation: isolate; /* windows' z-indexes stay below the page's dock */
+  overflow: hidden;
+  background-color: var(--panel);
+  background-image: radial-gradient(var(--dot) 1px, transparent 1px);
+  background-size: 20px 20px;
+  touch-action: none;
+}
+/* window elements (lib/view.ts): the shadow follows the client's alpha, so
+   rounded and round windows get rounded and round shadows */
+#desktop .wland-window {
+  filter: drop-shadow(0 10px 28px var(--shadow)) drop-shadow(0 1px 2px var(--shadow));
+}
+/* a fullscreen window fills the desktop: no shadow around it */
+#desktop .wland-window[data-wland-fullscreen] {
+  filter: none;
+}
+
+.trace-row { animation: trace-in 0.4s ease-out; }
+@keyframes trace-in { from { background: var(--hover); } to { background: transparent; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .trace-row { animation: none; }
+}

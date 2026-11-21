@@ -1,0 +1,7 @@
+zig-out/
+.zig-cache/
+web/dist/
+core.*
+node_modules
+*.tgz
+/dist/

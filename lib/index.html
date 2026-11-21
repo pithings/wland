@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wland</title>
+<style>
+  :root {
+    color-scheme: dark; --bar: 40px;
+    --bg: #0d0f14; --panel: rgb(20 23 30 / .78); --line: rgb(255 255 255 / .07);
+    --chip: rgb(255 255 255 / .04); --chip-hover: rgb(255 255 255 / .08);
+    --text: #e4e7ee; --muted: #8b92a3; --accent: #6d9eff;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  button { font: inherit; color: inherit; border: 0; background: none; cursor: default; }
+  svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+  #bar { position: fixed; inset: 0 0 auto 0; height: var(--bar); display: flex; align-items: center; gap: 10px; padding: 0 8px 0 12px; box-sizing: border-box; background: var(--panel); backdrop-filter: blur(16px) saturate(1.4); border-bottom: 1px solid var(--line); z-index: 10; user-select: none; }
+  #brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .2px; }
+  #brand i { width: 16px; height: 16px; border-radius: 5px; background: linear-gradient(135deg, #8ab4ff, #7c5cff); box-shadow: 0 0 12px rgb(124 92 255 / .45); }
+  .sep { width: 1px; height: 18px; background: var(--line); flex: none; }
+
+  #windows { display: flex; gap: 4px; flex: 1; min-width: 0; overflow: hidden; }
+  #windows button { position: relative; display: flex; align-items: center; gap: 8px; flex: 0 1 200px; min-width: 64px; height: 28px; padding: 0 10px; border-radius: 8px; background: var(--chip); transition: background .15s, opacity .15s; }
+  #windows button:hover { background: var(--chip-hover); }
+  #windows button span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #windows button em { flex: none; display: grid; place-items: center; width: 18px; height: 18px; border-radius: 5px; background: rgb(255 255 255 / .08); font-size: 10px; font-weight: 600; line-height: 1; font-style: normal; text-transform: uppercase; color: var(--muted); }
+  #windows button.focused { background: rgb(109 158 255 / .14); }
+  #windows button.focused em { background: var(--accent); color: #0d0f14; }
+  #windows button.focused::after { content: ''; position: absolute; left: 30%; right: 30%; bottom: 1px; height: 2px; border-radius: 2px; background: var(--accent); }
+  #windows button.minimized { opacity: .45; }
+
+  #menu { position: fixed; z-index: 20; min-width: 190px; padding: 5px; border: 1px solid var(--line); border-radius: 10px; background: rgb(24 27 35 / .92); backdrop-filter: blur(16px) saturate(1.4); box-shadow: 0 12px 40px rgb(0 0 0 / .45); user-select: none; }
+  #menu[hidden] { display: none; }
+  #menu button { display: flex; align-items: center; gap: 10px; width: 100%; height: 30px; padding: 0 10px; border-radius: 6px; text-align: left; }
+  #menu button:hover, #menu button:focus-visible { background: rgb(109 158 255 / .16); outline: none; }
+  #menu button svg { color: var(--muted); }
+  #menu kbd { margin-left: auto; padding-left: 16px; color: var(--muted); font: 11px ui-monospace, monospace; }
+
+  #status { display: flex; align-items: center; gap: 7px; height: 26px; padding: 0 10px; border-radius: 13px; background: var(--chip); color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #e3b341; flex: none; animation: pulse 1.4s ease-in-out infinite; }
+  #status[data-state="open"]::before { background: #3fb950; box-shadow: 0 0 8px #3fb950; animation: none; }
+  #status[data-state="closed"]::before { background: #f85149; animation: none; }
+  #status button { margin-left: 4px; padding: 2px 8px; border-radius: 6px; background: var(--accent); color: #0d0f14; font-weight: 600; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  /* the compositor's screen: wland owns every child; its client size is the
+     output size apps see */
+  #desktop { position: fixed; inset: var(--bar) 0 0 0; overflow: hidden;
+    background: radial-gradient(1200px 700px at 15% 0%, rgb(124 92 255 / .16), transparent 60%),
+                radial-gradient(900px 600px at 100% 100%, rgb(64 156 255 / .12), transparent 60%),
+                radial-gradient(rgb(255 255 255 / .05) 1px, transparent 1px) 0 0 / 24px 24px, #12151c; }
+  #hint { position: fixed; inset: var(--bar) 0 0 0; display: grid; place-items: center; pointer-events: none; z-index: 5; }
+  #hint[hidden] { display: none; }
+  #hint div { padding: 28px 36px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); backdrop-filter: blur(12px); text-align: center; color: var(--muted); box-shadow: 0 20px 60px rgb(0 0 0 / .35); }
+  #hint h1 { margin: 0 0 6px; font-size: 15px; font-weight: 600; color: var(--text); }
+  #hint p { margin: 0 0 16px; }
+  code { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: rgb(0 0 0 / .3); color: var(--text); font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code::before { content: '$ '; color: var(--muted); }
+</style>
+</head>
+<body>
+<header id="bar">
+  <div id="brand"><i></i>wland</div>
+  <div class="sep"></div>
+  <nav id="windows" aria-label="Windows"></nav>
+  <span id="status">connecting…</span>
+</header>
+<div id="desktop"></div>
+<div id="menu" role="menu" hidden></div>
+<div id="hint"><div><h1>No windows yet</h1><p>Launch an app from a shell:</p><code>npx wland run foot</code></div></div>
+<script type="module">
+import { createWland } from './client.mjs';
+
+const $ = (id) => document.getElementById(id);
+const bar = $('windows'), status = $('status'), hint = $('hint'), menu = $('menu');
+const icon = (d) => `<svg viewBox="0 0 14 14"><path d="${d}"/></svg>`;
+const ICONS = {
+  min: icon('M3 7h8'),
+  max: icon('M3 3h8v8H3z'),
+  restore: icon('M3 5h6v6H3zM5 5V3h6v6H9'),
+  full: icon('M2 5V2h3M9 2h3v3M12 9v3H9M5 12H2V9'),
+  unfull: icon('M5 2v3H2M12 5H9V2M9 12V9h3M2 9h3v3'),
+};
+let wl;
+
+// the bar and the menu never take DOM focus: that would take the keyboard
+// from the focused window
+for (const el of [$('bar'), menu]) el.addEventListener('mousedown', (e) => e.preventDefault());
+
+// a window's menu (right-click on its taskbar item): items act on that
+// window; maximize and fullscreen also raise it (restoring a minimized one)
+let menuKey = null;
+function openMenu(w, x, y) {
+  const item = (label, svg, keys, act) => {
+    const b = document.createElement('button');
+    b.setAttribute('role', 'menuitem');
+    b.innerHTML = `${svg}<span></span><kbd>${keys}</kbd>`;
+    b.querySelector('span').textContent = label;
+    b.onclick = () => { closeMenu(); act(); };
+    return b;
+  };
+  menu.replaceChildren(
+    w.minimized
+      ? item('Restore', ICONS.restore, '', () => w.restore())
+      : item('Minimize', ICONS.min, 'Alt+F9', () => w.minimize()),
+    item(w.maximized ? 'Unmaximize' : 'Maximize', w.maximized ? ICONS.restore : ICONS.max, 'Alt+F10',
+      () => { w.raise(); w.setMaximized(!w.maximized); }),
+    item(w.fullscreen ? 'Exit fullscreen' : 'Fullscreen', w.fullscreen ? ICONS.unfull : ICONS.full, 'Alt+F11',
+      () => { w.raise(); w.setFullscreen(!w.fullscreen); }),
+  );
+  menuKey = w.key;
+  menu.hidden = false;
+  // keep it on screen
+  const { width, height } = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(x, innerWidth - width - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(y, innerHeight - height - 4))}px`;
+}
+function closeMenu() { menu.hidden = true; menuKey = null; }
+addEventListener('pointerdown', (e) => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); }, true);
+addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); }, true);
+addEventListener('blur', closeMenu);
+addEventListener('resize', closeMenu);
+
+function renderWindows() {
+  const list = wl ? wl.windows() : [];
+  hint.hidden = list.length > 0;
+  bar.replaceChildren(...list.map((w) => {
+    const b = document.createElement('button');
+    const title = w.title || 'untitled';
+    b.innerHTML = '<em></em><span></span>';
+    b.firstChild.textContent = title[0];
+    b.lastChild.textContent = title;
+    b.title = title;
+    if (w.focused && !w.minimized) b.className = 'focused';
+    else if (w.minimized) b.className = 'minimized';
+    // the focused window's button minimizes it, any other raises (restores)
+    b.onclick = () => (w.focused && !w.minimized ? w.minimize() : w.raise());
+    b.oncontextmenu = (e) => {
+      e.preventDefault();
+      const r = b.getBoundingClientRect();
+      // from the keyboard (no pointer position): below the item
+      openMenu(w, e.button === 2 ? e.clientX : r.left, e.button === 2 ? e.clientY : r.bottom + 4);
+    };
+    return b;
+  }));
+  // an open menu follows its window's state; closes when the window goes
+  if (menuKey) {
+    const w = list.find((w) => w.key === menuKey);
+    if (w) openMenu(w, parseFloat(menu.style.left), parseFloat(menu.style.top));
+    else closeMenu();
+  }
+  const focused = list.find((w) => w.focused && !w.minimized);
+  document.title = focused && focused.title ? `${focused.title} — wland` : 'wland';
+}
+
+function setStatus(state, text) {
+  status.dataset.state = state;
+  status.textContent = text;
+}
+
+try {
+  wl = await createWland({
+    container: $('desktop'),
+    onWindowsChange: renderWindows,
+    onEvent(ev) {
+      switch (ev.type) {
+        case 'open': setStatus('open', 'connected'); break;
+        case 'error': console.warn('wland:', ev.detail); break;
+        case 'close':
+          // Taken over by another tab: no automatic reload, that would take
+          // the session straight back (ping-pong); the user decides.
+          if (ev.takenOver) {
+            setStatus('closed', 'in another tab');
+            const back = document.createElement('button');
+            back.textContent = 'Take back';
+            back.onclick = () => location.reload();
+            status.append(back);
+          } else {
+            setStatus('closed', 'disconnected · reloading…');
+            setTimeout(() => location.reload(), 3000);
+          }
+          break;
+      }
+    },
+  });
+  renderWindows();
+} catch (e) {
+  setStatus('closed', `failed to start: ${e}`);
+}
+</script>
+</body>
+</html>

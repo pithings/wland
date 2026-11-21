@@ -1,0 +1,256 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 30 960 294" width="960" height="294" role="img" aria-labelledby="t d">
+  <title id="t">How wland works</title>
+  <desc id="d">Unmodified Wayland apps talk to the wlandr relay over a unix socket on a Linux host, VM guest or container. The relay keeps file descriptors and forwards everything else over a WebSocket, vsock or any byte stream (STREAM) to the compositor, which runs as WebAssembly in a browser tab and draws each window.</desc>
+  <style>
+    svg {
+      --bg: #fafafa; --card: #ffffff; --sub: #f4f4f5; --fg: #171717; --muted: #737373;
+      --border: #e5e5e5; --line: #d4d4d4; --grid: #e4e4e7;
+      --blue: #0070f3; --violet: #7928ca; --ok: #16a34a;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Geist, Inter, Helvetica, Arial, sans-serif;
+      --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      svg {
+        --bg: #000000; --card: #0a0a0a; --sub: #141414; --fg: #ededed; --muted: #a1a1a1;
+        --border: #262626; --line: #3f3f46; --grid: #1c1c1f;
+        --blue: #3291ff; --violet: #a855f7; --ok: #22c55e;
+      }
+    }
+
+    .canvas { fill: var(--bg); stroke: var(--border); }
+    .dot { fill: var(--grid); }
+    .card { fill: var(--card); stroke: var(--border); }
+    .sub { fill: var(--sub); }
+    .rule { stroke: var(--border); }
+    .line { stroke: var(--line); fill: none; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
+    .bound { fill: none; stroke: var(--line); stroke-dasharray: 4 4; }
+    .knock { fill: var(--bg); }
+    .fg { fill: var(--fg); }
+    .mfill { fill: var(--line); }
+    .blue { fill: var(--blue); }
+    .violet { fill: var(--violet); }
+    .ok { fill: var(--ok); }
+
+    text { font-family: var(--sans); fill: var(--fg); }
+    .title { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+    .mono { font-family: var(--mono); }
+    .muted { fill: var(--muted); }
+    .s { font-size: 12px; }
+    .xs { font-size: 10.5px; }
+    .eyebrow { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; fill: var(--muted); }
+
+    .win { fill: var(--card); stroke: var(--line); }
+    .focus { fill: none; stroke: var(--fg); opacity: 0; }
+    .chip { fill: var(--sub); stroke: var(--border); }
+    .chip-hl { fill: none; stroke: var(--blue); opacity: 0; }
+
+    /* packets */
+    .r { animation: right 2.4s linear infinite; }
+    .l { animation: left 3.2s linear infinite; }
+    @keyframes right {
+      0% { transform: translateX(0); opacity: 0; }
+      15%, 85% { opacity: 1; }
+      100% { transform: translateX(112px); opacity: 0; }
+    }
+    @keyframes left {
+      0% { transform: translateX(0); opacity: 0; }
+      15%, 85% { opacity: 1; }
+      100% { transform: translateX(-112px); opacity: 0; }
+    }
+    .d1 { animation-delay: -0.8s; } .d2 { animation-delay: -1.6s; }
+    .d3 { animation-delay: -1.2s; } .d4 { animation-delay: -2.0s; }
+    .d5 { animation-delay: -0.4s; }
+
+    /* live dots on apps */
+    .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+    /* fds held in the relay */
+    .hold { animation: hold 2.4s ease-out infinite; }
+    @keyframes hold { 0%, 55% { opacity: 0; } 62% { opacity: 1; } 100% { opacity: 0; } }
+
+    /* the desktop inside the browser: 6s loop */
+    .cursor { animation: cursor 6s infinite; }
+    @keyframes cursor {
+      0%   { transform: translate(890px, 204px); animation-timing-function: ease-in-out; }
+      20%  { transform: translate(764px, 132px); }
+      45%  { transform: translate(764px, 132px); animation-timing-function: ease-in-out; }
+      64%  { transform: translate(852px, 170px); }
+      86%  { transform: translate(852px, 170px); animation-timing-function: ease-in-out; }
+      100% { transform: translate(890px, 204px); }
+    }
+    .ripple { transform-box: fill-box; transform-origin: center; opacity: 0; }
+    .ra { animation: ripA 6s ease-out infinite; }
+    .rb { animation: ripB 6s ease-out infinite; }
+    @keyframes ripA { 0%, 20% { opacity: 0; transform: scale(0.3); } 21% { opacity: 0.5; } 32%, 100% { opacity: 0; transform: scale(1.8); } }
+    @keyframes ripB { 0%, 64% { opacity: 0; transform: scale(0.3); } 65% { opacity: 0.5; } 76%, 100% { opacity: 0; transform: scale(1.8); } }
+    .fa { animation: focA 6s step-end infinite; }
+    .fb { animation: focB 6s step-end infinite; }
+    @keyframes focA { 0% { opacity: 0; } 21% { opacity: 1; } 65% { opacity: 0; } }
+    @keyframes focB { 0% { opacity: 1; } 21% { opacity: 0; } 65% { opacity: 1; } }
+    .type { transform-box: fill-box; transform-origin: 0 50%; transform: scaleX(0); }
+    .t1 { animation: t1 6s infinite; } .t2 { animation: t2 6s infinite; } .t3 { animation: t3 6s infinite; }
+    @keyframes t1 { 0%, 23% { transform: scaleX(0); opacity: 1; } 31% { transform: scaleX(1); } 92% { opacity: 1; transform: scaleX(1); } 100% { opacity: 0; transform: scaleX(1); } }
+    @keyframes t2 { 0%, 31% { transform: scaleX(0); opacity: 1; } 37% { transform: scaleX(1); } 92% { opacity: 1; transform: scaleX(1); } 100% { opacity: 0; transform: scaleX(1); } }
+    @keyframes t3 { 0%, 37% { transform: scaleX(0); opacity: 1; } 45% { transform: scaleX(1); } 92% { opacity: 1; transform: scaleX(1); } 100% { opacity: 0; transform: scaleX(1); } }
+    .t1, .t2, .t3 { animation-timing-function: steps(6, end); }
+    .blink { animation: blink 1s step-end infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .sel { animation: sel 6s step-end infinite; opacity: 0; }
+    @keyframes sel { 0% { opacity: 0; } 65% { opacity: 1; } 92% { opacity: 0; } }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; }
+      .type { transform: none; }
+      .r, .l, .sel { opacity: 1; }
+      .cursor { transform: translate(852px, 170px); }
+    }
+  </style>
+
+  <defs>
+    <pattern id="grid" width="16" height="16" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.9" class="dot"/>
+    </pattern>
+    <radialGradient id="fade" cx="50%" cy="45%" r="60%">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="gridmask"><rect width="960" height="324" fill="url(#fade)"/></mask>
+    <clipPath id="canvasclip"><rect x="0.5" y="30.5" width="959" height="293" rx="16"/></clipPath>
+  </defs>
+
+  <!-- canvas -->
+  <rect class="canvas" x="0.5" y="30.5" width="959" height="293" rx="16"/>
+  <rect width="960" height="324" fill="url(#grid)" mask="url(#gridmask)" clip-path="url(#canvasclip)"/>
+
+  <!-- linux host boundary -->
+  <rect class="bound" x="24.5" y="60.5" width="571" height="208" rx="14"/>
+  <rect class="knock" x="38" y="54" width="210" height="13"/>
+  <text class="eyebrow" x="44" y="64">LINUX<tspan opacity="0.6"> · HOST, VM OR CONTAINER</tspan></text>
+  <text class="eyebrow" x="722" y="64">BROWSER TAB<tspan opacity="0.6"> · ANY OS</tspan></text>
+
+  <!-- 1 · apps -->
+  <rect class="card" x="40.5" y="80.5" width="199" height="171" rx="10"/>
+  <text class="title" x="58" y="110">Wayland apps</text>
+  <text class="s muted" x="58" y="128">unmodified, real protocol</text>
+  <line class="rule" x1="41" y1="144.5" x2="239" y2="144.5"/>
+  <g class="mono">
+    <circle class="ok pulse" cx="62" cy="166" r="3"/>
+    <text class="s" x="74" y="170">foot</text>
+    <text class="xs muted" x="222" y="170" text-anchor="end">terminal</text>
+    <circle class="ok pulse d1" cx="62" cy="192" r="3"/>
+    <text class="s" x="74" y="196">nautilus</text>
+    <text class="xs muted" x="222" y="196" text-anchor="end">GTK</text>
+    <circle class="ok pulse d2" cx="62" cy="218" r="3"/>
+    <text class="s" x="74" y="222">xterm</text>
+    <text class="xs muted" x="222" y="222" text-anchor="end">X11</text>
+  </g>
+
+  <!-- link · unix socket -->
+  <text class="xs mono muted" x="310" y="138" text-anchor="middle">unix socket</text>
+  <path class="line" d="M248 152 H372 M366 148 L372 152 L366 156"/>
+  <path class="line" d="M248 180 H372 M254 176 L248 180 L254 184"/>
+  <text class="xs mono muted" x="310" y="202" text-anchor="middle">Wayland wire</text>
+  <circle class="blue r" cx="254" cy="152" r="3"/>
+  <circle class="blue r d1" cx="254" cy="152" r="3"/>
+  <circle class="blue r d2" cx="254" cy="152" r="3"/>
+  <circle class="violet l" cx="366" cy="180" r="3"/>
+  <circle class="violet l d4" cx="366" cy="180" r="3"/>
+
+  <!-- 2 · relay -->
+  <rect class="card" x="380.5" y="80.5" width="199" height="171" rx="10"/>
+  <text class="title mono" x="398" y="110" style="font-size:15px">wlandr</text>
+  <text class="s muted" x="398" y="128">relay</text>
+  <line class="rule" x1="381" y1="144.5" x2="579" y2="144.5"/>
+  <text class="eyebrow" x="398" y="166">FDS STAY HERE</text>
+  <g class="mono" font-size="11">
+    <rect class="chip" x="398.5" y="176.5" width="42" height="21" rx="5"/>
+    <rect class="chip-hl hold" x="398.5" y="176.5" width="42" height="21" rx="5"/>
+    <text x="419.5" y="191" text-anchor="middle">shm</text>
+    <rect class="chip" x="447.5" y="176.5" width="60" height="21" rx="5"/>
+    <rect class="chip-hl hold d1" x="447.5" y="176.5" width="60" height="21" rx="5"/>
+    <text x="477.5" y="191" text-anchor="middle">keymap</text>
+    <rect class="chip" x="514.5" y="176.5" width="48" height="21" rx="5"/>
+    <rect class="chip-hl hold d2" x="514.5" y="176.5" width="48" height="21" rx="5"/>
+    <text x="538.5" y="191" text-anchor="middle">pipes</text>
+  </g>
+  <text class="s muted" x="398" y="228">forwards the rest as is</text>
+
+  <!-- link · websocket -->
+  <text class="xs mono muted" x="650" y="138" text-anchor="middle">WebSocket</text>
+  <path class="line" d="M588 152 H712 M706 148 L712 152 L706 156"/>
+  <path class="line" d="M588 180 H712 M594 176 L588 180 L594 184"/>
+  <text class="xs mono muted" x="650" y="202" text-anchor="middle">STREAM</text>
+  <text class="xs mono muted" x="650" y="218" text-anchor="middle" opacity="0.6">or vsock · fd</text>
+  <rect class="blue r d5" x="589" y="149" width="6" height="6" rx="1"/>
+  <rect class="blue r d3" x="589" y="149" width="6" height="6" rx="1"/>
+  <rect class="blue r d4" x="589" y="149" width="6" height="6" rx="1"/>
+  <circle class="violet l d3" cx="706" cy="180" r="3"/>
+  <circle class="violet l d5" cx="706" cy="180" r="3"/>
+
+  <!-- 3 · browser -->
+  <rect class="card" x="720.5" y="80.5" width="199" height="171" rx="10"/>
+  <circle class="mfill" cx="734" cy="91.5" r="3"/>
+  <circle class="mfill" cx="744" cy="91.5" r="3"/>
+  <circle class="mfill" cx="754" cy="91.5" r="3"/>
+  <rect class="sub" x="768" y="85.5" width="138" height="12" rx="6"/>
+  <text class="mono muted" x="837" y="94.5" text-anchor="middle" font-size="8.5">localhost:8080</text>
+  <rect class="sub" x="721" y="102" width="198" height="118"/>
+  <line class="rule" x1="721" y1="102.5" x2="919" y2="102.5"/>
+  <line class="rule" x1="721" y1="220.5" x2="919" y2="220.5"/>
+
+  <!-- window A: terminal -->
+  <rect class="win" x="732.5" y="112.5" width="112" height="70" rx="4"/>
+  <rect class="focus fa" x="732.5" y="112.5" width="112" height="70" rx="4"/>
+  <line class="rule" x1="733" y1="124.5" x2="844" y2="124.5"/>
+  <circle class="mfill" cx="739" cy="118.5" r="1.6"/>
+  <circle class="mfill" cx="745" cy="118.5" r="1.6"/>
+  <circle class="mfill" cx="751" cy="118.5" r="1.6"/>
+  <rect class="fg type t1" x="740" y="131" width="66" height="3" rx="1"/>
+  <rect class="fg type t2" x="740" y="138" width="42" height="3" rx="1"/>
+  <rect class="blue type t3" x="740" y="145" width="76" height="3" rx="1"/>
+  <rect class="ok" x="740" y="152" width="5" height="3" rx="1"/>
+  <rect class="fg blink" x="749" y="151" width="4" height="5"/>
+
+  <!-- window B: files -->
+  <rect class="win" x="790.5" y="146.5" width="118" height="68" rx="4"/>
+  <rect class="focus fb" x="790.5" y="146.5" width="118" height="68" rx="4"/>
+  <line class="rule" x1="791" y1="157.5" x2="908" y2="157.5"/>
+  <circle class="mfill" cx="797" cy="152" r="1.6"/>
+  <circle class="mfill" cx="803" cy="152" r="1.6"/>
+  <circle class="mfill" cx="809" cy="152" r="1.6"/>
+  <rect class="sub" x="791" y="158" width="21" height="56"/>
+  <rect class="mfill" x="795" y="164" width="13" height="2" rx="1"/>
+  <rect class="mfill" x="795" y="170" width="10" height="2" rx="1"/>
+  <rect class="mfill" x="795" y="176" width="12" height="2" rx="1"/>
+  <rect class="blue sel" x="842" y="162" width="24" height="26" rx="3" fill-opacity="0.15"/>
+  <g class="mfill">
+    <path d="M820 168 h6 l2 2 h8 v10 h-16 z"/>
+    <path d="M846 168 h6 l2 2 h8 v10 h-16 z"/>
+    <path d="M872 168 h6 l2 2 h8 v10 h-16 z"/>
+    <path d="M820 192 h6 l2 2 h8 v10 h-16 z"/>
+    <path d="M846 192 h6 l2 2 h8 v10 h-16 z"/>
+    <rect x="821" y="183" width="14" height="2" rx="1"/>
+    <rect x="847" y="183" width="14" height="2" rx="1"/>
+    <rect x="873" y="183" width="14" height="2" rx="1"/>
+    <rect x="821" y="207" width="14" height="2" rx="1"/>
+    <rect x="847" y="207" width="14" height="2" rx="1"/>
+  </g>
+
+  <!-- pointer -->
+  <circle class="ripple ra" cx="764" cy="132" r="7" fill="var(--blue)"/>
+  <circle class="ripple rb" cx="852" cy="170" r="7" fill="var(--blue)"/>
+  <g class="cursor">
+    <path d="M0 0 V12 L3.2 9 L5.6 14 L7.6 13.1 L5.2 8.3 H9.4 Z" fill="var(--fg)" stroke="var(--card)" stroke-width="1" stroke-linejoin="round"/>
+  </g>
+
+  <text class="s" x="734" y="241" font-weight="600">compositor</text>
+  <text class="xs mono muted" x="906" y="241" text-anchor="end">Zig → wasm</text>
+
+  <!-- legend -->
+  <rect class="blue" x="40" y="294" width="7" height="7" rx="1"/>
+  <text class="s muted" x="54" y="301">surfaces &amp; pixels <tspan opacity="0.7">(changed rects, compressed)</tspan></text>
+  <circle class="violet" cx="384" cy="297.5" r="3.5"/>
+  <text class="s muted" x="394" y="301">input, clipboard, resize</text>
+  <text class="xs mono muted" x="920" y="301" text-anchor="end">idle desktop = 0 bytes</text>
+</svg>

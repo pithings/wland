@@ -1,0 +1,12 @@
+{
+  // Tests and Node-side tools: same rules as the lib, minus declarations;
+  // allowJs for the plain-JS Wayland helpers in support/ (a JS relay,
+  // synthetic clients, the STREAM encoder).
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "declaration": false,
+    "isolatedDeclarations": false,
+    "allowJs": true
+  },
+  "include": [".", "../tools/relay-e2e-test.ts", "../tools/headless-e2e-test.ts", "../build.config.ts"]
+}

@@ -1,0 +1,225 @@
+# Release: build the package from source (zig: wlandr, the static release
+# binaries and the core wasm; obuild: lib/ → dist/, the page included),
+# tag the commit v<version>, publish it to npm and publish a GitHub release
+# (a normal one, marked latest, its notes a compare link from the previous
+# v* tag) with the npm tarball and the static wlandr binaries attached
+# (wland.tgz, wlandr-linux-x64.tar.gz, wlandr-linux-arm64.tar.gz, each
+# holding an executable `wlandr`).
+#
+# Runs:
+#   - by hand from main (Actions > Release > Run workflow): a release with
+#     a generated version <package.json version>-<YYMMDD>-<commit>, e.g.
+#     0.1.0-261121-e6c8140 (the commit's UTC date and short hash). After the
+#     build passes it tags the commit v<version>. Unchecking "publish" makes
+#     it a dry run (same build and version, no tag, npm or GitHub release).
+#   - on a pushed tag v<version> that points at a commit on main: a release
+#     of that version.
+# Any other ref is refused before anything is built.
+#
+# npm auth: the repository is private, so npm trusted publishing (OIDC) and
+# provenance are not available yet; publishing uses the NPM_TOKEN secret
+# (a granular automation token). Once the repo is public, set up trusted
+# publishing on npmjs.com for this workflow file, then follow the
+# "TRUSTED PUBLISHING" comments below and delete the secret.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Tag this commit v<version>-<YYMMDD>-<commit>, publish to npm and on GitHub (unchecked = dry run)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build, tag and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # the tag and the GitHub release
+      # TRUSTED PUBLISHING: uncomment (OIDC token for npm, and provenance).
+      # id-token: write
+    steps:
+      # Full history and tags, to find the previous tag for the release notes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check the ref and pick the version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          case "$GITHUB_REF" in
+          refs/heads/main)
+            base="$(jq -r .version package.json)"
+            date="$(TZ=UTC git show -s --date=format-local:%y%m%d --format=%cd "$GITHUB_SHA")"
+            # One prerelease identifier (hyphens do not split it), so a commit
+            # like 0123456 is fine, and same-base versions sort by date.
+            version="$base-$date-${GITHUB_SHA::7}"
+            publish="${PUBLISH_INPUT:-true}"
+            if [ "$publish" = true ] && gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" --silent 2>/dev/null; then
+              echo "::error::tag v$version exists already: this commit has been released"
+              exit 1
+            fi
+            ;;
+          refs/tags/v*)
+            # "identical" or "behind": the tagged commit is main or an ancestor of it.
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)"
+            case "$status" in
+            identical | behind) ;;
+            *) echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main (compare: $status)"; exit 1 ;;
+            esac
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+            ;;
+          *) echo "::error::releases run only from main or a v* tag on main, not $GITHUB_REF"; exit 1 ;;
+          esac
+          n='(0|[1-9][0-9]*)' id='(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)'
+          [[ "$version" =~ ^$n\.$n\.$n(-$id(\.$id)*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$ ]] ||
+            { echo "::error::$version is not a semver version"; exit 1; }
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "ok: $GITHUB_REF ($GITHUB_SHA), $([ "$publish" = true ] && echo "release" || echo "dry run") of $version"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12
+
+      # registry-url makes setup-node write an .npmrc that reads NODE_AUTH_TOKEN.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      # obuild runs the zig builds (`zig build`, `zig build release`) itself
+      # (build.config.ts). -Dcpu=baseline is not needed:
+      # the release binaries are cross-compiled for fixed targets.
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          npm pkg set version="$VERSION"
+          pnpm build
+          ls -l dist/wland.wasm dist/wlandr-linux-*.br dist/index.html
+
+      - name: Test
+        run: npm test
+
+      # prepack would rebuild; the build above is what gets packed. The
+      # release's assets: the npm tarball (a fixed name; the version is inside
+      # and in the tag) and the static wlandr binaries, one .tar.gz per arch.
+      - name: Pack
+        run: |
+          mkdir -p out
+          mv "out/$(npm pack --ignore-scripts --pack-destination out | tail -1)" out/wland.tgz
+          tar -tzf out/wland.tgz | sort
+          echo "npm package: $(stat -c %s out/wland.tgz) bytes packed"
+          # One tarball per arch holding an executable `wlandr` (the mode
+          # survives, unlike a bare download), ~1/3 of the binary's size.
+          for arch in x64 arm64; do
+            install -D -m 0755 "zig-out/release/wlandr-linux-$arch" "pkg-$arch/wlandr"
+            tar -C "pkg-$arch" --owner=0 --group=0 --numeric-owner -czf "out/wlandr-linux-$arch.tar.gz" wlandr
+            tar -tvzf "out/wlandr-linux-$arch.tar.gz"
+          done
+          ls -l out
+          (cd out && sha256sum -- *)
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wland-${{ steps.version.outputs.version }}
+          path: out/
+          if-no-files-found: error
+
+      # A pushed tag exists already; a manual release creates it here, on
+      # the commit that was built.
+      - name: Create the tag
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2>/dev/null; then
+            echo "$TAG exists"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" --silent
+            echo "created $TAG at $GITHUB_SHA"
+          fi
+
+      # Re-runnable: a version already on npm is skipped. Every release goes
+      # to the dist-tag latest; npm refuses to publish a semver prerelease
+      # (every generated version) without an explicit --tag, hence the flag.
+      - name: Publish to npm
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          # TRUSTED PUBLISHING: delete this line (npm then uses the OIDC token).
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm --version
+          if [ "$(npm view "wland@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "wland@$VERSION is on npm already"
+            exit 0
+          fi
+          npm publish ./out/wland.tgz --access public --tag latest
+          # TRUSTED PUBLISHING: use this instead (provenance needs a public repo).
+          # npm publish ./out/wland.tgz --access public --tag latest --provenance
+
+      # Re-runnable: an existing release gets the assets it lacks and is
+      # published if a cut-off run left it a draft.
+      - name: Publish the GitHub release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          # gh uploads the assets to a draft and publishes it after the last
+          # one: a run cut off in between leaves a draft without some of them.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            have="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            for f in out/*; do
+              grep -qxF "$(basename "$f")" <<<"$have" || gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+            done
+            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            fi
+            echo "release $TAG exists"
+            exit 0
+          fi
+          # The notes: the diff from the previous v* tag on main's history (an
+          # existing release keeps its notes, which may have been edited).
+          if prev="$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA^" 2>/dev/null)"; then
+            notes="**Full Changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$prev...$TAG"
+          else
+            notes="**Full Changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commits/$TAG"
+          fi
+          echo "$notes"
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+            --latest --verify-tag --notes "$notes" --title "$TAG"

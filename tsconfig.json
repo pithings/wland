@@ -1,0 +1,24 @@
+{
+  // Sources run as-is on Node's native type stripping (erasable syntax only,
+  // explicit `.ts` import extensions); `tsc` only type-checks. obuild
+  // (build.config.ts) emits dist/ JS + .d.mts per file (isolatedDeclarations
+  // keeps every export's type spelled out, so declarations need no type
+  // inference).
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "lib": ["esnext", "dom"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "declaration": true,
+    "isolatedDeclarations": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "skipLibCheck": true
+  },
+  "include": ["lib"]
+}

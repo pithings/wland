@@ -1,0 +1,20 @@
+{
+  // Type-check only: Vite (esbuild) compiles the page. The lib comes in as
+  // `wland/*` from its TypeScript source, as in vite.config.ts.
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    // *.css imports, import.meta.env
+    "types": ["vite/client"],
+    "paths": { "wland/*": ["../lib/*.ts"] }
+  },
+  "include": ["src", "vite.config.ts", "vite-wlandr.ts"]
+}

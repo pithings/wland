@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Launch a wayland app against wland with all required env set — no manual vars.
+#   tools/wland-run foot
+#   tools/wland-run nautilus      (GTK: session bus + cairo renderer handled)
+set -euo pipefail
+[[ $# -ge 1 ]] || { echo "usage: $0 <app> [args...]" >&2; exit 2; }
+
+# The client defaults (what libwayland does): $WAYLAND_DISPLAY or wayland-0 in
+# XDG_RUNTIME_DIR, falling back to /tmp/wland-run like the server when unset.
+# The server takes the first free wayland-N (or its --display), so export
+# WAYLAND_DISPLAY when it printed another name.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wland-run}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+
+# fail fast with a useful message instead of GTK's cryptic "Failed to open
+# display" when the server isn't up (stale socket files linger after exits)
+SOCK="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+# grep WITHOUT -q: under pipefail, grep -q's early exit SIGPIPEs ss once its
+# output tops the pipe buffer (lots of sockets, e.g. chromium running) and the
+# pipeline "fails" despite the match → bogus "no compositor" (E2E flake).
+if [[ ! -S "$SOCK" ]] || { command -v ss >/dev/null && ! ss -lx 2>/dev/null | grep -F "$SOCK" >/dev/null; }; then
+  echo "wland-run: no compositor listening at $SOCK" >&2
+  echo "  start one with: tools/run-poc.sh --demo   (then open http://localhost:8080)" >&2
+  exit 1
+fi
+
+# X11 apps: the server leaves its X display (xwayland-satellite) in
+# <socket>.x11; any other DISPLAY is some other X server.
+unset DISPLAY
+if [[ -r "$SOCK.x11" ]]; then DISPLAY="$(<"$SOCK.x11")"; export DISPLAY; fi
+
+# Chromium: three container traps crash it otherwise (.agents/gotchas.md) —
+# chrome-sandbox lacks its setuid bit (→ --no-sandbox), there are no DRM
+# render nodes and wland has no GPU client path (→ --disable-gpu), and the
+# 64M Docker-default /dev/shm OOM-SIGTRAPs the software compositor mid-paint
+# (→ --disable-dev-shm-usage). Duplicated flags are harmless if the caller
+# passes their own.
+case "$(basename "$1")" in
+  chromium*|chrome*|google-chrome*)
+    set -- "$@" --no-sandbox --disable-gpu --disable-dev-shm-usage
+    # Chromium LOG(FATAL)s (SIGTRAP + core) whenever its wl_display dies —
+    # every server restart / tab takeover would drop a ~400M core.<pid> in
+    # the server's CWD. Suppress cores; delete this line to diagnose a real
+    # chromium crash.
+    ulimit -c 0 ;;
+esac
+
+# GTK apps: wland has no GPU path → cairo software renderer; pin the backend.
+# XDG_SESSION_TYPE quiets nautilus's (nonfatal) "Unsupported or missing
+# session type ''" complaint — containers have no logind session.
+export GDK_BACKEND=wayland GSK_RENDERER=cairo XDG_SESSION_TYPE=wayland
+
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v dbus-run-session >/dev/null; then
+  # GTK apps (nautilus) refuse to start without a session bus; chromium and
+  # foot run without one (chromium logs D-Bus errors)
+  exec dbus-run-session -- "$@"
+fi
+exec "$@"

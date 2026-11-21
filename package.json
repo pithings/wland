@@ -1,0 +1,48 @@
+{
+  "name": "wland",
+  "version": "0.1.0",
+  "description": "🪟 Wayland apps, composited in the browser: a Wayland compositor in WebAssembly.",
+  "keywords": [
+    "wayland",
+    "compositor",
+    "browser",
+    "wasm",
+    "zig",
+    "remote-desktop"
+  ],
+  "license": "MPL-2.0 AND MIT",
+  "author": "Pooya Parsa <pooya@pi0.io>",
+  "repository": "pithings/wland",
+  "type": "module",
+  "bin": {
+    "wland": "./dist/cli.mjs"
+  },
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./client": "./dist/client.mjs",
+    "./engine": "./dist/engine.mjs",
+    "./headless": "./dist/headless.mjs",
+    "./wland.wasm": "./dist/wland.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "os": [
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "obuild",
+    "prepack": "npm run build",
+    "test": "zig build test && tools/smoke.sh && npm run typecheck && node --test test/*.test.ts",
+    "typecheck": "tsc -p . && tsc -p test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "obuild": "^0.4.45",
+    "typescript": "^7.0.2"
+  }
+}
