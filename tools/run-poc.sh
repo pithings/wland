@@ -26,6 +26,9 @@
 #   constraints  weston-constraints: confine, Pointer Lock, relative motion
 #                (fixture: constraints)
 #   states       foot: fullscreen (+ the browser's), minimize/restore (fixture: term)
+#   embedder     foot: an embedder's window manager — interactive move/resize
+#                and Alt+drag handed over, grabs ended by a blur, autoFocus
+#                off (fixture: term)
 #   retina       dpr 2
 #   takeover     a second tab takes the session
 #   handle-demo  the handle path in one page (2D + software WebGL)
@@ -33,7 +36,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_GROUPS=(foot gtk cursor constraints states retina takeover handle-demo relay)
+ALL_GROUPS=(foot gtk cursor constraints states embedder retina takeover handle-demo relay)
 DEMO=0
 ONLY=()
 for arg in "$@"; do
@@ -280,6 +283,11 @@ fi
 if want states; then
 echo "== window states: fullscreen (+ the browser's), minimize, restore =="
 $E2E states $CDP               # reloads the page with ?browserfs=1, spawns foot itself
+fi
+
+if want embedder; then
+echo "== the embedder's window manager: interactive move/resize, grabs, autoFocus off =="
+$E2E embedder $CDP             # reloads the page per mode, spawns foot itself
 fi
 
 if want retina; then

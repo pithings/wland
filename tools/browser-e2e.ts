@@ -46,7 +46,14 @@
 //   states       ?browserfs=1, spawns foot: Alt+F11 fills the desktop and
 //                takes the browser's fullscreen, leaving that ends foot's;
 //                Alt+F9 hides it, windows()[0].raise() restores it focused
-//   retina       dpr 2 → 2x buffers shown at logical size (spawns foot)
+//   embedder     reloads with ?embedder=1, ?altdrag=0, ?autofocus=0, spawns
+//                terms itself: a blur mid-drag ends wland's own grab and an
+//                embedder's input.grab (the next drag works); the embedder's
+//                `interactive` takes a move, a resize and an Alt+drag with
+//                their press (no grab of wland's); Alt+drag off leaves the
+//                press to the app and Alt+F10 on; autoFocus off focuses
+//                nothing by itself, input.focus() does
+//   retina      dpr 2 → 2x buffers shown at logical size (spawns foot)
 //   takeover     the first tab after a second connected: notice, no reload
 //   webgl        forced GL present path, software GL at dpr 1 (spawns foot)
 //   clipboard    foot: the clipboard bridge (lib/clipboard.ts) in a real
@@ -1051,6 +1058,244 @@ const phases: Record<string, () => Promise<void>> = {
       console.log("states ok: Alt+F11 with the browser's fullscreen, its exit ends foot's, Alt+F9 hides, raise() restores");
     } finally {
       foot.kill();
+      await call("Page.navigate", { url: `${base}/` });
+      await sleep(1000);
+      await waitOnline();
+    }
+  },
+
+  // The embedder's window manager owning interaction and focus (each mode a
+  // page reload with its query, term fixtures spawned here, killed after):
+  //  default      a grab of wland's own (the term's titlebar → move) ended
+  //               by a window blur mid-drag, then a second drag works
+  //  ?embedder=1  the page's `interactive` takes a move (titlebar), a resize
+  //               (border) and an Alt+drag, each with the press it came
+  //               from: wland starts no grab (left/top and size stay, no
+  //               requestResize), the page's input.grab holds the app off
+  //               the pointer; a window blur mid-drag ends that grab, the
+  //               next drag is taken again
+  //  ?altdrag=0   an Alt+press goes to the app, the window stays; Alt+F10
+  //               still maximizes
+  //  ?autofocus=0 no window focused at map or press; input.focus() gives it
+  //               (keys reach the app); the focused app going leaves none
+  //               focused; focus() on the other works
+  async embedder() {
+    await call("Page.enable");
+    const base = await evalJs("location.origin");
+    const apps: ReturnType<typeof spawnApp>[] = [];
+    const load = async (query: string) => {
+      for (const a of apps.splice(0)) a.kill();
+      await call("Page.navigate", { url: `${base}/${query}` });
+      await sleep(1000);
+      await waitOnline();
+    };
+    // the newest window (or window `key`): its box, the grid canvas, focus
+    const st = (key = ""): Promise<any> => evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const wl = window.wland, vws = wl.view.windows(), es = wl.windows();
+      const i = ${JSON.stringify(key)} ? vws.findIndex((w) => w.key === ${JSON.stringify(key)}) : vws.length - 1;
+      const w = vws[i];
+      if (!w) return null;
+      const c = wl.view.canvas(w.conn, w.surface), r = c.getBoundingClientRect();
+      return { key: w.key, conn: w.conn, surface: w.surface, left: w.element.style.left, top: w.element.style.top,
+        translate: w.element.style.translate || '', maximized: es[i].maximized, focused: es[i].focused,
+        anyFocused: es.some((e) => e.focused), x: r.left, y: r.top, w: parseFloat(c.style.width), h: parseFloat(c.style.height),
+        sinkFocused: document.activeElement && document.activeElement.contentEditable === 'true' };
+    })()`);
+    const until = async (ok: (s: any) => boolean, what: string, key = "") => {
+      let s = await st(key);
+      for (let i = 0; i < 50 && !(s && ok(s)); i++) { await sleep(200); s = await st(key); }
+      if (!(s && ok(s))) fail(`${what}: ${JSON.stringify(s)}`);
+      return s;
+    };
+    const spawnTerm = async (what: string) => {
+      const before: string[] = await evalJs("window.wland.view.windows().map((w) => w.key)");
+      apps.push(spawnApp("term"));
+      return until((s) => !before.includes(s.key) && s.w > 100 && s.h > 100, what);
+    };
+    // engine calls the app side would see, recorded from here on
+    const record = (names: string[]) => evalJs(`(() => {
+      const e = window.wland.engine, seen = window.e2eSeen = [];
+      for (const name of ${JSON.stringify(names)}) {
+        if (!e['_' + name]) e['_' + name] = e[name];
+        const orig = e['_' + name];
+        e[name] = (...a) => { seen.push([name, ...a]); return orig(...a); };
+      }
+    })()`);
+    const seen = async (): Promise<string[]> => (await evalJs("window.e2eSeen")).map((c: any[]) => c[0]);
+    const blur = () => evalJs("window.dispatchEvent(new Event('blur'))");
+    const press = (x: number, y: number, modifiers = 0) => mouse("mousePressed", x, y, { button: "left", buttons: 1, clickCount: 1, modifiers });
+    const moveTo = async (x: number, y: number, modifiers = 0) => { await mouse("mouseMoved", x, y, { button: "left", buttons: 1, modifiers }); await sleep(40); };
+    const release = (x: number, y: number, modifiers = 0) => mouse("mouseReleased", x, y, { button: "left", buttons: 0, clickCount: 1, modifiers });
+    const close = (a: number, b: number) => Math.abs(a - b) <= 1;
+    try {
+      // --- default: wland's own grab, a blur mid-drag, a second drag -------
+      await load("");
+      let s = await spawnTerm("a term mapped");
+      let tx = s.x + 60, ty = s.y - 13; // its titlebar (above the grid)
+      await mouse("mouseMoved", tx, ty);
+      await press(tx, ty);
+      await sleep(200); // the app asks for the move
+      const l0 = parseFloat(s.left);
+      await moveTo(tx + 20, ty + 10);
+      await moveTo(tx + 40, ty + 20);
+      s = await until((v) => close(parseFloat(v.left), l0 + 40), "the titlebar drag moves the window (wland's grab)");
+      const movedTo = s.left;
+      await blur();
+      await moveTo(tx + 140, ty + 60);
+      await sleep(200);
+      s = await st(s.key);
+      if (s.left !== movedTo) fail(`the window's blur did not end wland's grab: ${movedTo} → ${s.left}`);
+      if (await evalJs("document.body.style.cursor") !== "") fail("the grab's cursor is left on");
+      await release(tx + 140, ty + 60);
+      await sleep(200);
+      tx = s.x + 60; ty = s.y - 13;
+      await mouse("mouseMoved", tx, ty);
+      await press(tx, ty);
+      await sleep(200);
+      await moveTo(tx + 30, ty + 15);
+      await moveTo(tx + 60, ty + 30);
+      await release(tx + 60, ty + 30);
+      const s2 = await until((v) => close(parseFloat(v.left), l0 + 100), "a second drag after the blur moves the window again");
+      console.log(`wland's grab: dragged to ${movedTo}, a blur ended it, the next drag moved it to ${s2.left}`);
+
+      // --- ?embedder=1: the page's window manager takes them ---------------
+      await load("?embedder=1");
+      s = await spawnTerm("a term mapped (embedder page)");
+      const asked = (): Promise<any[]> => evalJs("window.wlandEmbedder");
+      const left0 = s.left, top0 = s.top;
+      await record(["pointerMotion", "pointerButton", "requestResize"]);
+      // a move from the app (its titlebar)
+      tx = Math.round(s.x + 60); ty = Math.round(s.y - 13);
+      await mouse("mouseMoved", tx, ty);
+      await press(tx, ty);
+      for (let i = 0; i < 25 && !(await asked()).length; i++) await sleep(100);
+      await record(["pointerMotion", "pointerButton", "requestResize"]);
+      await moveTo(tx + 25, ty + 10);
+      await moveTo(tx + 50, ty + 20);
+      await release(tx + 50, ty + 20);
+      await sleep(200);
+      let a = await asked();
+      s = await st(s.key);
+      const mv = a[0];
+      console.log(`move: ${JSON.stringify(mv)}; box ${s.left},${s.top} translate "${s.translate}"; app saw ${JSON.stringify(await seen())}`);
+      if (!mv || mv.type !== "move" || mv.conn !== s.conn || mv.surface !== s.surface) fail(`the hook was not asked for the move: ${JSON.stringify(a)}`);
+      if (mv.press.pointerType !== "mouse" || mv.press.button !== 0 || mv.press.buttons !== 1 || !close(mv.press.clientX, tx) || !close(mv.press.clientY, ty)) {
+        fail(`the press handed over is not the CDP press at ${tx},${ty}: ${JSON.stringify(mv.press)}`);
+      }
+      if (!mv.active || mv.ended !== "release" || mv.moves < 2) fail(`the page's grab: ${JSON.stringify(mv)}`);
+      if (s.left !== left0 || s.top !== top0) fail(`wland moved the window itself: ${left0},${top0} → ${s.left},${s.top}`);
+      if (s.translate !== "50px 20px") fail(`the embedder's move did not follow the pointer: "${s.translate}"`);
+      if ((await seen()).length) fail("the app got pointer events during the embedder's grab");
+      // a resize from the app (its right border, just outside the box)
+      const rx = Math.round(s.x + s.w + 2), ry = Math.round(s.y + s.h / 2);
+      const w0 = s.w;
+      await mouse("mouseMoved", rx, ry);
+      await press(rx, ry);
+      for (let i = 0; i < 25 && (await asked()).length < 2; i++) await sleep(100);
+      await moveTo(rx + 60, ry);
+      await moveTo(rx + 120, ry);
+      await release(rx + 120, ry);
+      await sleep(500);
+      a = await asked();
+      s = await st(s.key);
+      const rs = a[1];
+      console.log(`resize: ${JSON.stringify(rs)}; grid ${w0} → ${s.w}`);
+      if (!rs || rs.type !== "resize" || !(rs.edges & 8) || !close(rs.press.clientX, rx) || !close(rs.press.clientY, ry)) fail(`the hook was not asked for the resize as pressed: ${JSON.stringify(rs)}`);
+      if (rs.ended !== "release" || s.w !== w0 || s.left !== left0) fail(`wland resized or moved the window itself: ${JSON.stringify(s)}`);
+      if ((await seen()).includes("requestResize")) fail("wland asked the app for a size");
+      // Alt+drag: an 'alt-drag', the page moves the window
+      const ax = Math.round(s.x + s.w / 2), ay = Math.round(s.y + s.h / 2);
+      await mouse("mouseMoved", ax, ay);
+      await press(ax, ay, 1);
+      await moveTo(ax + 30, ay + 30, 1);
+      await release(ax + 30, ay + 30, 1);
+      await sleep(200);
+      a = await asked();
+      s = await st(s.key);
+      const ad = a[2];
+      if (!ad || ad.type !== "alt-drag" || !close(ad.press.clientX, ax) || ad.ended !== "release" || ad.moves < 1) fail(`Alt+drag: ${JSON.stringify(a)}`);
+      if (s.left !== left0 || s.translate !== "80px 50px") fail(`Alt+drag moved by wland or not by the page: ${JSON.stringify(s)}`);
+      console.log(`alt-drag: ${JSON.stringify(ad)}; translate "${s.translate}"`);
+      // a window blur mid-drag ends the page's grab (no pointerup: touch)
+      tx = Math.round(s.x + 60); ty = Math.round(s.y - 13);
+      await mouse("mouseMoved", tx, ty);
+      await press(tx, ty);
+      for (let i = 0; i < 25 && (await asked()).length < 4; i++) await sleep(100);
+      await moveTo(tx + 10, ty);
+      await blur();
+      a = await asked();
+      if (!a[3] || a[3].type !== "move" || a[3].ended !== "blur") fail(`a blur mid-drag: ${JSON.stringify(a[3])}`);
+      await record(["pointerMotion", "pointerButton"]);
+      await moveTo(tx + 20, ty);
+      await release(tx + 20, ty);
+      await sleep(200);
+      if (!(await seen()).includes("pointerMotion")) fail("after the blur the app does not get the pointer back");
+      // ... and the next drag is taken, and held, again
+      s = await st(s.key);
+      tx = Math.round(s.x + 60); ty = Math.round(s.y - 13);
+      await mouse("mouseMoved", tx, ty);
+      await press(tx, ty);
+      for (let i = 0; i < 25 && (await asked()).length < 5; i++) await sleep(100);
+      await record(["pointerMotion", "pointerButton"]);
+      await moveTo(tx + 15, ty + 5);
+      await release(tx + 15, ty + 5);
+      await sleep(200);
+      a = await asked();
+      if (!a[4] || a[4].type !== "move" || !a[4].active || a[4].ended !== "release" || a[4].moves < 1) fail(`the drag after the blur: ${JSON.stringify(a[4])}`);
+      if ((await seen()).length) fail(`the drag after the blur did not hold the app off: ${JSON.stringify(await seen())}`);
+      console.log("embedder ok: move, resize and Alt+drag handed over with their press, no grab of wland's; a blur mid-drag ends the page's grab, the next drag is held again");
+
+      // --- ?altdrag=0: Alt+press is the app's; Alt+F10 still works ---------
+      await load("?altdrag=0");
+      s = await spawnTerm("a term mapped (altdrag=0)");
+      await record(["pointerButton"]);
+      const bx = Math.round(s.x + s.w / 2), by = Math.round(s.y + s.h / 2);
+      await mouse("mouseMoved", bx, by);
+      await press(bx, by, 1);
+      await moveTo(bx + 60, by + 40, 1);
+      await release(bx + 60, by + 40, 1);
+      await sleep(300);
+      const s3 = await st(s.key);
+      const buttons = (await evalJs("window.e2eSeen")).filter((c: any[]) => c[0] === "pointerButton").map((c: any[]) => c[4]);
+      if (s3.left !== s.left || s3.top !== s.top) fail(`Alt+drag moved the window with drag off: ${s.left},${s.top} → ${s3.left},${s3.top}`);
+      if (JSON.stringify(buttons) !== "[true,false]") fail(`the Alt+press did not reach the app: buttons ${JSON.stringify(buttons)}`);
+      await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "F10", code: "F10", windowsVirtualKeyCode: 121, modifiers: 1 });
+      await call("Input.dispatchKeyEvent", { type: "keyUp", key: "F10", code: "F10", windowsVirtualKeyCode: 121, modifiers: 1 });
+      await until((v) => v.maximized, "Alt+F10 still maximizes with Alt+drag off", s.key);
+      console.log("altdrag=0 ok: the Alt+press went to the app, the window stayed; Alt+F10 maximized it");
+
+      // --- ?autofocus=0: focus only when told ------------------------------
+      await load("?autofocus=0");
+      const t1 = await spawnTerm("the first term (autofocus=0)");
+      const t2 = await spawnTerm("the second term (autofocus=0)");
+      if (t1.anyFocused || t2.anyFocused) fail(`a window took focus at map: ${JSON.stringify(t2)}`);
+      await click(Math.round(t2.x + t2.w / 2), Math.round(t2.y + t2.h / 2), 100);
+      await sleep(200);
+      if ((await st(t2.key)).anyFocused) fail("a press focused a window");
+      await evalJs(`window.wland.input.focus(${t2.conn}, ${t2.surface})`);
+      let f = await until((v) => v.focused && v.sinkFocused, "input.focus() gives it, the IME sink has the page's focus", t2.key);
+      const sum = (): Promise<number> => evalJs(`(() => {
+        const c = window.wland.view.canvas(${t2.conn}, ${t2.surface}), d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        let s = 0;
+        for (let i = 0; i < d.length; i += 4) s = (s * 31 + d[i] + d[i + 1] * 7 + d[i + 2] * 13) >>> 0;
+        return s;
+      })()`);
+      const before = await sum();
+      await typeText("echo hi");
+      await sleep(500);
+      if ((await sum()) === before) fail("keys after input.focus() did not reach the app");
+      // the focused app goes: nobody else is given the keyboard
+      apps[1]!.kill();
+      await until((v) => v.key === t1.key, "the second term gone", "");
+      await sleep(500);
+      f = await st(t1.key);
+      if (f.anyFocused) fail(`focus passed on by itself: ${JSON.stringify(f)}`);
+      await evalJs(`window.wland.input.focus(${t1.conn}, ${t1.surface})`);
+      await until((v) => v.focused, "input.focus() on the one left", t1.key);
+      console.log("autofocus=0 ok: nothing focused at map or press, focus() gives it (keys reach the app), the focused app going leaves none focused");
+    } finally {
+      for (const a of apps.splice(0)) a.kill();
       await call("Page.navigate", { url: `${base}/` });
       await sleep(1000);
       await waitOnline();
