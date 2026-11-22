@@ -140,6 +140,8 @@ const fixed_neg_one: i32 = -256;
 const frac_err_fractional_scale_exists: u32 = 0;
 // xdg_surface.error
 const xdg_surface_err_invalid_size: u32 = 5;
+// xdg_toplevel.error
+const xdg_toplevel_err_invalid_size: u32 = 2;
 // zwp_pointer_constraints_v1.error / .lifetime
 const constraints_err_already_constrained: u32 = 1;
 const constraint_lifetime_oneshot: u32 = 1;
@@ -256,11 +258,17 @@ const Surface = struct {
     /// pending popup size from the positioner (0 = client decides)
     popup_w: i32 = 0,
     popup_h: i32 = 0,
-    /// xdg_toplevel size hints (0 = unset); resize requests are clamped
+    /// xdg_toplevel size hints (0 = unset), window geometry px; resize
+    /// requests are clamped. set_min_size / set_max_size are double-
+    /// buffered: they write the pending pair, wl_surface.commit latches it
+    /// (and tells the embedder, size_limits_fn). xdg_toplevel state: reset
+    /// when it goes.
     min_w: i32 = 0,
     min_h: i32 = 0,
     max_w: i32 = 0,
     max_h: i32 = 0,
+    min_pending: ?[2]i32 = null,
+    max_pending: ?[2]i32 = null,
     configured: bool = false,
     role: Role = .none,
     /// wl_surface.set_buffer_scale — buffer px per logical px; the browser
@@ -674,9 +682,11 @@ const Conn = struct {
     /// The shape set_shape last set for the current enter (0 = none: a
     /// cursor surface, or nothing set yet), for replaySeat.
     cursor_shape: u32 = 0,
-    /// xdg_toplevel.set_title, by wl_surface id (owned copies), for
-    /// replaySurfaces; dropped with the surface or its xdg_toplevel.
+    /// xdg_toplevel.set_title and set_app_id, by wl_surface id (owned
+    /// copies), for replaySurfaces; dropped with the surface or its
+    /// xdg_toplevel.
     titles: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    app_ids: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// where the pointer is in pointer_focus's local px (wl_fixed): the
     /// last enter or motion as the client saw it (clamped while confined,
     /// frozen while locked), and that motion's time
@@ -816,6 +826,13 @@ pub const Compositor = struct {
     /// Toplevel title changed (xdg_toplevel.set_title); surface_id lets the
     /// embedder label each window (taskbar) rather than just the page.
     title_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, title: []const u8) void = null,
+    /// Toplevel app id changed (xdg_toplevel.set_app_id): the embedder
+    /// matches a window to its app (a dock's icon, a launcher).
+    app_id_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, app_id: []const u8) void = null,
+    /// A commit changed a toplevel's size hints (set_min_size /
+    /// set_max_size, double-buffered), window geometry px, 0 = unset; all
+    /// four 0 again when its xdg_toplevel goes (if any was set).
+    size_limits_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void = null,
     /// Surface role changed (value = Role) or surface destroyed (value = destroyed_code).
     surface_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void = null,
     /// App-initiated interactive request the embedder must act on (window
@@ -1031,9 +1048,11 @@ pub const Compositor = struct {
     }
 
     fn destroyConn(self: *Compositor, conn: *Conn) void {
-        var title_it = conn.titles.valueIterator();
-        while (title_it.next()) |t| self.gpa.free(t.*);
-        conn.titles.deinit(self.gpa);
+        inline for (.{ &conn.titles, &conn.app_ids }) |map| {
+            var it = map.valueIterator();
+            while (it.next()) |t| self.gpa.free(t.*);
+            map.deinit(self.gpa);
+        }
         conn.objects.deinit(self.gpa);
         conn.surfaces.deinit(self.gpa);
         conn.positioners.deinit(self.gpa);
@@ -1464,18 +1483,26 @@ pub const Compositor = struct {
             if (surfaceByToplevelId(conn, header.object_id)) |surface| {
                 const surface_id = surfaceIdOf(conn, surface);
                 const title = args[0].string orelse "";
-                self.keepTitle(conn, surface_id, title);
+                self.keepString(&conn.titles, surface_id, title);
                 if (self.title_fn) |title_fn| title_fn(self.ctx, conn_id, surface_id, title);
             }
-        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "set_min_size")) {
+        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "set_app_id")) {
             if (surfaceByToplevelId(conn, header.object_id)) |surface| {
-                surface.min_w = args[0].int;
-                surface.min_h = args[1].int;
+                const surface_id = surfaceIdOf(conn, surface);
+                const app_id = args[0].string orelse "";
+                self.keepString(&conn.app_ids, surface_id, app_id);
+                if (self.app_id_fn) |f| f(self.ctx, conn_id, surface_id, app_id);
             }
-        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "set_max_size")) {
-            if (surfaceByToplevelId(conn, header.object_id)) |surface| {
-                surface.max_w = args[0].int;
-                surface.max_h = args[1].int;
+        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and
+            (std.mem.eql(u8, msg.name, "set_min_size") or std.mem.eql(u8, msg.name, "set_max_size")))
+        {
+            // pending until commit (min > max is checked there: the pair
+            // may change in either order before it)
+            if (args[0].int < 0 or args[1].int < 0) {
+                self.sendError(conn_id, header.object_id, xdg_toplevel_err_invalid_size, "min/max size must not be negative");
+            } else if (surfaceByToplevelId(conn, header.object_id)) |surface| {
+                const size: [2]i32 = .{ args[0].int, args[1].int };
+                if (msg.name[5] == 'i') surface.min_pending = size else surface.max_pending = size;
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and
             (std.mem.eql(u8, msg.name, "move") or std.mem.eql(u8, msg.name, "resize")))
@@ -1822,6 +1849,9 @@ pub const Compositor = struct {
                         surface.geom_set = true;
                         surface.geom_pending = null;
                     }
+                    if (surface.min_pending != null or surface.max_pending != null) {
+                        self.latchSizeLimits(conn_id, header.object_id, surface);
+                    }
                     // its subsurfaces' z-order (place_above / place_below)
                     if (surface.stack_pending) {
                         surface.stack_pending = false;
@@ -1896,7 +1926,7 @@ pub const Compositor = struct {
         if (msg.destructor) {
             if (std.mem.eql(u8, iface.name, "wl_surface")) {
                 _ = conn.surfaces.remove(header.object_id);
-                self.dropTitle(conn, header.object_id);
+                self.dropToplevelStrings(conn, header.object_id);
                 self.restacked(conn); // it, or its children, may have been placed
                 // its subsurfaces are unmapped with it, their role objects
                 // inert (the id may name another surface right after)
@@ -1968,7 +1998,20 @@ pub const Compositor = struct {
                         (surface.role == .toplevel and surface.toplevel_id == header.object_id);
                     if (match) {
                         self.positions_dirty = true;
-                        if (surface.role == .toplevel) self.dropTitle(conn, kv.key_ptr.*);
+                        if (surface.role == .toplevel) {
+                            self.dropToplevelStrings(conn, kv.key_ptr.*);
+                            // its size hints are the xdg_toplevel's too
+                            const had_limits = surface.min_w != 0 or surface.min_h != 0 or surface.max_w != 0 or surface.max_h != 0;
+                            surface.min_w = 0;
+                            surface.min_h = 0;
+                            surface.max_w = 0;
+                            surface.max_h = 0;
+                            surface.min_pending = null;
+                            surface.max_pending = null;
+                            if (had_limits) {
+                                if (self.size_limits_fn) |f| f(self.ctx, conn_id, kv.key_ptr.*, 0, 0, 0, 0);
+                            }
+                        }
                         surface.role = .none;
                         surface.popup_id = 0;
                         surface.toplevel_id = 0;
@@ -2145,16 +2188,47 @@ pub const Compositor = struct {
         if (self.surface_fn) |surface_fn| surface_fn(self.ctx, conn_id, surface_id, value);
     }
 
-    /// set_title's title kept for replaySurfaces (a failed copy just drops
-    /// the old one: the replay then sends no title).
-    fn keepTitle(self: *Compositor, conn: *Conn, surface_id: u32, title: []const u8) void {
-        self.dropTitle(conn, surface_id);
-        const copy = self.gpa.dupe(u8, title) catch return;
-        conn.titles.put(self.gpa, surface_id, copy) catch self.gpa.free(copy);
+    /// set_title's title or set_app_id's id kept for replaySurfaces (a
+    /// failed copy just drops the old one: the replay then sends none).
+    fn keepString(self: *Compositor, map: *std.AutoHashMapUnmanaged(u32, []u8), surface_id: u32, value: []const u8) void {
+        if (map.fetchRemove(surface_id)) |kv| self.gpa.free(kv.value);
+        const copy = self.gpa.dupe(u8, value) catch return;
+        map.put(self.gpa, surface_id, copy) catch self.gpa.free(copy);
     }
 
-    fn dropTitle(self: *Compositor, conn: *Conn, surface_id: u32) void {
+    fn dropToplevelStrings(self: *Compositor, conn: *Conn, surface_id: u32) void {
         if (conn.titles.fetchRemove(surface_id)) |kv| self.gpa.free(kv.value);
+        if (conn.app_ids.fetchRemove(surface_id)) |kv| self.gpa.free(kv.value);
+    }
+
+    /// wl_surface.commit with a set_min_size / set_max_size pending: the
+    /// pair takes effect (min above max in a dimension where both are set
+    /// is invalid_size, nothing applied) and the embedder hears of a change.
+    fn latchSizeLimits(self: *Compositor, conn_id: u32, surface_id: u32, surface: *Surface) void {
+        const min = surface.min_pending orelse [2]i32{ surface.min_w, surface.min_h };
+        const max = surface.max_pending orelse [2]i32{ surface.max_w, surface.max_h };
+        surface.min_pending = null;
+        surface.max_pending = null;
+        if (surface.role != .toplevel) return; // (its xdg_toplevel went: reset)
+        for (0..2) |i| {
+            if (min[i] > 0 and max[i] > 0 and min[i] > max[i]) {
+                return self.sendError(conn_id, surface.toplevel_id, xdg_toplevel_err_invalid_size, "min size larger than max size");
+            }
+        }
+        if (min[0] == surface.min_w and min[1] == surface.min_h and max[0] == surface.max_w and max[1] == surface.max_h) return;
+        surface.min_w = min[0];
+        surface.min_h = min[1];
+        surface.max_w = max[0];
+        surface.max_h = max[1];
+        if (self.size_limits_fn) |f| f(self.ctx, conn_id, surface_id, min[0], min[1], max[0], max[1]);
+    }
+
+    /// Embedder: ask a toplevel to close (its close button, a taskbar's
+    /// "close window"): xdg_toplevel.close, nothing else — the app decides
+    /// (a dialog about unsaved work, or it destroys the window).
+    pub fn closeToplevel(self: *Compositor, conn_id: u32, surface_id: u32) void {
+        const t = self.toplevelSurface(conn_id, surface_id) orelse return;
+        self.sendEvent(conn_id, t.surface.toplevel_id, "xdg_toplevel", "close", &.{});
     }
 
     fn surfaceByXdgId(conn: *Conn, xdg_id: u32) ?*Surface {
@@ -4554,9 +4628,10 @@ pub const Compositor = struct {
     /// Tell an embedder that attaches to a running compositor what describes
     /// each surface now, through the same callbacks the changes went
     /// through: per conn (ascending), per surface (parents first) the
-    /// surface_fn value it was last told (unless none), its title, its
-    /// input region (unless infinite, the default) and its set window
-    /// states (interactive kinds 2, 6, 8). Pixels are the embedder's.
+    /// surface_fn value it was last told (unless none), its title and app
+    /// id, its input region (unless infinite, the default), its size hints
+    /// (unless none) and its set window states (interactive kinds 2, 6, 8).
+    /// Pixels are the embedder's.
     pub fn replaySurfaces(self: *Compositor) void {
         const ids = self.connIds(self.gpa) catch return;
         defer self.gpa.free(ids);
@@ -4574,10 +4649,16 @@ pub const Compositor = struct {
                 if (conn.titles.get(surface_id)) |t| {
                     if (self.title_fn) |f| f(self.ctx, conn_id, surface_id, t);
                 }
+                if (conn.app_ids.get(surface_id)) |a| {
+                    if (self.app_id_fn) |f| f(self.ctx, conn_id, surface_id, a);
+                }
                 if (s.input) |*r| {
                     if (self.input_region_fn) |f| f(self.ctx, conn_id, surface_id, r);
                 }
                 if (s.role == .toplevel) {
+                    if (s.min_w != 0 or s.min_h != 0 or s.max_w != 0 or s.max_h != 0) {
+                        if (self.size_limits_fn) |f| f(self.ctx, conn_id, surface_id, s.min_w, s.min_h, s.max_w, s.max_h);
+                    }
                     if (self.interactive_fn) |f| {
                         if (s.maximized) f(self.ctx, conn_id, surface_id, 2, 0);
                         if (s.fullscreen) f(self.ctx, conn_id, surface_id, 6, 0);
@@ -4795,6 +4876,31 @@ const TestSink = struct {
     sel_mimes: [128]u8 = undefined,
     sel_mimes_len: usize = 0,
     sel_calls: u32 = 0,
+    // size_limits_fn: last hints + count
+    limits_surface: u32 = 0,
+    limits: [4]i32 = @splat(-1),
+    limits_calls: u32 = 0,
+    // app_id_fn: last id + count
+    app_id: [64]u8 = undefined,
+    app_id_len: usize = 0,
+    app_id_calls: u32 = 0,
+
+    fn sizeLimits(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        _ = conn_id;
+        self.limits_surface = surface_id;
+        self.limits = .{ min_w, min_h, max_w, max_h };
+        self.limits_calls += 1;
+    }
+
+    fn appId(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, app_id: []const u8) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        _ = conn_id;
+        _ = surface_id;
+        self.app_id_len = @min(app_id.len, self.app_id.len);
+        @memcpy(self.app_id[0..self.app_id_len], app_id[0..self.app_id_len]);
+        self.app_id_calls += 1;
+    }
 
     fn selection(ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx.?));
@@ -5487,6 +5593,7 @@ test "requestResize sends clamped configure to toplevel" {
     try comp.onWire(1, wire.encodeMessage(&buf, 7, 1, &.{.{ .new_id = 8 }})); // toplevel
     try comp.onWire(1, wire.encodeMessage(&buf, 8, 8, &.{ .{ .int = 300 }, .{ .int = 200 } })); // set_min_size
     try comp.onWire(1, wire.encodeMessage(&buf, 8, 7, &.{ .{ .int = 800 }, .{ .int = 600 } })); // set_max_size
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, 6, &.{})); // commit: the hints apply
     sink.events.clearRetainingCapacity();
 
     comp.requestResize(1, 6, 100, 900); // below min-w, above max-h
@@ -5502,6 +5609,111 @@ test "requestResize sends clamped configure to toplevel" {
     // non-toplevel target is ignored
     sink.events.clearRetainingCapacity();
     comp.requestResize(1, 999, 400, 400);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+}
+
+test "set_min_size / set_max_size are double-buffered: a commit applies them and tells the embedder (size_limits_fn) once per change; the xdg_toplevel going resets them" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.size_limits_fn = TestSink.sizeLimits;
+
+    try wmBaseToplevel(&comp, 1);
+    const tl = comptime protocol.find("xdg_toplevel").?;
+    const min_op = comptime tl.requestIndex("set_min_size").?;
+    const max_op = comptime tl.requestIndex("set_max_size").?;
+    const commit_op = comptime protocol.find("wl_surface").?.requestIndex("commit").?;
+    var buf: [128]u8 = undefined;
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, min_op, &.{ .{ .int = 300 }, .{ .int = 200 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, max_op, &.{ .{ .int = 800 }, .{ .int = 0 } }));
+    try std.testing.expectEqual(@as(u32, 0), sink.limits_calls); // pending
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, commit_op, &.{})); // (the initial configure; latches)
+    try std.testing.expectEqual(@as(u32, 1), sink.limits_calls);
+    try std.testing.expectEqual(@as(u32, 6), sink.limits_surface);
+    try std.testing.expectEqual([4]i32{ 300, 200, 800, 0 }, sink.limits);
+    try std.testing.expectEqual(@as(i32, 300), comp.conns.get(1).?.surfaces.get(6).?.min_w);
+
+    // a new max alone is pending until the next commit; min stays
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, max_op, &.{ .{ .int = 900 }, .{ .int = 700 } }));
+    try std.testing.expectEqual(@as(i32, 800), comp.conns.get(1).?.surfaces.get(6).?.max_w);
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, commit_op, &.{}));
+    try std.testing.expectEqual(@as(u32, 2), sink.limits_calls);
+    try std.testing.expectEqual([4]i32{ 300, 200, 900, 700 }, sink.limits);
+    // the same values again: no news
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, min_op, &.{ .{ .int = 300 }, .{ .int = 200 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, commit_op, &.{}));
+    try std.testing.expectEqual(@as(u32, 2), sink.limits_calls);
+    // max below min, then fixed before the commit: in either order, fine
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, max_op, &.{ .{ .int = 100 }, .{ .int = 100 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, min_op, &.{ .{ .int = 50 }, .{ .int = 0 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, commit_op, &.{}));
+    try std.testing.expectEqual([4]i32{ 50, 0, 100, 100 }, sink.limits);
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+
+    // the toplevel goes: back to none, and the embedder is told
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, comptime tl.requestIndex("destroy").?, &.{}));
+    try std.testing.expectEqual(@as(u32, 4), sink.limits_calls);
+    try std.testing.expectEqual([4]i32{ 0, 0, 0, 0 }, sink.limits);
+    try std.testing.expectEqual(@as(i32, 0), comp.conns.get(1).?.surfaces.get(6).?.min_w);
+}
+
+test "set_min_size / set_max_size: negative is invalid_size at once, min above max at the commit (nothing applied)" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.size_limits_fn = TestSink.sizeLimits;
+    const tl = comptime protocol.find("xdg_toplevel").?;
+    const min_op = comptime tl.requestIndex("set_min_size").?;
+    const max_op = comptime tl.requestIndex("set_max_size").?;
+    const commit_op = comptime protocol.find("wl_surface").?.requestIndex("commit").?;
+    var buf: [128]u8 = undefined;
+
+    try wmBaseToplevel(&comp, 1);
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, min_op, &.{ .{ .int = -1 }, .{ .int = 10 } }));
+    try std.testing.expectEqual(@as(?u32, xdg_toplevel_err_invalid_size), lastErrorCode(&sink));
+
+    try wmBaseToplevel(&comp, 2);
+    try comp.onWire(2, wire.encodeMessage(&buf, 8, min_op, &.{ .{ .int = 0 }, .{ .int = 500 } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 8, max_op, &.{ .{ .int = 0 }, .{ .int = 400 } }));
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(2, wire.encodeMessage(&buf, 6, commit_op, &.{}));
+    try std.testing.expectEqual(@as(?u32, xdg_toplevel_err_invalid_size), lastErrorCode(&sink));
+    try std.testing.expectEqual(@as(u32, 0), sink.limits_calls);
+    try std.testing.expectEqual(@as(i32, 0), comp.conns.get(2).?.surfaces.get(6).?.max_h);
+}
+
+test "closeToplevel sends xdg_toplevel.close and nothing else; not to other roles; set_app_id reaches app_id_fn" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.app_id_fn = TestSink.appId;
+
+    try wmBaseToplevel(&comp, 1);
+    var buf: [128]u8 = undefined;
+    const tl = comptime protocol.find("xdg_toplevel").?;
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, comptime tl.requestIndex("set_app_id").?, &.{.{ .string = "org.example.App" }}));
+    try std.testing.expectEqual(@as(u32, 1), sink.app_id_calls);
+    try std.testing.expectEqualStrings("org.example.App", sink.app_id[0..sink.app_id_len]);
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, comptime protocol.find("wl_surface").?.requestIndex("commit").?, &.{}));
+    sink.events.clearRetainingCapacity();
+
+    comp.closeToplevel(1, 6);
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try std.testing.expectEqual(@as(u32, 8), sink.events.items[0].object_id);
+    try std.testing.expectEqual(comptime tl.eventIndex("close").?, sink.events.items[0].opcode);
+    try std.testing.expectEqual(@as(usize, wire.header_size), sink.events.items[0].len);
+
+    // the window stays (the app decides); a surface without the role, an
+    // unknown one or conn: nothing
+    try std.testing.expectEqual(Role.toplevel, comp.surfaceRole(1, 6));
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 9 }})); // create_surface 9
+    comp.closeToplevel(1, 9);
+    comp.closeToplevel(1, 99);
+    comp.closeToplevel(5, 6);
     try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
 }
 
@@ -9837,6 +10049,12 @@ const ReplayRecorder = struct {
     fn title(ctx: ?*anyopaque, c: u32, s: u32, t: []const u8) void {
         of(ctx).add("title {d} {d} {s}", .{ c, s, t });
     }
+    fn appId(ctx: ?*anyopaque, c: u32, s: u32, a: []const u8) void {
+        of(ctx).add("app_id {d} {d} {s}", .{ c, s, a });
+    }
+    fn limits(ctx: ?*anyopaque, c: u32, s: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
+        of(ctx).add("limits {d} {d} {d} {d} {d} {d}", .{ c, s, min_w, min_h, max_w, max_h });
+    }
     fn interactive(ctx: ?*anyopaque, c: u32, s: u32, k: u32, v: u32) void {
         of(ctx).add("interactive {d} {d} {d} {d}", .{ c, s, k, v });
     }
@@ -9859,13 +10077,15 @@ const ReplayRecorder = struct {
     }
 };
 
-test "replay: an embedder attaching later is told each surface (parents first: role, title, input region, window states) and the seat (pointer image, lock, selection); embedderGone lets go of the seat and suspends" {
+test "replay: an embedder attaching later is told each surface (parents first: role, title, app id, input region, size hints, window states) and the seat (pointer image, lock, selection); embedderGone lets go of the seat and suspends" {
     var rec: ReplayRecorder = .{};
     defer rec.deinit();
     var comp = Compositor.init(std.testing.allocator, &rec, ReplayRecorder.send, ReplayRecorder.log);
     defer comp.deinit();
     comp.surface_fn = ReplayRecorder.surface;
     comp.title_fn = ReplayRecorder.title;
+    comp.app_id_fn = ReplayRecorder.appId;
+    comp.size_limits_fn = ReplayRecorder.limits;
     comp.interactive_fn = ReplayRecorder.interactive;
     comp.input_region_fn = ReplayRecorder.region;
     comp.selection_fn = ReplayRecorder.selection;
@@ -9887,6 +10107,9 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     try S.send(&comp, &buf, 6, comptime surf.requestIndex("commit").?, &.{});
     try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_title").?, &.{.{ .string = "Old" }});
     try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_title").?, &.{.{ .string = "Hello" }});
+    try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_app_id").?, &.{.{ .string = "hello.app" }});
+    try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_min_size").?, &.{ .{ .int = 100 }, .{ .int = 50 } });
+    try S.send(&comp, &buf, 6, comptime surf.requestIndex("commit").?, &.{});
     try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_maximized").?, &.{});
     // a subsurface 9 of it (made after a later surface 12, so ids alone
     // would not order it), with an input region of one box
@@ -9907,7 +10130,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
 
     rec.clear();
     comp.replaySurfaces();
-    try rec.expect(&.{ "surface 1 6 1", "title 1 6 Hello", "interactive 1 6 2 0", "surface 1 9 2", "region 1 9 1" });
+    try rec.expect(&.{ "surface 1 6 1", "title 1 6 Hello", "app_id 1 6 hello.app", "limits 1 6 100 50 0 0", "interactive 1 6 2 0", "surface 1 9 2", "region 1 9 1" });
     rec.clear();
     comp.replaySeat();
     try rec.expect(&.{"selection 0 0"}); // nobody holds the pointer: no image
@@ -9943,8 +10166,11 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     comp.replaySeat();
     try rec.expect(&.{"selection 0 0"});
 
-    // destroying the xdg_toplevel drops its title; the role-none surface is not replayed
+    // destroying the xdg_toplevel drops its title, app id and hints; the
+    // role-none surface is not replayed
+    rec.clear();
     try S.send(&comp, &buf, 8, comptime tl.requestIndex("destroy").?, &.{});
+    try rec.expect(&.{ "limits 1 6 0 0 0 0", "surface 1 6 0" });
     rec.clear();
     comp.replaySurfaces();
     try rec.expect(&.{ "surface 1 9 2", "region 1 9 1" });

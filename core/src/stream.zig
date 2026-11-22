@@ -742,6 +742,7 @@ pub const CallOp = enum(u16) {
     drag_cancel = 26,
     set_selection = 27,
     read_selection = 28,
+    close = 29,
     _,
 };
 
@@ -760,6 +761,8 @@ pub const EventOp = enum(u16) {
     selection_data = 11,
     keyboard_locks_state = 12,
     synced = 13,
+    set_app_id = 14,
+    size_limits = 15,
     _,
 };
 

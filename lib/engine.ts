@@ -442,6 +442,11 @@ export interface Engine {
    *  the embedder's: xdg_toplevel has set_minimized and no way back. A
    *  'minimize' event follows; see MinimizeEvent. */
   setMinimized(conn: number, surface: number, minimized: boolean): void;
+  /** Ask a toplevel to close (xdg_toplevel.close: a close button, a
+   *  taskbar's "close window"). Nothing else happens here: the app decides
+   *  — it destroys the window ('surface' role none / 'destroy' events
+   *  follow), asks about unsaved work, or ignores it. */
+  close(conn: number, surface: number): void;
   /** During a drag ('drag-start'): the surface under the pointer (0, 0 =
    *  none), then dragDrop or dragCancel exactly once. */
   dragMotion(conn: number, surface: number, time: number, x: number, y: number): void;
@@ -502,7 +507,7 @@ export interface Engine {
 export type Event =
   | OpenEvent | ErrorEvent | CloseEvent | LogEvent
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
-  | TitleEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
+  | TitleEvent | AppIdEvent | SizeLimitsEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
   | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
   | SelectionEvent | PositionEvent | SyncedEvent;
 
@@ -650,6 +655,26 @@ export interface DisconnectEvent { type: 'disconnect'; conn: number }
  *  readSelection. Not the primary selection. */
 export interface SelectionEvent { type: 'selection'; conn: number; mimes: string[] }
 export interface TitleEvent { type: 'title'; conn: number; surface: number; title: string }
+/** xdg_toplevel.set_app_id: the app the toplevel belongs to (by convention
+ *  its .desktop file's basename, e.g. 'org.gnome.Nautilus'; foot says
+ *  'foot'). Like the title it may come before the window's first commit,
+ *  and change later. */
+export interface AppIdEvent { type: 'app-id'; conn: number; surface: number; appId: string }
+/** A commit changed the toplevel's size hints (xdg_toplevel.set_min_size /
+ *  set_max_size, double-buffered): window geometry px (the box
+ *  CommitEvent.geometry and requestResize mean), 0 = no limit in that
+ *  dimension. All 0 again when the xdg_toplevel goes. requestResize clamps
+ *  to them already; an embedder's window manager can use them to not offer
+ *  a size (a tile, a resize edge) the app will refuse. */
+export interface SizeLimitsEvent {
+  type: 'size-limits';
+  conn: number;
+  surface: number;
+  minW: number;
+  minH: number;
+  maxW: number;
+  maxH: number;
+}
 /** The pointer image `conn` set while its surface holds the pointer; the
  *  last of these wins until the pointer leaves the client's surfaces.
  *  - wp_cursor_shape: `cursor` is a CSS cursor name, `surface` 0.
@@ -1034,6 +1059,10 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       js_log: (ptr, len) => log(str(ptr, len)),
       js_set_title: (conn, surface, ptr, len) =>
         emit({ type: 'title', conn: conn >>> 0, surface, title: str(ptr, len) }),
+      js_set_app_id: (conn, surface, ptr, len) =>
+        emit({ type: 'app-id', conn: conn >>> 0, surface, appId: str(ptr, len) }),
+      js_size_limits: (conn, surface, minW, minH, maxW, maxH) =>
+        emit({ type: 'size-limits', conn: conn >>> 0, surface, minW, minH, maxW, maxH }),
       js_conn_close: (conn) => {
         conn >>>= 0;
         conns.delete(conn);
@@ -1842,6 +1871,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     setFullscreen: call((conn, surface, on) => ex.wland_set_fullscreen(conn, surface, on ? 1 : 0)),
     // minimizing sends a pointer leave: after any pending motion
     setMinimized: call((conn, surface, on) => ex.wland_set_minimized(conn, surface, on ? 1 : 0), true),
+    close: call((conn, surface) => ex.wland_close(conn, surface)),
     dragMotion: call((conn, surface, time, x, y) =>
       ex.wland_drag_motion(conn, surface, time >>> 0, fixed(x), fixed(y)), true),
     dragDrop: call(() => ex.wland_drag_drop(), true),

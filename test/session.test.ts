@@ -134,7 +134,9 @@ test('scene replay: surfaces, titles, regions, states and commits from the SURFA
     surface(7, 10, { role: 1, scale: 2, state: 1, root: 10, geom: [5, 6, 100, 80] }),
     event(3, u32(7, 10, 1)),
     event(2, u32(7, 10), bytes('foot')),
+    event(14, u32(7, 10), bytes('org.codeberg.dnkl.foot')),
     event(8, u32(7, 10, 0, 2), i32(1, 2, 3, 4, 10, 20, 30, 40)),
+    event(15, u32(7, 10), i32(120, 40, 0, 0)),
     event(4, u32(7, 10, 2, 0)),
     surface(7, 11, { role: 2, scale: 2, root: 10, parent: 10, x: 4, y: 5, z: 1 }),
     event(3, u32(7, 11, 2)),
@@ -147,10 +149,14 @@ test('scene replay: surfaces, titles, regions, states and commits from the SURFA
     event(13),
   ));
   const types = events.map((e) => e.type);
-  assert.deepEqual(types, ['surface', 'title', 'input-region', 'maximize', 'surface', 'commit', 'commit', 'cursor', 'selection', 'synced']);
+  assert.deepEqual(types, ['surface', 'title', 'app-id', 'input-region', 'size-limits', 'maximize', 'surface', 'commit', 'commit', 'cursor', 'selection', 'synced']);
   assert.deepEqual(events[0], { type: 'surface', conn: 7, surface: 10, role: 1, root: 10, parent: 0, z: 0 });
   assert.deepEqual(events[1], { type: 'title', conn: 7, surface: 10, title: 'foot' });
-  assert.deepEqual(events[2].region && [...events[2].region], [1, 2, 3, 4, 10, 20, 30, 40]);
+  assert.deepEqual(events[2], { type: 'app-id', conn: 7, surface: 10, appId: 'org.codeberg.dnkl.foot' });
+  assert.deepEqual(events[3].region && [...events[3].region], [1, 2, 3, 4, 10, 20, 30, 40]);
+  assert.deepEqual(events[4], { type: 'size-limits', conn: 7, surface: 10, minW: 120, minH: 40, maxW: 0, maxH: 0 });
+  events.splice(2, 1);
+  events.splice(3, 1);
   assert.deepEqual(events[3], { type: 'maximize', conn: 7, surface: 10, maximized: true });
   assert.deepEqual(events[4], { type: 'surface', conn: 7, surface: 11, role: 2, root: 10, parent: 10, z: 1 });
   const top = events[5];
@@ -216,6 +222,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
   engine.setFullscreen(7, 10, false);
   engine.setMinimized(7, 10, true);
   engine.popupDismiss(7, 12);
+  engine.close(7, 10);
   engine.requestResize(7, 10, 640.4, 480.6);
   engine.dragMotion(7, 10, 105, 1, 2);
   engine.dragDrop();
@@ -241,6 +248,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
     call(20, u32(7, 10, 0)),
     call(21, u32(7, 10, 1)),
     call(22, u32(7, 12)),
+    call(29, u32(7, 10)),
     call(23, u32(7, 10), i32(640, 481)),
     call(24, u32(7, 10, 105), i32(fx(1), fx(2))),
     call(25),

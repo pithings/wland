@@ -249,6 +249,8 @@ fn openWindow(rig: *Rig, c: *Client) !Window {
     w.toplevel = c.newId();
     try c.send(xdg_surface, comptime op("xdg_surface", .request, "get_toplevel"), &.{.{ .new_id = w.toplevel }});
     try c.send(w.toplevel, comptime op("xdg_toplevel", .request, "set_title"), &.{.{ .string = "kept" }});
+    try c.send(w.toplevel, comptime op("xdg_toplevel", .request, "set_app_id"), &.{.{ .string = "kept.app" }});
+    try c.send(w.toplevel, comptime op("xdg_toplevel", .request, "set_min_size"), &.{ .{ .int = 2 }, .{ .int = 1 } });
     try c.send(w.surface, comptime op("wl_surface", .request, "commit"), &.{});
     try rig.roundtrip(c);
     const configure = c.last(xdg_surface, comptime op("xdg_surface", .event, "configure")) orelse return error.NoConfigure;
@@ -299,8 +301,8 @@ fn expectWindowPixels(gpa: std.mem.Allocator, f: Received, surface: u32, base: u
 }
 
 /// The scene replay after `from`: CONN_OPEN for `conn`, the window's
-/// SURFACE (a toplevel) before its surface_event and title, one whole-window
-/// pixel frame with `base`'s pixels, synced last.
+/// SURFACE (a toplevel) before its surface_event, title, app id and size
+/// hints, one whole-window pixel frame with `base`'s pixels, synced last.
 fn expectReplay(gpa: std.mem.Allocator, v: *const Viewer, from: usize, conn: u32, w: Window, base: u8) !void {
     const frames = v.frames.items;
     const synced = v.findEvent(from, .synced).?;
@@ -334,7 +336,14 @@ fn expectReplay(gpa: std.mem.Allocator, v: *const Viewer, from: usize, conn: u32
     try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(1)), role.args);
     const title_at = v.findEvent(from, .set_title).?;
     try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(4) ++ "kept".*), v.frames.items[title_at].parse().event.args);
-    try std.testing.expect(surface_at.? < role_at and role_at < title_at and title_at < pixels_at.? and pixels_at.? < synced);
+    const app_id_at = v.findEvent(from, .set_app_id).?;
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(8) ++ "kept.app".*), v.frames.items[app_id_at].parse().event.args);
+    const limits_at = v.findEvent(from, .size_limits).?;
+    // (min 2×1 from openWindow; the max is what the test set since)
+    const limits = v.frames.items[limits_at].parse().event.args;
+    try std.testing.expectEqual(@as(usize, 24), limits.len);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(2) ++ le(1)), limits[0..16]);
+    try std.testing.expect(surface_at.? < role_at and role_at < title_at and title_at < app_id_at and app_id_at < limits_at and limits_at < pixels_at.? and pixels_at.? < synced);
     // the selection (nobody's) and the lock state precede synced
     try std.testing.expect(v.findEvent(from, .selection).? < synced);
     try std.testing.expect(v.findEvent(from, .keyboard_locks_state).? < synced);
@@ -396,6 +405,25 @@ test "session: FEATURE session first, nothing before init, init replays the scen
             return x.c.count(x.p, x.ev) == 1;
         }
     }.pred);
+    // close asks the app (xdg_toplevel.close), nothing more
+    try a.call(.close, &(le(conn) ++ le(w.surface)));
+    const Tc = struct { c: *Client, t: u32 };
+    try rig.until(Tc{ .c = c, .t = w.toplevel }, struct {
+        fn pred(x: Tc) bool {
+            return x.c.count(x.t, comptime op("xdg_toplevel", .event, "close")) == 1;
+        }
+    }.pred);
+    // size hints a commit changes reach the live viewer
+    mark = a.frames.items.len;
+    try c.send(w.toplevel, comptime op("xdg_toplevel", .request, "set_max_size"), &.{ .{ .int = 640 }, .{ .int = 480 } });
+    try c.send(w.surface, comptime op("wl_surface", .request, "commit"), &.{});
+    const Lc = struct { v: *Viewer, from: usize };
+    try rig.until(Lc{ .v = a, .from = mark }, struct {
+        fn pred(x: Lc) bool {
+            return x.v.findEvent(x.from, .size_limits) != null;
+        }
+    }.pred);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(2) ++ le(1) ++ le(640) ++ le(480)), a.frames.items[a.findEvent(mark, .size_limits).?].parse().event.args);
     // read_selection with nothing to read: selection_data status 3
     mark = a.frames.items.len;
     try a.call(.read_selection, &(le(10) ++ "text/plain".* ++ le(7) ++ le(1000)));

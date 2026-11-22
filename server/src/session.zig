@@ -152,6 +152,8 @@ pub const Session = struct {
         c.dmabuf_created_fn = coreDmabufCreated;
         c.presented_fn = corePresented;
         c.title_fn = evTitle;
+        c.app_id_fn = evAppId;
+        c.size_limits_fn = evSizeLimits;
         c.surface_fn = evSurface;
         c.interactive_fn = evInteractive;
         c.cursor_shape_fn = evCursorShape;
@@ -507,6 +509,26 @@ pub const Session = struct {
         self.endEvent(.set_title);
     }
 
+    fn evAppId(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, app_id: []const u8) void {
+        const self = of(ctx);
+        self.noteNamed(conn_id, surface_id);
+        const w = self.beginEvent() orelse return;
+        w.u32_(conn_id) catch return;
+        w.u32_(surface_id) catch return;
+        w.bytes(app_id) catch return;
+        self.endEvent(.set_app_id);
+    }
+
+    fn evSizeLimits(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
+        const self = of(ctx);
+        self.noteNamed(conn_id, surface_id);
+        const w = self.beginEvent() orelse return;
+        w.u32_(conn_id) catch return;
+        w.u32_(surface_id) catch return;
+        inline for (.{ min_w, min_h, max_w, max_h }) |v| w.i32_(v) catch return;
+        self.endEvent(.size_limits);
+    }
+
     fn evSurface(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void {
         const self = of(ctx);
         if (value != core.compositor.surface_destroyed_code) self.noteNamed(conn_id, surface_id);
@@ -819,6 +841,7 @@ pub const Session = struct {
             .set_fullscreen => c.setFullscreen(try a.u32_(), try a.u32_(), try a.u32_() != 0),
             .set_minimized => c.setMinimized(try a.u32_(), try a.u32_(), try a.u32_() != 0),
             .popup_dismiss => c.popupDismiss(try a.u32_(), try a.u32_()),
+            .close => c.closeToplevel(try a.u32_(), try a.u32_()),
             .request_resize => c.requestResize(try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_motion => c.dragMotion(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_drop => c.dragDrop(),

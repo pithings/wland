@@ -23,6 +23,11 @@ const core = @import("core");
 extern "env" fn js_send(ptr: [*]const u8, len: usize) void;
 extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
 extern "env" fn js_set_title(conn_id: u32, surface_id: u32, ptr: [*]const u8, len: usize) void;
+/// xdg_toplevel.set_app_id (ptr/len valid only during the call).
+extern "env" fn js_set_app_id(conn_id: u32, surface_id: u32, ptr: [*]const u8, len: usize) void;
+/// A commit changed a toplevel's size hints (set_min_size / set_max_size),
+/// window geometry px, 0 = unset; all 0 when its xdg_toplevel went.
+extern "env" fn js_size_limits(conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void;
 extern "env" fn js_conn_close(conn_id: u32) void;
 /// value = role (0-4) on role change, 0xffffffff when the surface is destroyed.
 extern "env" fn js_surface_event(conn_id: u32, surface_id: u32, value: u32) void;
@@ -103,6 +108,8 @@ export fn wland_init(scale: i32, scale_120: i32) void {
     compositor.dmabuf_created_fn = sendDmabufCreated;
     compositor.presented_fn = sendPresented;
     compositor.title_fn = setTitle;
+    compositor.app_id_fn = setAppId;
+    compositor.size_limits_fn = sizeLimits;
     compositor.surface_fn = surfaceEvent;
     compositor.interactive_fn = interactive;
     compositor.cursor_shape_fn = cursorShape;
@@ -305,6 +312,12 @@ export fn wland_set_fullscreen(conn_id: u32, surface_id: u32, on: u32) void {
 /// the embedder's (xdg_toplevel has no unset_minimized).
 export fn wland_set_minimized(conn_id: u32, surface_id: u32, on: u32) void {
     compositor.setMinimized(conn_id, surface_id, on != 0);
+    flushOut();
+}
+
+/// Ask a toplevel to close (xdg_toplevel.close); the app decides what to do.
+export fn wland_close(conn_id: u32, surface_id: u32) void {
+    compositor.closeToplevel(conn_id, surface_id);
     flushOut();
 }
 
@@ -777,6 +790,16 @@ fn pointerLock(ctx: ?*anyopaque, conn_id: u32, surface_id: u32) void {
 fn setTitle(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, title: []const u8) void {
     _ = ctx;
     js_set_title(conn_id, surface_id, title.ptr, title.len);
+}
+
+fn setAppId(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, app_id: []const u8) void {
+    _ = ctx;
+    js_set_app_id(conn_id, surface_id, app_id.ptr, app_id.len);
+}
+
+fn sizeLimits(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
+    _ = ctx;
+    js_size_limits(conn_id, surface_id, min_w, min_h, max_w, max_h);
 }
 
 fn log(ctx: ?*anyopaque, text: []const u8) void {

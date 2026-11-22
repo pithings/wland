@@ -464,6 +464,15 @@ with it. New findings go in the matching section.
   content names the role again. A toplevel unmapped that way starts over
   (states gone, initial configure at its next commit). A destroyed parent
   unmaps its subsurfaces for good.
+- **Size hints are double-buffered** (xdg_toplevel.set_min_size /
+  set_max_size: `min_pending`/`max_pending`, latched by wl_surface.commit,
+  `latchSizeLimits`): requestResize clamps to the committed pair only, and
+  the embedder hears of it (size_limits_fn → 'size-limits') per committed
+  change, all 0 when the xdg_toplevel goes. A negative size is
+  `invalid_size` at the request; min above max where both are set only at
+  the commit (a client may set the pair in either order before it), and
+  then nothing is applied. Title and app id are not double-buffered: they
+  go out at the request.
 - **`activated` is keyboard focus** (`toplevelStates`, in every toplevel
   configure): keyboardEnter/Leave send a configure repeating the size.
   Chromium reads "is this window active" from it, not from wl_keyboard. The
@@ -636,6 +645,16 @@ with it. New findings go in the matching section.
 
 - **Every `extern "env"` in the wasm must exist in engine.ts's imports**, or
   instantiation dies with a LinkError (whole client, every test). Same commit.
+- **Every stateful core call and every core event has a session twin.** On
+  a session link the compositor is the relay's: a `wland_*` export that
+  changes state is a CALL (remote-core.ts `CALLS`, session.zig `call`,
+  stream.zig `CallOp`, STREAM.md's table), a `js_*` import an EVENT
+  (remote-core.ts `event`, a session.zig `ev*` callback set in `create`,
+  `EventOp`), and whatever describes a surface now also goes into
+  `replaySurfaces` (a viewer that attaches later is told it). CALLs are
+  one-way: nothing may need a return value. Getters answer from the
+  SURFACE mirror, a fixed 65-byte frame: new per-surface state travels as
+  an EVENT instead (size hints did), which an older peer skips.
 - **wasm `u32` import args arrive in JS as signed `i32`.** Compare sentinels and
   conn ids with `>>> 0` (`0xffffffff` arrived as −1: the destroy path was dead
   code since day one).

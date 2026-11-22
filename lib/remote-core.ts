@@ -89,6 +89,7 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_drag_motion: [24, 'uuuii'],
   wland_drag_drop: [25, ''],
   wland_drag_cancel: [26, ''],
+  wland_close: [29, 'uu'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
 
@@ -247,6 +248,14 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
       }
       case 12: locks = a.u32() & 3; return;
       case 13: return options.synced();
+      case 14: {
+        const conn = a.u32(), surface = a.u32();
+        return inWasm(a.data(), (p, n) => env.js_set_app_id(conn, surface, p, n));
+      }
+      case 15: {
+        const conn = a.u32(), surface = a.u32(), minW = a.i32(), minH = a.i32(), maxW = a.i32(), maxH = a.i32();
+        return env.js_size_limits(conn, surface, minW, minH, maxW, maxH);
+      }
       default: return; // an op this viewer does not know: skipped
     }
   }

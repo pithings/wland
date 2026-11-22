@@ -131,6 +131,23 @@ test('engine runs without a DOM: registry, toplevel, title, commit, destroy', as
   const title = events.find((e) => e.type === 'title');
   assert.deepEqual(title, { type: 'title', conn: CONN, surface: 6, title: 'hello wland' });
 
+  // set_app_id at once; set_min_size / set_max_size at the commit
+  link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+    ...msg(8, 3, 'org.wland.hello'),
+    ...msg(8, 8, 100, 50),
+    ...msg(8, 7, 0, 400),
+  ]))));
+  assert.deepEqual(events.find((e) => e.type === 'app-id'), { type: 'app-id', conn: CONN, surface: 6, appId: 'org.wland.hello' });
+  assert.equal(events.find((e) => e.type === 'size-limits'), undefined, 'pending until the commit');
+  link.cb!.onMessage(pack(wireFrame(CONN, msg(6, 6))));
+  assert.deepEqual(events.find((e) => e.type === 'size-limits'),
+    { type: 'size-limits', conn: CONN, surface: 6, minW: 100, minH: 50, maxW: 0, maxH: 400 });
+
+  // close: one xdg_toplevel.close (object 8, event 1, no args) to the app
+  link.sent.length = 0;
+  engine.close(CONN, 6);
+  assert.deepEqual(link.sent.map((b) => [...b]), [[...wireFrame(CONN, u32s(8, (8 << 16) | 1))]]);
+
   // a BUFFER frame (canvas-ready RGBA, packed per damage rect) → commit
   const px = new Uint8Array(2 * 1 * 4 + 1 * 2 * 4).map((_, i) => i + 1);
   link.cb!.onMessage(pack(frame(2,
