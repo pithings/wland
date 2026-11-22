@@ -433,6 +433,26 @@ const wl = await createWland({ container, mount, unmount, manageDisplay: false }
 wl.engine.setVisible(conn, surface, false);   // or entry.setVisible(false) on wl.windows()
 ```
 
+Snapping windows to halves and quarters: `setTiled` tells the app which
+edges it is tiled against (it drops its shadows and rounded corners
+there, as when maximized), and can ask for the tile's size in the same
+configure. Apps may answer with a different size (foot rounds to whole
+cells). To know which request an answer belongs to, every configure is a
+`configure` event carrying the token your call returned, and every commit
+that applies one the app acked is preceded by an `acked` event (also
+`ViewWindow.acked`). An app acks only the latest configure it has seen, so
+your request is answered once an acked serial reaches the serial of the
+configure your token came back with:
+
+```js
+const token = wl.engine.setTiled(conn, surface, EDGE_LEFT | EDGE_TOP | EDGE_BOTTOM, width / 2, height);
+// onEvent:
+if (ev.type === 'configure' && ev.cause === token) asked = ev.serial;
+if (ev.type === 'acked' && asked && ev.serial >= asked) {
+  // the commit events that follow are the app's answer: place its size
+}
+```
+
 The default wm expects the default mount. With your own frames, your window
 manager can take what it owns and leave the rest (popups, drag and drop, the
 key bindings) to wland's:

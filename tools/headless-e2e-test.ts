@@ -89,7 +89,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { fileURLToPath } from 'node:url';
 import type { GpuRef } from '../lib/engine.ts';
 import {
-  createHeadless, NO_SELECTION_BRIDGE, ROLE_POPUP, ROLE_SUBSURFACE, type Headless, type HeadlessWindow, type RgbaImage,
+  createHeadless, EDGE_BOTTOM, EDGE_LEFT, EDGE_TOP, NO_SELECTION_BRIDGE, ROLE_POPUP, ROLE_SUBSURFACE,
+  type ConfigureEvent, type Headless, type HeadlessWindow, type RgbaImage,
 } from '../lib/headless.ts';
 import { xDisplayOf } from '../lib/index.ts';
 import { app, appHome, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
@@ -186,6 +187,7 @@ const titles: string[] = [];
 const grabs: string[] = []; // 'move' / 'resize' events: the grabs the core started
 let synced = 0; // 'synced' events: scene replays of a session relay
 const order: string[] = []; // 'decoration' events and each surface's first commit, in order
+const configures: ConfigureEvent[] = []; // every 'configure' event
 let hl!: Headless;
 
 /** Commits stopped arriving for `quiet` ms. */
@@ -488,6 +490,33 @@ async function states() {
   hl.type(`printf '\\033]2;RESTORED\\007'\n`);
   await until(() => titles.includes('RESTORED'), 5000, 'keys to reach restored foot');
   check(true, 'keys reach it again');
+
+  // hidden by the embedder: not drawn, still focused, not minimized
+  hl.setVisible(win, false);
+  check(hl.windows()[0]!.hidden && !hl.windows()[0]!.minimized && hl.focused()?.key === win.key && colours(hl.screenshot()) === 1,
+    'hidden: not drawn, not minimized, still focused');
+  hl.setVisible(win, true);
+  await settle();
+  check(colours(hl.screenshot()) >= 3, 'shown: drawn again');
+
+  // snapped: the tiled states and a size in one configure; the app's
+  // answer is told by the acked configure (foot rounds to whole cells)
+  if (!configures.length) console.log('  skipped tiled: this relay sends no configure events (predates them)');
+  else {
+    const n = configures.length;
+    const token = hl.setTiled(win, EDGE_LEFT | EDGE_TOP | EDGE_BOTTOM, 401, 303);
+    const mine = () => configures.slice(n).find((c) => c.cause === token);
+    await until(mine, 3000, 'the configure carrying the setTiled token');
+    const cfg = mine()!;
+    check(cfg.width === 401 && cfg.height === 303 && configures.slice(n).length === 1,
+      `one configure: 401x303, tiled ${cfg.tiled} (told only from xdg_wm_base v2)`);
+    await until(() => (hl.windows()[0]!.acked?.serial ?? 0) >= cfg.serial, 5000, 'foot to ack the tiled configure');
+    await settle();
+    const w2 = hl.windows()[0]!;
+    check(w2.acked!.width === 401 && w2.acked!.height === 303 && w2.width <= 401 && w2.width > 300,
+      `answered: acked ${w2.acked!.width}x${w2.acked!.height}, the window took ${w2.width}x${w2.height}`);
+    hl.setTiled(win, 0);
+  }
   await stop(app);
   await noWindows();
 
@@ -890,6 +919,7 @@ function attach(decorations: 'client' | 'server' = 'client'): Promise<Headless> 
       else if (ev.type === 'error') errors.push(ev.detail);
       else if (ev.type === 'title') titles.push(ev.title);
       else if (ev.type === 'move' || ev.type === 'resize') grabs.push(ev.type);
+      else if (ev.type === 'configure') configures.push(ev);
     },
   });
 }

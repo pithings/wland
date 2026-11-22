@@ -117,9 +117,12 @@ any of them (update this list when it does).
   event (input's `clipboard` hooks), so the app reads the new selection.
 - Window states (maximized, fullscreen, minimized) are core state: the embedder
   asks (`setMaximized/setFullscreen/setMinimized`) and reacts to the events;
-  restoring a minimized window is only ever the embedder's. Hidden
+  restoring a minimized window is only ever the embedder's. Tiled edges
+  (`setTiled`) are core state too but only the embedder's to set. Hidden
   (`setVisible`) is the embedder's alone and not a window state: rendered
   for like minimized (callbacks held, `suspended`), nothing else changes.
+  Calls that configure return a token (`cause` on the 'configure' event);
+  'acked' tells which configure a commit applied.
 - `activated` follows keyboard focus (keyboardEnter/Leave reconfigure the
   toplevel); a 'surface' event with role none means unmapped — the role
   object went, or attach(NULL) was committed.

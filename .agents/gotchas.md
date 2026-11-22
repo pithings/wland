@@ -624,6 +624,23 @@ with it. New findings go in the matching section.
   leaves itself (pointer: constraint first, via pointerLeave; keyboard)
   and popup_done to the window's popups, and from then on drops enters
   aimed at its tree; focus handoff stays the embedder's.
+- **Tiled is a state, not a size** (`Surface.tiled`, `setTiled`): the
+  tiled_* states (v2, version-gated per object like suspended) in every
+  configure from `toplevelStates`, independent of maximized/fullscreen.
+  setTiled's optional size goes through `requestResize` so a snap is ONE
+  configure; with no size and the same edges nothing is sent (nor for a
+  pre-v2 client, which has no tiled state to hear of).
+- **Configure tokens instead of return values** (`cause`, configure_fn /
+  acked_fn): a session CALL returns nothing, so requestResize /
+  setMaximized / setFullscreen / setTiled carry the engine's token as
+  their last word and `Compositor.cause` is set around the call (wasm.zig,
+  session.zig: always reset to 0 after); `sendToplevelConfigure` tells
+  every configure with it. A token is the calls' argument, not a separate
+  "set cause" CALL: app messages may be processed between two link
+  messages. Each toplevel keeps its last 8 configures (`cfgs` ring) so an
+  ack_configure names the size it asked; `acked_fn` fires at the commit
+  that applies the ack (the commit's pixel frames come after its WIRE), the
+  last ack before the commit winning. The replay carries the last acked.
 - **Hidden is not minimized** (`Surface.hidden`, `setVisible`: the
   embedder's window manager hides a window for its own reasons). It shares
   only the rendering half of minimize: `underHidden` (minimized OR hidden,
