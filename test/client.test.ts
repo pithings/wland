@@ -842,13 +842,15 @@ test('createWland: the frame loop ticks with rAF timestamps and the display inte
 // engine; the states arrive as events, as the core sends them ---------------
 type Ev = Parameters<ReturnType<typeof createView>['handle']>[0];
 function wmRig(dom: ReturnType<typeof installFakeDom>,
-  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive'> & { autoFocus?: boolean; manageDisplay?: boolean } = {}) {
+  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive' | 'positions'> & { autoFocus?: boolean; manageDisplay?: boolean } = {}) {
   const { autoFocus, manageDisplay, ...wmOpts } = opts;
   const container = dom.container();
   const view = createView({ container, webgl: 'never', focusOnMap: autoFocus !== false, manageDisplay });
   const calls: unknown[][] = [];
+  // setWindowPosition calls (what the wm tells the core) are kept apart
+  const positions: unknown[][] = [];
   const engine = new Proxy({} as Engine, {
-    get: (_, name) => (...args: unknown[]) => { calls.push([name, ...args]); },
+    get: (_, name) => (...args: unknown[]) => { (name === 'setWindowPosition' ? positions : calls).push([name, ...args]); },
   });
   const input = createInput({ engine, view, container, autoFocus });
   const wm = createWindowManager({ engine, view, input, container, ...wmOpts });
@@ -868,7 +870,7 @@ function wmRig(dom: ReturnType<typeof installFakeDom>,
     return stopped;
   };
   return {
-    container, view, input, wm, calls, feed, commit, el, z, key,
+    container, view, input, wm, calls, positions, feed, commit, el, z, key,
     dispose() { wm.dispose(); input.dispose(); view.dispose(); },
   };
 }
@@ -1079,6 +1081,51 @@ test('view: `acked` on the window follows the \'acked\' events (the last one), w
     });
     assert.equal(view.window(1, 5)!.acked, null, 'a new surface with that id starts with none');
     view.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('wm positions: the core is told where each window\'s geometry is — at its first commit (the cascade), maximized at the origin and back, an Alt+drag\'s moves — once per change; again after an unmap or a session\'s new viewer; never with positions false', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom);
+    r.commit(1, 5);
+    r.commit(1, 5);
+    assert.deepEqual(r.positions, [['setWindowPosition', 1, 5, 24, 48]]);
+    r.feed({ type: 'maximize', conn: 1, surface: 5, maximized: true });
+    r.commit(1, 5, { maximized: true });
+    r.feed({ type: 'maximize', conn: 1, surface: 5, maximized: false });
+    r.commit(1, 5);
+    assert.deepEqual(r.positions.slice(1), [['setWindowPosition', 1, 5, 0, 0], ['setWindowPosition', 1, 5, 24, 48]]);
+    // Alt+drag
+    r.positions.length = 0;
+    const el = r.el(1, 5);
+    const canvas = r.view.canvas(1, 5);
+    dom.document.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 1, clientX: 30, clientY: 50,
+      preventDefault() {}, stopPropagation() {} });
+    el.dispatch('pointermove', { pointerId: 1, clientX: 90, clientY: 120, buttons: 1 });
+    const [ax, ay] = [parseFloat(el.style.left), parseFloat(el.style.top)];
+    assert.ok(ax !== 24 || ay !== 48, 'moved');
+    el.dispatch('pointermove', { pointerId: 1, clientX: 90, clientY: 120, buttons: 1 }); // the same place: not again
+    assert.deepEqual(r.positions, [['setWindowPosition', 1, 5, ax, ay]]);
+    dom.document.dispatch('pointerup', { pointerId: 1, button: 0, buttons: 0 });
+    // unmapped: the core forgot it; mapped again it is told
+    r.positions.length = 0;
+    r.feed({ type: 'surface', conn: 1, surface: 5, role: 0, root: 5 });
+    r.commit(1, 5);
+    assert.deepEqual(r.positions, [['setWindowPosition', 1, 5, ax, ay]]);
+    // a session's new viewer: every window again
+    r.positions.length = 0;
+    r.feed({ type: 'synced' });
+    assert.deepEqual(r.positions, [['setWindowPosition', 1, 5, ax, ay]]);
+    r.dispose();
+    const off = wmRig(dom, { positions: false });
+    off.commit(1, 5);
+    off.feed({ type: 'maximize', conn: 1, surface: 5, maximized: true });
+    assert.deepEqual(off.positions, []);
+    off.dispose();
+    await new Promise((res) => setTimeout(res, 0));
   } finally {
     dom.uninstall();
   }
@@ -1834,6 +1881,23 @@ test('createWland: interactive, shortcuts, autoFocus and manageDisplay are passe
     feed({ type: 'minimize', conn: 1, surface: 5, minimized: true });
     assert.ok(!(wl.view.window(1, 5)!.element as any).style.display, 'the view leaves display alone');
     wl.dispose();
+    // with a mount of the embedder's, the wm tells the core no positions
+    const link2 = scriptedLink();
+    const frame = dom.container();
+    const wl2: Wland = await createWland({ container: dom.container(), wasm, link: link2, webgl: 'never', scale: 1,
+      mount: (win) => { frame.appendChild(win.element); win.element.style.left = '10px'; win.element.style.top = '10px'; } });
+    link2.cb!.onOpen();
+    const told: unknown[][] = [];
+    wl2.engine.setWindowPosition = (...a) => { told.push(a); };
+    const feed2 = (ev: Ev) => { wl2.view.handle(ev); wl2.input.handle(ev); wl2.wm.handle(ev); };
+    feed2({
+      type: 'commit', conn: 1, surface: 5, role: 1, root: 5, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 1, height: 1 },
+      width: 1, height: 1, logicalWidth: 1, logicalHeight: 1, format: 'rgba', stride: 0,
+      damage: new Int32Array([0, 0, 1, 1]), pixels: new Uint8Array(4),
+    });
+    assert.deepEqual(told, []);
+    wl2.dispose();
   } finally {
     dom.uninstall();
   }

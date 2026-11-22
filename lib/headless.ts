@@ -797,7 +797,28 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
 
   // --- window policy: may call the engine, so it runs after dispatch ------
 
+  // Where every mapped window's geometry sits in the output, for the core
+  // (Engine.setWindowPosition: popups constrained to the output), told
+  // when it changed — after every event and scripted move. `told` is what
+  // the core has: forgotten with a new link, a session's new viewer, an
+  // unmapped toplevel.
+  const told = new Map<string, string>();
+  function tellPositions() {
+    for (const win of wins.values()) {
+      if (!visible(win)) continue;
+      const o = originOfWin(win);
+      const x = Math.round(o.x + win.gx), y = Math.round(o.y + win.gy);
+      const at = `${x},${y}`;
+      if (told.get(win.key) === at) continue;
+      told.set(win.key, at);
+      engine.setWindowPosition(win.conn, win.surface, x, y);
+    }
+  }
+
   function policy(ev: Event, mapped: boolean) {
+    if (ev.type === 'open' || ev.type === 'synced') told.clear();
+    else if ((ev.type === 'surface' && ev.role !== ROLE_TOPLEVEL) || ev.type === 'destroy') told.delete(keyOf(ev.conn, ev.surface));
+    else if (ev.type === 'disconnect') for (const k of told.keys()) if (k.startsWith(`c${ev.conn}s`)) told.delete(k);
     // the focused toplevel unmapped (its xdg_toplevel went) while its
     // wl_surface lives on: that one can, and does, get its leave
     if (ev.type === 'surface' && ev.role !== ROLE_TOPLEVEL && active && active.conn === ev.conn && active.surface === ev.surface) {
@@ -876,6 +897,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         dnd = { conn: ev.conn, icon: ev.icon };
         break;
     }
+    tellPositions();
   }
 
   // --- geometry -------------------------------------------------------------
@@ -974,6 +996,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     if (g.mode === 'move') {
       g.win.x = g.x + dx;
       g.win.y = Math.max(0, g.y + dy);
+      tellPositions();
       return;
     }
     // edges: 1 top, 2 bottom, 4 left, 8 right; left/top also shift the box
@@ -984,6 +1007,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     if (g.edges & 1) { h -= dy; g.win.y = Math.max(0, g.y + dy); }
     g.lastW = Math.max(80, w);
     g.lastH = Math.max(60, h);
+    tellPositions();
     engine.requestResize(g.win.conn, g.win.surface, g.lastW, g.lastH);
   }
 
@@ -1225,6 +1249,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       output.width = width;
       output.height = height;
       engine.setOutput(width, height);
+      tellPositions(); // (a fullscreen window's geometry is centred in it)
       if (scale !== undefined) {
         output.scale = scale;
         engine.setScale(scale, scale * 120);
@@ -1290,7 +1315,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     },
     move(ref, x, y) {
       const win = wins.get(refKey(ref));
-      if (win) { win.x = x; win.y = y; }
+      if (win) { win.x = x; win.y = y; tellPositions(); }
     },
     resize(ref, width, height) {
       const win = wins.get(refKey(ref));

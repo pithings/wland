@@ -2,8 +2,10 @@
 // App-initiated move/resize grabs (xdg_toplevel.move/.resize), maximize and
 // fullscreen placement, minimize/restore (focus and stacking), Alt+drag
 // move, the window key bindings, popup dismissal on outside click, and the
-// dnd session (wl_data_device.start_drag). Window positions are DOM state:
-// the core has none. It moves the view's window elements, so it assumes the
+// dnd session (wl_data_device.start_drag). Window positions are DOM state;
+// the core is only told them (Engine.setWindowPosition, `positions`: it
+// constrains popups to the output with them). It moves the view's window
+// elements, so it assumes the
 // view's default mount (windows absolutely positioned in one container); an
 // embedder hosting windows in its own frames brings its own window manager,
 // or keeps this one for the rest and takes interactive move/resize
@@ -81,6 +83,15 @@ export interface WindowManagerOptions {
    *  with `input.grab(press.pointerId)`: it ends at that pointer's release
    *  whatever happens. False or absent: the default grab. */
   interactive?(ev: InteractiveEvent, press: PointerPress): boolean;
+  /** Tell the core where each window is (Engine.setWindowPosition: the
+   *  window element's left/top, the window geometry's top-left in the
+   *  container), so the apps' popups are constrained to the output — at
+   *  its first commit and whenever this module moves it. Right for the
+   *  view's default mount (windows absolutely positioned in `container`,
+   *  whose box is the output); default true. createWland turns it off with
+   *  a `mount` of the embedder's, whose frames put the element elsewhere:
+   *  that window manager calls setWindowPosition itself. */
+  positions?: boolean;
   log?(line: string): void;
 }
 
@@ -181,6 +192,11 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   const sc = options.shortcuts;
   const keysOn = typeof sc === 'object' && sc ? sc.keys !== false : sc !== false;
   const altDragOn = typeof sc === 'object' && sc ? sc.drag !== false : true;
+  const positionsOn = options.positions !== false;
+  // window key → the position last told the core ('x,y'): told again only
+  // when it changed; forgotten when the core forgets it (a new link, the
+  // toplevel unmapped, a session's new viewer)
+  const told = new Map<string, string>();
   let lastPointer = { x: 0, y: 0 };
   let grab: Grab | null = null;
   let dnd: Dnd | null = null;
@@ -213,6 +229,19 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   // (whatever owns the pointer lets go at the blur through its input grab)
   const onBlur = () => held.clear();
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('blur', onBlur);
+
+  // --- window positions for the core (popup constraints; `positions`) -----
+  function tellPosition(conn: number, surface: number) {
+    if (!positionsOn) return;
+    const win = view.window(conn, surface);
+    if (!win) return;
+    const x = parseFloat(win.element.style.left), y = parseFloat(win.element.style.top);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const at = `${Math.round(x)},${Math.round(y)}`;
+    if (told.get(win.key) === at) return;
+    told.set(win.key, at);
+    engine.setWindowPosition(conn, surface, x, y);
+  }
 
   // --- session: window places across reloads (see the file comment) -------
   // sid: the session id as of the last 'synced' (null: passthrough, or the
@@ -248,12 +277,15 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     if (!saved) return;
     const pos = { left: `${saved.x}px`, top: `${saved.y}px` };
     if (restore.has(w.key)) restore.set(w.key, pos);
-    else { w.element.style.left = pos.left; w.element.style.top = pos.top; }
+    else { w.element.style.left = pos.left; w.element.style.top = pos.top; tellPosition(w.conn, w.surface); }
   }
   // the scene is all there: places for the windows mapped before the id
   // was known, the saved stacking, the keyboard to the top window
   function synced() {
     sid = engine.session?.()?.id ?? null;
+    // a new viewer: the relay forgot the positions the last one told
+    told.clear();
+    for (const w of view.windows()) tellPosition(w.conn, w.surface);
     if (!sid) return;
     const current = `${PLACE_PREFIX}${sid}:`;
     dropPlaces((k) => !k.startsWith(current)); // an earlier relay run's
@@ -314,6 +346,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     if (g.mode === 'move') {
       g.el.style.left = `${g.startL + dx}px`;
       g.el.style.top = `${Math.max(0, g.startT + dy)}px`;
+      tellPosition(g.conn, g.surface);
       return;
     }
     // edges: 1 top, 2 bottom, 4 left, 8 right. Left/top also shift the box;
@@ -324,6 +357,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     if (g.edges & 4) { w -= dx; g.el.style.left = `${g.startL + dx}px`; }
     if (g.edges & 2) h += dy;
     if (g.edges & 1) { h -= dy; g.el.style.top = `${Math.max(0, g.startT + dy)}px`; }
+    if (g.edges & 5) tellPosition(g.conn, g.surface);
     g.lastW = Math.max(80, w);
     g.lastH = Math.max(60, h);
     if (!g.queued) {
@@ -368,6 +402,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
       const t = Math.min(Math.max(startT + mv.clientY - startY, 0), container.clientHeight - 24);
       el.style.left = `${l}px`;
       el.style.top = `${t}px`;
+      tellPosition(win.conn, win.surface);
     };
     // ends with its input grab: at the release (seen or not), a cancel, or
     // the capture lost any other way (otherwise hovering the window would go
@@ -402,6 +437,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     if (!restore.has(win.key)) restore.set(win.key, { left: st.left, top: st.top });
     st.left = '0px';
     st.top = '0px';
+    tellPosition(conn, surface);
   }
   function unsnap(conn: number, surface: number) {
     const win = view.window(conn, surface);
@@ -409,6 +445,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     const pos = restore.get(win.key);
     restore.delete(win.key);
     if (pos) { win.element.style.left = pos.left; win.element.style.top = pos.top; }
+    tellPosition(conn, surface);
   }
 
   // --- the browser's fullscreen (browserFullscreen) -------------------------
@@ -639,13 +676,16 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
           st.minimized = ev.minimized;
           if (ev.maximized || ev.fullscreen) snap(ev.conn, ev.surface);
           if (ev.fullscreen && !was) { view.raise(ev.conn, ev.surface); syncBrowserFs(); }
+          tellPosition(ev.conn, ev.surface); // (the mount placed it; told once)
         } else if (ev.role === ROLE_POPUP) popups.set(keyOf(ev.conn, ev.surface), { conn: ev.conn, surface: ev.surface });
         else if (ev.role === ROLE_DND_ICON) placeIcon();
         break;
       case 'surface':
         if (ev.role === ROLE_DND_ICON) placeIcon();
         else if (ev.role !== ROLE_POPUP) popups.delete(keyOf(ev.conn, ev.surface));
-        // an unmapped toplevel's states went with its xdg_toplevel
+        // an unmapped toplevel's states went with its xdg_toplevel (and the
+        // position the core had)
+        if (ev.role !== ROLE_TOPLEVEL) told.delete(keyOf(ev.conn, ev.surface));
         if (ev.role !== ROLE_TOPLEVEL && states.delete(keyOf(ev.conn, ev.surface))) syncBrowserFs();
         break;
       case 'destroy':
@@ -653,12 +693,14 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
         if (sid && engine.session()) dropPlaces((k) => k === placeKey(ev.conn, ev.surface));
         popups.delete(keyOf(ev.conn, ev.surface));
         restore.delete(keyOf(ev.conn, ev.surface));
+        told.delete(keyOf(ev.conn, ev.surface));
         if (states.delete(keyOf(ev.conn, ev.surface))) syncBrowserFs();
         break;
       case 'disconnect':
         if (sid && engine.session()) dropPlaces((k) => k.startsWith(`${PLACE_PREFIX}${sid}:${ev.conn}:`));
         for (const [key, p] of popups) if (p.conn === ev.conn) popups.delete(key);
         for (const key of restore.keys()) if (key.startsWith(`c${ev.conn}s`)) restore.delete(key);
+        for (const key of told.keys()) if (key.startsWith(`c${ev.conn}s`)) told.delete(key);
         for (const [key, s] of states) if (s.conn === ev.conn) states.delete(key);
         syncBrowserFs();
         if (grab && grab.conn === ev.conn) cancelGrab();
@@ -686,7 +728,8 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
         break;
       }
       case 'synced': synced(); break;
-      case 'close': sid = null; break; // (the next link's 'synced' says again)
+      case 'open': told.clear(); break; // a fresh compositor
+      case 'close': sid = null; told.clear(); break; // (the next link's 'synced' says again)
     }
   }
 
@@ -726,6 +769,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
       popups.clear();
       restore.clear();
       states.clear();
+      told.clear();
       if (browserFs.ours && document.fullscreenElement === container) document.exitFullscreen().catch(() => {});
       browserFs.ours = browserFs.wanted = browserFs.requested = false;
     },

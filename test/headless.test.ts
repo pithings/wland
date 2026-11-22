@@ -942,6 +942,42 @@ test('setTiled / resize: tokens, the app\'s ack + commit is the window\'s `acked
   hl.dispose();
 });
 
+test('window positions: the core is told where each box is (cascade, move(), maximize, fullscreen centred), once per change; a popup near the output\'s right edge flips back inside it', async () => {
+  const ctx = await setup();
+  const { hl } = ctx;
+  const calls: number[][] = [];
+  const orig = hl.engine.setWindowPosition;
+  hl.engine.setWindowPosition = (conn, surface, x, y) => { calls.push([x, y]); orig(conn, surface, x, y); };
+  const a = client(ctx, 1);
+  const t = a.toplevel('win');
+  a.paint(t.surface, 40, 30, [255, 0, 0, 255]);
+  const k = `c1s${t.surface}`;
+  const told = () => calls.slice();
+  assert.deepEqual(told(), [[24, 48]], 'the cascade, at the first commit');
+  hl.move(k, 150, 48);
+  hl.move(k, 150, 48);
+  assert.deepEqual(told(), [[24, 48], [150, 48]], 'once per change');
+  // a menu at x 30 of the window: 150 + 31 + 60 > 200 → flipped left of the anchor
+  const surface = a.id(), xdg = a.id(), popup = a.id(), pos = a.id();
+  a.send(msg(WM, 1, pos), msg(pos, 1, 60, 40), msg(pos, 2, 30, 10, 1, 1), msg(pos, 3, 8), msg(pos, 4, 8), msg(pos, 5, 4),
+    msg(COMP, 0, surface), msg(WM, 2, xdg, surface), msg(xdg, 2, popup, t.xdg, pos), msg(surface, 6));
+  a.paint(surface, 60, 40, [0, 0, 255, 255]);
+  const p = hl.surfaces().find((s) => s.surface === surface)!;
+  assert.deepEqual([p.x, p.y], [30 - 60, 11]);
+  // maximized: the origin; fullscreen: the geometry centred in the output
+  calls.length = 0;
+  hl.setMaximized(k, true);
+  a.paint(t.surface, 200, 150, [255, 0, 0, 255]);
+  assert.deepEqual(told(), [[0, 0]]);
+  calls.length = 0;
+  hl.setMaximized(k, false);
+  a.paint(t.surface, 40, 30, [255, 0, 0, 255]);
+  hl.setFullscreen(k, true);
+  a.paint(t.surface, 40, 30, [255, 0, 0, 255]);
+  assert.deepEqual(told(), [[150, 48], [80, 60]]);
+  hl.dispose();
+});
+
 test('window geometry: the box is what set_window_geometry names; shadows hang outside it, placement and sizes follow it', async () => {
   const ctx = await setup();
   const { hl, calls } = ctx;

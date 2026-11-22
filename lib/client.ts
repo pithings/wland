@@ -121,7 +121,10 @@ export interface WlandOptions {
    *  manager still runs as with the default (popups, dnd, the bindings) and
    *  still positions the element itself for an app's move/resize grab and
    *  for maximize/fullscreen (left/top 0): inside your frame, that is
-   *  relative to wherever you put the element. */
+   *  relative to wherever you put the element. It no longer tells the core
+   *  where windows are: call engine.setWindowPosition(conn, surface, x, y)
+   *  with the window geometry's top-left in the output as your frames move,
+   *  so menus near the output's edges flip or slide back inside it. */
   mount?(win: ViewWindow): void;
   /** Take a window's element out of your frame (ViewOptions.unmount).
    *  Default: element.remove(). */
@@ -283,7 +286,9 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
     input = createInput({ engine, view, container, onFocusChange: options.onFocusChange || onWindowsChange, clipboard: clip?.hooks,
       autoFocus: options.autoFocus });
     wm = createWindowManager({ engine, view, input, container, log,
-      browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts, interactive: options.interactive });
+      browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts, interactive: options.interactive,
+      // window positions are the embedder's to tell when its frames place them
+      positions: !options.mount });
     output = watchOutput(engine, container, scale);
   } catch (e) {
     teardown();
