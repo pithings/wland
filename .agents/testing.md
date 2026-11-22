@@ -77,7 +77,11 @@ oneshot; read its WAYLAND_DEBUG for `confined()`/`locked()`/
 app is: headless-e2e drives one through `python3` ctypes, relative mouse
 mode = a persistent lock + a relative pointer). SDL3 must run with
 `SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR=0`: libdecor's GTK plugin aborts on the
-same glycin icon failure as the GTK3 demos.
+same glycin icon failure as the GTK3 demos. `neverball` (SDL2 through
+sdl2-compat) is installed: the real app behind the `game` role (it draws
+every frame, so a phase must not wait for commits to settle); answered
+client_side it moves to libdecor (that abort), so it runs with the same
+variable.
 
 Presentation feedback: `weston-presentation-shm -f` (weston-demo) prints a
 line per presented frame — `c2p` is commit → presentation on its own
@@ -136,6 +140,7 @@ apps do through the compositor is checked without a browser, by
 | Clipboard bridge (core own selection / `readSelection`, relay pipe_read and pipe writes, engine selection API, `lib/clipboard.ts`, input's paste-chord queue) | `zig build test` (also Debug) + `node --test test/clipboard.test.ts` + both Node E2Es (their clipboard phases) + run-poc `foot` (its `clipboard` phase; CDP grants the clipboard permissions) + `node tools/firefox-smoke.ts` (step 3: Gecko's late paste event targets the body; step 4: a page selection Gecko keeps across the click into the desktop is not copied by Ctrl+C or a copy command there) |
 | `lib/wm.ts` (grabs, maximize, popups, dnd) | run-poc `foot gtk` (gtk's `dnd` phase drags in the `files` fixture); real nautilus: `tools/dnd-test.sh` |
 | Window states (fullscreen, minimize, maximize: core, view, wm, input, headless) | `zig build test` (also Debug) + `node --test test/client.test.ts test/headless.test.ts` + both Node E2Es (headless: foot, weston-fullscreen, nautilus's minimize button — fixtures `term`, `fullscreen`, `files`; relay: a minimized simple-shm stops on the stream link) + run-poc `states` |
+| Decorations / bounds (core xdg-decoration, `setBounds`, 'decoration' events, `decorated` in view/headless/client) | `zig build test` (also Debug) + `node --test test/engine.test.ts test/session.test.ts test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (its `decorations` phase, fixture `game`; also `--profile session` via `WLAND_E2E_RELAY`, where a viewer's mode re-answers the running game) and with `WLAND_E2E_APPS=real` (neverball, foot) |
 | `lib/client.ts`, the server's page serving and takeover | run-poc `foot takeover` |
 | Anything browser-facing that may differ in Gecko (input, present, view, client) | also `node tools/firefox-smoke.ts` (headless Firefox, its own port 8951 / BiDi 9351 / socket `wayland-ffsmoke`) |
 | `test/support/`, `test/browser/` | `node --test test/*.test.ts` + run-poc `handle-demo` (its `sab=1` modes load through `test/support/isolated.ts`, a COOP/COEP mirror of wlandr: wlandr's own pages can't make a SharedArrayBuffer) + `node tools/firefox-smoke.ts` |

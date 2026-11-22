@@ -59,7 +59,13 @@
 //     xeyes installed): the relay claimed an X display; an X client
 //     connecting to it starts satellite and gets a window.
 //  7. output scale 2: foot attaches buffers at 2× its logical size.
-//  8. a GPU client (fixtures only): a second relay with the test-only
+//  8. decorations (fixture `game`, real neverball): an SDL game is
+//     client-side under the default; a scene with decorations 'server' (a
+//     reload) has it decorated, told before its first commit (session: the
+//     running game answered server_side at the attach); the fixture's
+//     set_mode after the map undecorates and decorates it again; foot
+//     (real) asks too, the term fixture never does.
+//  9. a GPU client (fixtures only): a second relay with the test-only
 //     `--dmabuf virtgpu:@fake` names the `dmabuf` fixture's buffers as
 //     resources; COMMITs of kind virtgpu reach a headless client with a
 //     gpu resolver, with the client's size, format and implicit modifier,
@@ -179,6 +185,7 @@ const errors: string[] = [];
 const titles: string[] = [];
 const grabs: string[] = []; // 'move' / 'resize' events: the grabs the core started
 let synced = 0; // 'synced' events: scene replays of a session relay
+const order: string[] = []; // 'decoration' events and each surface's first commit, in order
 let hl!: Headless;
 
 /** Commits stopped arriving for `quiet` ms. */
@@ -867,10 +874,16 @@ async function scale2() {
 }
 
 /** A scene on the main relay's link (the page; again after a "reload"). */
-function attach(): Promise<Headless> {
+function attach(decorations: 'client' | 'server' = 'client'): Promise<Headless> {
+  const seen = new Set<string>(); // surfaces with a commit in this scene
   return createHeadless({
-    link: `ws://127.0.0.1:${PORT}/ws`, width: 1280, height: 800,
+    link: `ws://127.0.0.1:${PORT}/ws`, width: 1280, height: 800, decorations,
     onEvent(ev) {
+      if (ev.type === 'decoration') order.push(`decoration c${ev.conn}s${ev.surface} ${ev.decorated}`);
+      else if (ev.type === 'commit' && !seen.has(`c${ev.conn}s${ev.surface}`)) {
+        seen.add(`c${ev.conn}s${ev.surface}`);
+        order.push(`commit c${ev.conn}s${ev.surface}`);
+      }
       if (ev.type === 'commit') commits++;
       else if (ev.type === 'open') opened = true;
       else if (ev.type === 'synced') synced++;
@@ -915,6 +928,86 @@ async function reattach() {
   check(alive(app), 'input reaches it again: typed keys retitled the window');
   await stop(app);
   await noWindows();
+}
+
+/** decorations 'client' (the default) and 'server': an SDL game binds
+ *  xdg-decoration before its first commit and gets server_side only from
+ *  a scene that draws frames, which knows it before the window's first
+ *  commit; on a session relay a viewer of the other mode answers the
+ *  running game again. */
+async function decorations() {
+  console.log('== decorations: an SDL game, client-side by default, server-side for a scene that draws frames ==');
+  const spec = need('game');
+  if (!spec) return;
+  const session = !!hl.engine.session();
+  let out = '';
+  const start = () => {
+    const p = runApp(spec);
+    p.stdout!.on('data', (c) => { out += c; });
+    return p;
+  };
+  // (a real game draws every frame: commits never settle)
+  const mapped = async () => {
+    await until(() => hl.windows().length === 1, 20000, `${spec.name}'s window`);
+    await sleep(500);
+    return hl.windows()[0]!;
+  };
+  let game = start();
+  let win = await mapped();
+  check(!win.decorated, `default: not decorated (${win.width}x${win.height})`);
+  if (!realApps) check(/decoration: client_side/.test(out) && /Created a window/.test(out), 'the game was configured client_side and drew its window');
+
+  // a scene that draws frames: a page reload with decorations 'server'
+  hl.dispose();
+  if (!session) await until(() => !alive(game), 5000, 'the game to end with its link (passthrough)');
+  const s0 = synced, o0 = order.length;
+  opened = false;
+  hl = await attach('server');
+  await until(() => opened, 10000, 'the link to open');
+  if (session) {
+    await until(() => synced > s0, 10000, 'the scene replay (synced)');
+    if (!realApps) await until(() => /decoration: server_side/.test(out), 5000, 'the running game to be answered server_side');
+    await until(() => hl.windows()[0]?.decorated, 5000, 'the running game to be decorated');
+    check(true, 'session: the running game was answered server_side when the viewer attached');
+  } else {
+    out = '';
+    game = start();
+  }
+  win = await mapped();
+  check(win.decorated, `'server': decorated (${win.width}x${win.height})`);
+  const key = `c${win.conn}s${win.surface}`;
+  const told = order.indexOf(`decoration ${key} true`, o0), first = order.indexOf(`commit ${key}`, o0);
+  check(told >= 0 && (session || (first >= 0 && told < first)), `known before its first commit (${order.slice(o0).filter((l) => l.includes(key)).join(', ')})`);
+  if (!realApps) {
+    check(/decoration: server_side/.test(out) && /Created a window/.test(out), 'the game was configured server_side and drew its window');
+    check(win.width === 800 && win.height === 600, 'its box is its content, 800x600 (no frame added)');
+    // SDL_SetWindowBordered(false): set_mode(client_side), then back
+    hl.click(win.x + 400, win.y + 300);
+    hl.press('KeyB');
+    await until(() => !hl.windows()[0]?.decorated, 5000, 'client_side asked to undecorate it');
+    hl.press('KeyB');
+    await until(() => hl.windows()[0]?.decorated, 5000, 'server_side asked to decorate it again');
+    check(true, 'set_mode(client_side) / set_mode(server_side) after the map: decorated follows');
+  }
+  await stop(game);
+  await noWindows();
+
+  // foot binds xdg-decoration and prefers server_side; its fixture, like
+  // GTK, never asks: client-side under 'server' too
+  const term = need('term');
+  if (term) {
+    const app = runApp(term);
+    const t = await oneWindow(term.name);
+    check(t.decorated === realApps, realApps ? 'foot asked for server_side: decorated' : 'a toplevel that never asks: not decorated');
+    await stop(app);
+    await noWindows();
+  }
+
+  // back to the default for whatever follows
+  hl.dispose();
+  opened = false;
+  hl = await attach();
+  await until(() => opened, 10000, 'the link to open');
 }
 
 async function gpu() {
@@ -1043,6 +1136,7 @@ try {
   await x11();
   await scale2();
   await reattach();
+  await decorations();
   await gpu();
   check(errors.length === 0, `no engine error events ${errors.join('; ')}`);
   console.log('HEADLESS-E2E PASS');

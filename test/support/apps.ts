@@ -34,7 +34,10 @@ export type AppRole =
   | 'browser'
   // a GPU client (linux-dmabuf); the fixture's buffers are memfds, which
   // only the relay's test-only `--dmabuf virtgpu:@fake` takes
-  | 'dmabuf';
+  | 'dmabuf'
+  // an SDL2 game: xdg-decoration made before its first commit, no frame of
+  // its own (neverball)
+  | 'game';
 
 export interface AppSpec {
   role: AppRole;
@@ -151,6 +154,9 @@ function real(role: AppRole, args: string[]): AppSpec {
     // container at GTK's first icon, testing.md "Setup")
     case 'browser': return spec('firefox', ['--no-remote', '--new-instance', ...args]);
     case 'dmabuf': return spec('weston-simple-dmabuf-egl', args);
+    // SDL2 (sdl2-compat here); no libdecor (its GTK plugin aborts in this
+    // container), no audio device needed
+    case 'game': return spec('neverball', args, { SDL_VIDEO_DRIVER: 'wayland', SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR: '0', SDL_AUDIODRIVER: 'dummy' });
     // no libdecor: its GTK plugin aborts in this container (testing.md)
     case 'relative': return { ...spec('python3', ['-c', SDL_RELATIVE, '60'], { SDL_VIDEO_DRIVER: 'wayland', SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR: '0' }), name: 'SDL3 (python3)' };
     // a plain shell: no rc files that retitle the window on every prompt

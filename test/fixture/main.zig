@@ -25,13 +25,16 @@
 //!   dmabuf                       weston-simple-dmabuf-egl: linux-dmabuf buffers
 //!                                (memfds: needs a relay that takes them, e.g.
 //!                                the test-only `--dmabuf virtgpu:@fake`)
+//!   game                         an SDL2 game (neverball): xdg-decoration made
+//!                                before the first commit, prints the mode it
+//!                                is configured with; `b` toggles the border
 
 const std = @import("std");
 const wl = @import("wl.zig");
 
 const usage =
     \\usage: wland-fixture <mode> [args]
-    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf
+    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf game
     \\
 ;
 
@@ -64,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "fullscreen", @import("fullscreen.zig").run },
         .{ "browser", @import("browser.zig").run },
         .{ "dmabuf", @import("dmabuf.zig").run },
+        .{ "game", @import("game.zig").run },
     };
     inline for (modes) |m| {
         if (std.mem.eql(u8, mode, m[0])) return m[1](gpa, env, args);
