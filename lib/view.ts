@@ -107,6 +107,11 @@ export interface ViewOptions {
   /** WebGL present for toplevels: 'auto' (only on hardware-accelerated
    *  WebGL), 'always', or 'never'. Default 'auto'. */
   webgl?: 'auto' | 'always' | 'never';
+  /** A new toplevel's canvas takes the page's focus at its first commit,
+   *  which input turns into keyboard focus. Default true; false for an
+   *  embedder that decides focus (InputOptions.autoFocus false): a new
+   *  window then takes nothing from the element that has the focus. */
+  focusOnMap?: boolean;
   log?(line: string): void;
 }
 
@@ -661,7 +666,7 @@ export function createView(options: ViewOptions): View {
         // a new toplevel takes keyboard focus, AFTER presenting: input
         // listens for focusin and calls the engine, which can detach a
         // wasm-backed ev.pixels (engine.ts, pixel lifetime)
-        if (mapped) s.canvas.focus({ preventScroll: true });
+        if (mapped && options.focusOnMap !== false) s.canvas.focus({ preventScroll: true });
         break;
       }
       case 'input-region': {

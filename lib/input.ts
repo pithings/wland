@@ -15,6 +15,20 @@ export interface InputOptions {
   container: HTMLElement;
   /** Keyboard focus moved to another toplevel, or was lost. */
   onFocusChange?(): void;
+  /** Who decides keyboard focus. Default true, wland: a press in a window
+   *  focuses its toplevel, and when the focused one closes, unmaps or is
+   *  minimized focus passes to the topmost window left (the window manager
+   *  also focuses a window it restores or makes fullscreen; a new window
+   *  takes focus through the view, ViewOptions.focusOnMap). False: the
+   *  embedder's window manager — only focus() gives it; blur(), or the
+   *  focused window going, leaves no window focused. A press is then
+   *  forwarded to the app without moving the focus: to focus on press, call
+   *  focus() from your own pointerdown listener on the window's frame (it
+   *  runs before input's document listener, so the app gets its keyboard
+   *  enter before the button, as with true; and inside the press, where the
+   *  browser lets the IME sink's focus open the on-screen keyboard). Turn
+   *  the view's focusOnMap off with it (createWland does). */
+  autoFocus?: boolean;
   /** The clipboard bridge (lib/clipboard.ts). With it, the paste chords
    *  keep the browser's default action, so the browser fires `paste` on the
    *  IME sink, and from a paste chord's press on, key events (and
@@ -85,18 +99,76 @@ function applePlatform(): boolean {
   return /^(macOS|Mac|iPhone|iPad|iPod)/i.test(p);
 }
 
+/** Why a grab ended (GrabOptions.onEnd). */
+export type GrabEndReason =
+  /** its pointer's pointerup, or a move showing no button down (a release
+   *  the page didn't see) */
+  | 'release'
+  /** its pointer's pointercancel */
+  | 'cancel'
+  /** a lostpointercapture for its pointer (an element that captured it
+   *  for the grab let go, or left the document) */
+  | 'capture'
+  /** the window lost focus: the release may happen where the page can't
+   *  see it */
+  | 'blur'
+  /** end() */
+  | 'end';
+
+export interface GrabOptions {
+  /** Called once when the grab ends, however it ends; `ev` is the event
+   *  that ended it, if one did. Runs before the pointer is entered again,
+   *  with the grab already inactive. */
+  onEnd?(reason: GrabEndReason, ev?: PointerEvent): void;
+}
+
+/** A window manager's hold on the pointer (Input.grab). */
+export interface PointerGrab {
+  /** The pointer it follows (-1: none, see Input.suppress). */
+  readonly pointerId: number;
+  /** False once it ended (or when it never started: its pointer was not
+   *  down). */
+  readonly active: boolean;
+  /** Let go; idempotent. */
+  end(): void;
+}
+
 export interface Input {
   /** Feed every engine event, after the view (focus dies silently with its
-   *  surface and passes to the topmost window left; the IME sink follows
-   *  the text cursor). */
+   *  surface and, with autoFocus, passes to the topmost window left; the
+   *  IME sink follows the text cursor). */
   handle(event: WlandEvent): void;
+  /** InputOptions.autoFocus as created: whether wland moves keyboard focus
+   *  on its own (the window manager reads it too). */
+  readonly autoFocus: boolean;
   /** Give a toplevel keyboard focus (not a minimized one: restore it
    *  first). */
   focus(conn: number, surface: number): void;
+  /** Take keyboard focus from whichever window has it (a keyboard leave):
+   *  no window has it until the next focus(). The IME sink lets go of the
+   *  page's focus too. */
+  blur(): void;
   /** Whether a toplevel holds keyboard focus. */
   focused(conn: number, surface: number): boolean;
-  /** While on, pointer events are not forwarded (a window-manager grab owns
-   *  the pointer). */
+  /** Take the pointer from the apps for a window manager's drag (a move or
+   *  resize, the embedder's or wland's own) started by a press of pointer
+   *  `pointerId`. While any grab is on, pointer events are not forwarded:
+   *  the implicit grab (pointer capture on the pressed surface) is let go
+   *  and the surface holding the pointer gets a leave. It ends at that
+   *  pointer's release (its pointerup, which is not forwarded either, or a
+   *  move showing no button down), its pointercancel, a lostpointercapture
+   *  for it (so a pointer capture you take for the drag ending any other
+   *  way ends the grab too), the window's blur, or end() — whichever comes
+   *  first; then the surface under the pointer is entered again. A pointer
+   *  that is not down (its release already seen) gets a grab that is over
+   *  at once (`active` false, onEnd not called): a grab cannot outlive its
+   *  press. */
+  grab(pointerId: number, options?: GrabOptions): PointerGrab;
+  /** While on, pointer events are not forwarded. A grab (see grab()) of the
+   *  pointer pressed last while it is still down, else of no pointer;
+   *  suppress(false) ends it. It ends by itself like any grab: at that
+   *  pointer's release, cancel, lost capture or the window's blur (a
+   *  pointerless one at the blur only). Prefer grab(). */
   suppress(on: boolean): void;
   /** Remove its document listeners and the IME sink. DOM only: the engine
    *  is not told (dispose the engine as well, or stop feeding it). */
@@ -164,7 +236,7 @@ export function createInput(options: InputOptions): Input {
   const { engine, view, container, clipboard } = options;
   const onFocusChange = options.onFocusChange || (() => {});
   const apple = applePlatform();
-  let suppressed = false; // a window-manager grab owns the pointer
+  const autoFocus = options.autoFocus !== false;
   let active: Focus | null = null; // the toplevel holding keyboard focus
 
   const isActive = (conn: number, surface: number) => !!active && active.conn === conn && active.surface === surface;
@@ -278,17 +350,33 @@ export function createInput(options: InputOptions): Input {
     if (document.activeElement !== sink) sink.focus({ preventScroll: true });
   }
 
+  // the embedder takes the keyboard from every window (Input.blur): a leave,
+  // and the sink lets go of the page's focus (its blur check then finds
+  // nothing to drop)
+  function blur() {
+    if (active) {
+      releasePaste();
+      releaseHeld();
+      engine.keyboardLeave(active.conn);
+      active = null;
+      onFocusChange();
+    }
+    if (document.activeElement === sink) sink.blur();
+    updateInputMode();
+  }
+
   // the focused surface or conn went away: drop routing WITHOUT a leave (a
   // leave naming a dead surface kills the client), unless the surface lives
-  // on unmapped (`leave`). Focus then passes to the topmost window left, as
-  // closing a window does on a desktop: the keyboard was ours (active is
-  // cleared when DOM focus leaves the sink), so it stays with us.
+  // on unmapped (`leave`). With autoFocus, focus then passes to the topmost
+  // window left, as closing a window does on a desktop: the keyboard was
+  // ours (active is cleared when DOM focus leaves the sink), so it stays
+  // with us. Without, no window has it until the embedder says.
   function forget(matches: (a: Focus) => boolean, leave = false) {
     if (!active || !matches(active)) return;
     releasePaste();
     if (leave) { releaseHeld(); engine.keyboardLeave(active.conn); }
     active = null;
-    const next = topWindow();
+    const next = autoFocus ? topWindow() : null;
     if (next) return focus(next.conn, next.surface);
     onFocusChange();
     updateInputMode();
@@ -307,9 +395,15 @@ export function createInput(options: InputOptions): Input {
     return top;
   }
 
+  // a toplevel canvas taking the page's focus (the view's focusOnMap, a
+  // click whose default went through, Tab) focuses its window. Without
+  // autoFocus it moves no keyboard focus: while a window has it, the sink
+  // takes the page's focus back (the keys are still that window's)
   on('focusin', (ev) => {
     const s = view.surfaceOf(ev.target);
-    if (s && s.role === ROLE_TOPLEVEL) focus(s.conn, s.surface);
+    if (!s || s.role !== ROLE_TOPLEVEL) return;
+    if (autoFocus) focus(s.conn, s.surface);
+    else if (active) sink.focus({ preventScroll: true });
   });
 
   // focus leaving the sink for something that ISN'T one of our canvases
@@ -441,10 +535,12 @@ export function createInput(options: InputOptions): Input {
   });
   // the window lost focus (another window, Alt/Cmd+Tab): DOM focus stays on
   // the sink and the app keeps its keyboard focus, but the releases of what
-  // is held now go to another window
+  // is held now go to another window — pointer buttons too: every grab ends
   const onWindowBlur = () => {
     releaseHeld();
     forgetBrowserKeys();
+    down.clear();
+    for (const g of [...grabs]) endGrab(g, 'blur');
   };
   window.addEventListener('blur', onWindowBlur);
   // on the document: Chromium targets the sink, Firefox the element holding
@@ -489,7 +585,7 @@ export function createInput(options: InputOptions): Input {
   });
 
   // --- pointer: delegated, so windows can be mounted anywhere --------------
-  const target = (ev: UIEvent) => (suppressed ? null : view.surfaceOf(ev.target));
+  const target = (ev: UIEvent) => (grabs.size ? null : view.surfaceOf(ev.target));
 
   // The implicit grab: while a button is held the pressed surface keeps the
   // pointer (a Wayland seat's rule; the browser would hand it to whatever is
@@ -498,15 +594,126 @@ export function createInput(options: InputOptions): Input {
   // to that element, no pointerout fires on the way out (motion goes on in
   // its surface-local px, outside it too), and the boundary events after the
   // last release bring the leave/enter. It is let go where a grab takes the
-  // pointer over: a window-manager grab or drag (suppress), and a popup of
+  // pointer over: a window-manager grab or drag (grab()), and a popup of
   // the pressed client mapping (a popup grab: its surfaces then get the
   // pointer by position, as GTK's press-drag-release menus need).
   let captured: { el: Element; id: number; conn: number; surface: number } | null = null;
+  // elements whose capture release() let go, until their lostpointercapture
+  // came: that one is ours, it ends no grab
+  const letGo = new WeakSet<Element>();
   function release() {
     const c = captured;
     captured = null;
     if (!c) return;
-    try { if (c.el.hasPointerCapture(c.id)) c.el.releasePointerCapture(c.id); } catch { /* gone */ }
+    try {
+      if (c.el.hasPointerCapture(c.id)) {
+        letGo.add(c.el);
+        c.el.releasePointerCapture(c.id);
+      }
+    } catch { /* gone */ }
+  }
+
+  // --- grabs (Input.grab): a window manager's drag owns the pointer --------
+  // `down`: pointers with a button down (pointerdown → pointerup/cancel, a
+  // buttonless move, the window's blur) and where each was last seen; a
+  // grab needs its pointer there. The listeners are capture-phase ones on
+  // the document, registered before the window manager's (created after
+  // input): a grab ends before anyone else sees the event that ends it, so
+  // the window manager's own pointerup sees its grab over, and a pointerup
+  // that ended one is not forwarded (`swallow`; the app never saw the press
+  // as its own: the grab sent it a leave).
+  // `ignore`: the implicit grab's element at the start, whose capture may
+  // still be on its way out (a capture taken for the drag moved it there)
+  interface GrabState {
+    pointerId: number; active: boolean; x: number; y: number; ignore?: Element;
+    onEnd?: GrabOptions['onEnd'];
+  }
+  const down = new Map<number, { x: number; y: number }>();
+  const grabs = new Set<GrabState>();
+  const swallow = new WeakSet<Event>();
+  let lastPressed = -1; // the pointer pressed last (suppress's)
+  let lastAt = { x: 0, y: 0 }; // where any pointer was last seen
+  let hovered = 0; // the conn the pointer was last entered into (0: none)
+
+  function startGrab(pointerId: number, options: GrabOptions = {}): PointerGrab {
+    const at = pointerId < 0 ? lastAt : down.get(pointerId);
+    const g: GrabState = { pointerId, active: !!at, x: at ? at.x : 0, y: at ? at.y : 0, onEnd: options.onEnd };
+    const handle: PointerGrab = {
+      pointerId,
+      get active() { return g.active; },
+      end: () => endGrab(g, 'end'),
+    };
+    if (!g.active) return handle; // released already: nothing to hold
+    // whatever had the pointer lets go: the implicit grab, and the app
+    // under the pointer gets its leave (ends its own gesture)
+    const left = new Set([captured?.conn, hovered]);
+    g.ignore = captured?.el;
+    release();
+    for (const conn of left) if (conn) engine.pointerLeave(conn);
+    hovered = 0;
+    grabs.add(g);
+    return handle;
+  }
+  function endGrab(g: GrabState, reason: GrabEndReason, ev?: PointerEvent) {
+    if (!g.active) return;
+    g.active = false;
+    grabs.delete(g);
+    if (ev) { g.x = ev.clientX; g.y = ev.clientY; }
+    try {
+      g.onEnd?.(reason, ev);
+    } finally {
+      // the pointer goes back to whatever surface is under it (not under a
+      // lock: no boundary events there, it stays on its surface)
+      if (!grabs.size && !locked) {
+        const t = view.surfaceAt(g.x, g.y);
+        if (t) { engine.pointerEnter(t.conn, t.surface, t.x, t.y); hovered = t.conn; }
+      }
+    }
+  }
+  const grabsOf = (id: number) => [...grabs].filter((g) => g.pointerId === id);
+  on('pointerdown', (ev) => {
+    down.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    lastPressed = ev.pointerId;
+    lastAt = { x: ev.clientX, y: ev.clientY };
+  }, true);
+  on('pointermove', (ev) => {
+    lastAt = { x: ev.clientX, y: ev.clientY };
+    for (const g of grabs) if (g.pointerId === ev.pointerId || g.pointerId < 0) { g.x = ev.clientX; g.y = ev.clientY; }
+    if (ev.buttons !== 0) {
+      if (down.has(ev.pointerId)) down.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      return;
+    }
+    // no button down: its release went unseen
+    down.delete(ev.pointerId);
+    for (const g of grabsOf(ev.pointerId)) endGrab(g, 'release', ev);
+  }, true);
+  on('pointerup', (ev) => {
+    down.delete(ev.pointerId);
+    const ending = grabsOf(ev.pointerId);
+    if (ending.length) swallow.add(ev);
+    for (const g of ending) endGrab(g, 'release', ev);
+  }, true);
+  on('pointercancel', (ev) => {
+    down.delete(ev.pointerId);
+    for (const g of grabsOf(ev.pointerId)) endGrab(g, 'cancel', ev);
+  }, true);
+  on('lostpointercapture', (ev) => {
+    const el = ev.target as Element;
+    if (letGo.has(el)) { letGo.delete(el); return; }
+    for (const g of grabsOf(ev.pointerId)) {
+      if (g.ignore === el) g.ignore = undefined;
+      else endGrab(g, 'capture', ev);
+    }
+  }, true);
+  // suppress(): a grab of the pointer pressed last, or of none
+  let suppressing: PointerGrab | null = null;
+  function suppress(on: boolean) {
+    if (!on) {
+      suppressing?.end();
+      suppressing = null;
+    } else if (!suppressing?.active) {
+      suppressing = startGrab(down.has(lastPressed) ? lastPressed : -1);
+    }
   }
   const local = (ev: MouseEvent) => {
     const r = (ev.target as Element).getBoundingClientRect();
@@ -580,10 +787,13 @@ export function createInput(options: InputOptions): Input {
     if (!s) return;
     const [x, y] = local(ev);
     engine.pointerEnter(s.conn, s.surface, x, y);
+    hovered = s.conn;
   });
   on('pointerout', (ev) => {
     const s = locked ? null : target(ev);
-    if (s) engine.pointerLeave(s.conn);
+    if (!s) return;
+    engine.pointerLeave(s.conn);
+    if (hovered === s.conn) hovered = 0;
   });
   // every motion carries its relative part (zwp_relative_pointer_v1):
   // movementX/Y, which goes on under Pointer Lock while clientX/Y freeze
@@ -597,13 +807,15 @@ export function createInput(options: InputOptions): Input {
   on('pointerdown', (ev) => {
     readLocks(ev); // what a focus this press makes tells the app
     if (clipboard && !container.contains(ev.target as Node) && !view.surfaceOf(ev.target)) clipboard.outside();
-    if (ev.altKey) return; // Alt+drag belongs to the window manager
+    // (an Alt+drag taken by the window manager or the embedder is a grab
+    // by now, or stopped before it got here)
     const s = target(ev);
     if (!s) return;
-    // a click anywhere in a window focuses its toplevel; preventDefault keeps
-    // decoration clicks from moving DOM focus off the sink
+    // a click anywhere in a window focuses its toplevel (autoFocus: else the
+    // embedder's call); preventDefault keeps decoration clicks from moving
+    // DOM focus off the sink
     const root = view.surfaceOf(view.canvas(s.conn, s.root));
-    if (root && root.role === ROLE_TOPLEVEL) focus(s.conn, s.root);
+    if (autoFocus && root && root.role === ROLE_TOPLEVEL) focus(s.conn, s.root);
     clipboard?.gesture();
     const btn = BTN[ev.button];
     if (btn !== undefined) engine.pointerButton(s.conn, now(), btn, true);
@@ -626,7 +838,7 @@ export function createInput(options: InputOptions): Input {
     if (captured && ev.pointerId === captured.id) captured = null;
   });
   on('pointerup', (ev) => {
-    const s = target(ev);
+    const s = swallow.has(ev) ? null : target(ev); // (a grab's release is the grab's)
     if (!s) return;
     const btn = BTN[ev.button];
     if (btn !== undefined) engine.pointerButton(s.conn, now(), btn, false);
@@ -686,6 +898,7 @@ export function createInput(options: InputOptions): Input {
         break;
       case 'disconnect':
         textInput.delete(ev.conn);
+        if (hovered === ev.conn) hovered = 0;
         forget((a) => a.conn === ev.conn);
         if (lockWant && lockWant.conn === ev.conn) { lockWant = null; releaseLock(); }
         break;
@@ -709,21 +922,25 @@ export function createInput(options: InputOptions): Input {
 
   return {
     handle,
+    autoFocus,
     focus,
+    blur,
     focused: isActive,
-    // a grab owns the pointer from here: the implicit grab ends, so the
+    // a grab owns the pointer from its start: the implicit grab ends, so the
     // browser tracks what is under the pointer again (its boundary events
-    // land while suppressed; the window manager re-enters at the end)
-    suppress(on) {
-      suppressed = !!on;
-      if (suppressed) release();
-    },
-    // DOM only: the engine is not told (dispose it too, or it keeps routing)
+    // land while grabbed; the grab's end enters the surface under it)
+    grab: startGrab,
+    suppress: (on) => suppress(!!on),
+    // DOM only: the engine is not told (dispose it too, or it keeps routing);
+    // a grab in progress just ends (no onEnd, no enter)
     dispose() {
       for (const [type, fn, opts] of listening.splice(0)) document.removeEventListener(type, fn, opts);
       window.removeEventListener('blur', onWindowBlur);
       pressed.clear();
       forgetBrowserKeys();
+      for (const g of grabs) g.active = false;
+      grabs.clear();
+      down.clear();
       release();
       lockWant = null;
       if (locked) releaseLock();

@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { installFakeDom } from './fake-dom.ts';
 import { createView, watchOutput } from '../lib/view.ts';
 import { createInput } from '../lib/input.ts';
-import { createWindowManager } from '../lib/wm.ts';
+import { createWindowManager, type WindowManagerOptions } from '../lib/wm.ts';
 import { createWland, type ViewWindow, type Wland } from '../lib/client.ts';
 import type { Engine, Link, LinkCallbacks, Role } from '../lib/engine.ts';
 
@@ -841,15 +841,17 @@ test('createWland: the frame loop ticks with rAF timestamps and the display inte
 // --- window states: the view, input and window manager on a recording
 // engine; the states arrive as events, as the core sends them ---------------
 type Ev = Parameters<ReturnType<typeof createView>['handle']>[0];
-function wmRig(dom: ReturnType<typeof installFakeDom>, opts: { browserFullscreen?: boolean; shortcuts?: boolean } = {}) {
+function wmRig(dom: ReturnType<typeof installFakeDom>,
+  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive'> & { autoFocus?: boolean } = {}) {
+  const { autoFocus, ...wmOpts } = opts;
   const container = dom.container();
-  const view = createView({ container, webgl: 'never' });
+  const view = createView({ container, webgl: 'never', focusOnMap: autoFocus !== false });
   const calls: unknown[][] = [];
   const engine = new Proxy({} as Engine, {
     get: (_, name) => (...args: unknown[]) => { calls.push([name, ...args]); },
   });
-  const input = createInput({ engine, view, container });
-  const wm = createWindowManager({ engine, view, input, container, ...opts });
+  const input = createInput({ engine, view, container, autoFocus });
+  const wm = createWindowManager({ engine, view, input, container, ...wmOpts });
   const feed = (ev: Ev) => { view.handle(ev); input.handle(ev); wm.handle(ev); };
   const commit = (conn: number, surface: number, st: { maximized?: boolean; fullscreen?: boolean; minimized?: boolean } = {},
     geometry = { x: 0, y: 0, width: 40, height: 30 }) => feed({
@@ -1313,17 +1315,20 @@ test('wm: a move/resize or drag asked for after the release starts nothing; a gr
     assert.deepEqual(r.calls, [['dragCancel']]);
 
     // Alt+drag ends at the release, or when its capture goes another way
+    // (events at the box, which holds the capture: the document's capture
+    // listeners — input's grab — see them first)
+    const atBox = (type: string, ev: Record<string, unknown>) => { doc.dispatch(type, { target: el, ...ev }); el.dispatch(type, ev); };
     doc.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 2, clientX: 0, clientY: 0 });
     assert.equal(el.captured, 2);
-    el.dispatch('pointermove', { pointerId: 2, clientX: 50, clientY: 40, buttons: 1 });
+    atBox('pointermove', { pointerId: 2, clientX: 50, clientY: 40, buttons: 1 });
     assert.deepEqual([el.style.left, el.style.top], ['50px', '40px']);
     el.captured = null;
-    el.dispatch('lostpointercapture', { pointerId: 2 });
-    el.dispatch('pointermove', { pointerId: 2, clientX: 90, clientY: 90, buttons: 0 });
+    atBox('lostpointercapture', { pointerId: 2 });
+    atBox('pointermove', { pointerId: 2, clientX: 90, clientY: 90, buttons: 0 });
     assert.deepEqual([el.style.left, el.style.top], ['50px', '40px'], 'hovering moves it no more');
     doc.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 3, clientX: 0, clientY: 0 });
-    el.dispatch('pointermove', { pointerId: 3, clientX: 10, clientY: 10, buttons: 0 });
-    el.dispatch('pointermove', { pointerId: 3, clientX: 70, clientY: 70, buttons: 1 });
+    atBox('pointermove', { pointerId: 3, clientX: 10, clientY: 10, buttons: 0 });
+    atBox('pointermove', { pointerId: 3, clientX: 70, clientY: 70, buttons: 1 });
     assert.deepEqual([el.style.left, el.style.top], ['50px', '40px'], 'a move with no button down ends it');
     assert.equal(el.captured, null);
 
@@ -1502,6 +1507,266 @@ test('view: subsurfaces stack by their z (place_above / place_below) — one pla
     commit(9, 2, 7, 1);
     assert.ok(z(7) < z(9) && z(9) < z(5));
     view.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+// --- the embedder's window manager: input grabs, the interactive hook,
+// autoFocus off ---------------------------------------------------------------
+test('input grab: the apps lose the pointer from a held press until its release (not forwarded), a cancel, a lost capture, a move with no button down, the window blur or end(); then the surface under it is entered; a released pointer gets none; suppress() is one', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom);
+    r.commit(1, 5);
+    const canvas = r.view.canvas(1, 5) as any;
+    const doc = dom.document;
+    doc.elementFromPoint = () => canvas; // what surfaceAt hit-tests
+    const ev = (type: string, id: number, x: number, y: number, buttons: number) =>
+      doc.dispatch(type, { target: canvas, button: 0, buttons, pointerId: id, clientX: x, clientY: y });
+    const names = () => r.calls.map((c) => c[0]);
+    const ended: unknown[] = [];
+    const onEnd = (reason: string, e?: { type: string }) => { ended.push(e ? `${reason}:${e.type}` : reason); };
+
+    assert.equal(r.input.grab(4).active, false, 'a pointer not down: over at once');
+
+    // a press on the app (the implicit grab captures), then a grab of it
+    ev('pointerover', 1, 5, 5, 0);
+    ev('pointerdown', 1, 5, 5, 1);
+    assert.equal(canvas.captured, 1);
+    r.calls.length = 0;
+    const g = r.input.grab(1, { onEnd });
+    assert.deepEqual([g.active, g.pointerId, canvas.captured], [true, 1, null], 'the implicit grab let go');
+    assert.deepEqual(r.calls, [['pointerLeave', 1]], 'the app under the pointer lost it');
+    r.calls.length = 0;
+    ev('pointermove', 1, 20, 5, 1);
+    ev('pointermove', 2, 30, 5, 0); // another pointer: held off too
+    doc.dispatch('lostpointercapture', { target: canvas, pointerId: 1 }); // the implicit grab's own
+    assert.deepEqual([r.calls, g.active], [[], true]);
+    ev('pointerup', 1, 25, 6, 0);
+    assert.deepEqual([g.active, ended], [false, ['release:pointerup']]);
+    assert.deepEqual(r.calls, [['pointerEnter', 1, 5, 25, 6]], 'no release reaches the app; the pointer is entered again');
+    g.end();
+    assert.equal(ended.length, 1, 'end() after the end: nothing');
+
+    // the window's blur mid-drag (no pointerup, no pointercancel: touch)
+    ev('pointerdown', 1, 5, 5, 1);
+    const g2 = r.input.grab(1, { onEnd });
+    (globalThis as any).window.dispatch('blur');
+    assert.deepEqual([g2.active, ended.at(-1)], [false, 'blur']);
+    r.calls.length = 0;
+    ev('pointermove', 1, 30, 5, 1);
+    assert.deepEqual(names(), ['pointerMotion'], 'the apps have the pointer again');
+    assert.equal(r.input.grab(1).active, false, 'the blur forgot the press');
+    ev('pointerup', 1, 30, 5, 0);
+    // ... and the next drag grabs again
+    ev('pointerdown', 1, 5, 5, 1);
+    const g3 = r.input.grab(1, { onEnd });
+    assert.equal(g3.active, true);
+    ev('pointercancel', 1, 5, 5, 0);
+    assert.equal(ended.at(-1), 'cancel:pointercancel');
+    // a capture the drag took ends any other way
+    ev('pointerdown', 1, 5, 5, 1);
+    r.input.grab(1, { onEnd });
+    doc.dispatch('lostpointercapture', { target: doc.createElement('div'), pointerId: 1 });
+    assert.equal(ended.at(-1), 'capture:lostpointercapture');
+    // a move with no button down: a release the page didn't see
+    r.input.grab(1, { onEnd });
+    ev('pointermove', 1, 9, 9, 0);
+    assert.equal(ended.at(-1), 'release:pointermove');
+    // end()
+    ev('pointerdown', 1, 5, 5, 1);
+    r.input.grab(1, { onEnd }).end();
+    assert.equal(ended.at(-1), 'end');
+    r.calls.length = 0;
+    ev('pointerup', 1, 5, 5, 0);
+    assert.deepEqual(names(), ['pointerButton'], 'over: the release is the app\'s again');
+
+    // suppress(true): a grab of the press held, ending with it
+    ev('pointerdown', 1, 5, 5, 1);
+    r.input.suppress(true);
+    r.calls.length = 0;
+    ev('pointermove', 1, 6, 6, 1);
+    ev('pointerup', 1, 6, 6, 0);
+    ev('pointermove', 1, 7, 7, 0);
+    assert.deepEqual(names(), ['pointerEnter', 'pointerMotion'], 'held off until the release, entered after it');
+    r.input.suppress(false);
+    // no press held: until suppress(false)
+    r.input.suppress(true);
+    r.calls.length = 0;
+    ev('pointermove', 1, 8, 8, 0);
+    assert.deepEqual(r.calls, []);
+    r.input.suppress(false);
+    ev('pointermove', 1, 9, 9, 0);
+    assert.deepEqual(names(), ['pointerEnter', 'pointerMotion']);
+    r.dispose();
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('wm interactive: the embedder takes an app\'s move/resize, handed the press it came from (no grab here; one after the release is dropped first), and Alt+drag as an \'alt-drag\'; false keeps the default grab; shortcuts { drag: false } hands an Alt+press to the app and keeps the keys, false the reverse', async () => {
+  const dom = installFakeDom();
+  try {
+    const asked: unknown[][] = [];
+    let take = true;
+    const r = wmRig(dom, { interactive: (ev, press) => { asked.push([ev, press]); return take; } });
+    r.commit(1, 5);
+    const canvas = r.view.canvas(1, 5) as any;
+    const el = r.el(1, 5);
+    const doc = dom.document;
+    const ev = (type: string, id: number, x: number, y: number, buttons: number, more: Record<string, unknown> = {}) =>
+      doc.dispatch(type, { target: canvas, button: 0, buttons, pointerId: id, clientX: x, clientY: y, pointerType: 'mouse', ...more });
+    const names = () => r.calls.map((c) => c[0]);
+    const left = el.style.left;
+
+    ev('pointerdown', 7, 10, 12, 1, { pointerType: 'touch' });
+    r.calls.length = 0;
+    r.feed({ type: 'move', conn: 1, surface: 5 });
+    assert.deepEqual(asked, [[{ type: 'move', conn: 1, surface: 5 },
+      { pointerId: 7, pointerType: 'touch', clientX: 10, clientY: 12, button: 0, buttons: 1 }]]);
+    assert.deepEqual(r.calls, [], 'no leave: no grab of its own');
+    ev('pointermove', 7, 60, 12, 1);
+    assert.equal(el.style.left, left, 'the window is the embedder\'s to move');
+    assert.deepEqual(names(), ['pointerMotion'], 'the app keeps the pointer (the embedder did not grab)');
+    ev('pointerup', 7, 60, 12, 0);
+    asked.length = 0;
+    r.feed({ type: 'resize', conn: 1, surface: 5, edges: 8 });
+    assert.deepEqual(asked, [], 'after the release: never asked');
+    ev('pointerdown', 1, 10, 10, 1);
+    r.feed({ type: 'resize', conn: 1, surface: 5, edges: 8 });
+    assert.deepEqual(asked.map((a) => a[0]), [{ type: 'resize', conn: 1, surface: 5, edges: 8 }]);
+    ev('pointerup', 1, 10, 10, 0);
+
+    // declined: the default grab
+    take = false;
+    ev('pointerdown', 1, 10, 10, 1);
+    r.feed({ type: 'move', conn: 1, surface: 5 });
+    ev('pointermove', 1, 30, 10, 1);
+    assert.equal(el.style.left, '20px', 'moved by the wm (from offsetLeft, 0 here)');
+    ev('pointerup', 1, 30, 10, 0);
+
+    // Alt+press: an 'alt-drag', its press with it; taken, no Alt+drag here
+    take = true;
+    asked.length = 0;
+    ev('pointerdown', 2, 5, 5, 1, { altKey: true });
+    assert.deepEqual(asked, [[{ type: 'alt-drag', conn: 1, surface: 5 },
+      { pointerId: 2, pointerType: 'mouse', clientX: 5, clientY: 5, button: 0, buttons: 1 }]]);
+    assert.equal(el.captured, null, 'the box took no capture');
+    ev('pointerup', 2, 5, 5, 0);
+    r.dispose();
+
+    // { drag: false }: an Alt+press is the app's (the button goes to it); Alt+F10 still works
+    const off = wmRig(dom, { shortcuts: { drag: false } });
+    off.commit(1, 5);
+    const offCanvas = off.view.canvas(1, 5) as any;
+    off.calls.length = 0;
+    doc.dispatch('pointerdown', { target: offCanvas, altKey: true, button: 0, buttons: 1, pointerId: 1, clientX: 5, clientY: 5 });
+    assert.ok(off.calls.some((c) => c[0] === 'pointerButton'), 'forwarded');
+    assert.deepEqual([off.el(1, 5).captured, offCanvas.captured], [null, 1], 'no Alt+drag: the implicit grab');
+    doc.dispatch('pointerup', { target: offCanvas, button: 0, buttons: 0, pointerId: 1, clientX: 5, clientY: 5 });
+    off.calls.length = 0;
+    assert.equal(off.key('F10'), true);
+    assert.deepEqual(off.calls, [['setMaximized', 1, 5, true]]);
+    off.dispose();
+    // false: the keys off, Alt+drag on
+    const keys = wmRig(dom, { shortcuts: false });
+    keys.commit(1, 5);
+    doc.dispatch('pointerdown', { target: keys.view.canvas(1, 5), altKey: true, button: 0, buttons: 1, pointerId: 1, clientX: 5, clientY: 5 });
+    assert.equal(keys.el(1, 5).captured, 1, 'Alt+drag');
+    assert.equal(keys.key('F10'), false);
+    keys.dispose();
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('input autoFocus false: focus only when told — none at map or press, none passed on when the focused window goes or is minimized, the wm focuses nothing it restores or makes fullscreen; focus() gives it, blur() takes it; a canvas taking the page\'s focus moves none', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom, { autoFocus: false });
+    const doc = dom.document;
+    r.commit(1, 5);
+    r.commit(2, 5);
+    r.commit(3, 5);
+    assert.equal(r.input.autoFocus, false);
+    assert.deepEqual(r.calls.filter((c) => c[0] === 'keyboardEnter'), [], 'a new window takes nothing');
+    assert.equal(doc.activeElement, doc.body);
+    const sink = r.container.children.find((c: any) => c.contentEditable === 'true');
+    const press = (conn: number) => {
+      const canvas = r.view.canvas(conn, 5);
+      doc.dispatch('pointerdown', { target: canvas, button: 0, buttons: 1, pointerId: 1, clientX: 1, clientY: 1 });
+      doc.dispatch('pointerup', { target: canvas, button: 0, buttons: 0, pointerId: 1, clientX: 1, clientY: 1 });
+    };
+    r.calls.length = 0;
+    press(1);
+    assert.deepEqual(r.calls.map((c) => c[0]), ['pointerButton', 'pointerButton'], 'a press is forwarded, focusing nothing');
+
+    r.input.focus(1, 5);
+    assert.deepEqual(r.calls.slice(2), [['keyboardEnter', 1, 5]]);
+    assert.equal(doc.activeElement, sink);
+    r.calls.length = 0;
+    r.feed({ type: 'destroy', conn: 1, surface: 5 });
+    assert.deepEqual(r.calls, [], 'closed: nobody gets it');
+    assert.ok(!r.input.focused(2, 5) && !r.input.focused(3, 5));
+
+    r.input.focus(2, 5);
+    r.calls.length = 0;
+    r.feed({ type: 'minimize', conn: 2, surface: 5, minimized: true });
+    assert.deepEqual(r.calls, [['keyboardLeave', 2]], 'minimized: its leave, nobody else');
+    r.calls.length = 0;
+    r.feed({ type: 'minimize', conn: 2, surface: 5, minimized: false });
+    r.feed({ type: 'fullscreen', conn: 3, surface: 5, fullscreen: true });
+    assert.deepEqual(r.calls, [], 'restored, made fullscreen: raised, not focused');
+    assert.ok(r.z(3, 5) > r.z(2, 5));
+
+    // a canvas taking the page's focus (Tab): the sink takes it back while
+    // a window has the keyboard, which stays where it was
+    r.input.focus(2, 5);
+    r.calls.length = 0;
+    (r.view.canvas(3, 5) as any).focus();
+    assert.equal(doc.activeElement, sink);
+    assert.ok(r.input.focused(2, 5));
+    assert.deepEqual(r.calls, []);
+
+    r.input.blur();
+    assert.deepEqual(r.calls, [['keyboardLeave', 2]]);
+    assert.equal(doc.activeElement, doc.body, 'the sink let go of the page\'s focus');
+    assert.ok(!r.input.focused(2, 5));
+    r.calls.length = 0;
+    r.input.blur();
+    assert.deepEqual(r.calls, []);
+    r.dispose();
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('createWland: interactive, shortcuts and autoFocus are passed on', async () => {
+  const dom = installFakeDom();
+  try {
+    const link = scriptedLink();
+    const asked: unknown[] = [];
+    const wl: Wland = await createWland({ container: dom.container(), wasm, link, webgl: 'never', scale: 1,
+      autoFocus: false, shortcuts: { drag: false }, interactive: (ev) => { asked.push(ev.type); return true; } });
+    link.cb!.onOpen();
+    const feed = (ev: Ev) => { wl.view.handle(ev); wl.input.handle(ev); wl.wm.handle(ev); };
+    feed({
+      type: 'commit', conn: 1, surface: 5, role: 1, root: 5, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 1, height: 1 },
+      width: 1, height: 1, logicalWidth: 1, logicalHeight: 1, format: 'rgba', stride: 0,
+      damage: new Int32Array([0, 0, 1, 1]), pixels: new Uint8Array(4),
+    });
+    assert.equal(wl.input.autoFocus, false);
+    assert.deepEqual(wl.windows().map((w) => w.focused), [false], 'not focused at map');
+    const canvas = wl.view.canvas(1, 5);
+    dom.document.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 1, clientX: 0, clientY: 0 });
+    feed({ type: 'move', conn: 1, surface: 5 });
+    assert.deepEqual(asked, ['move'], 'no alt-drag (drag off); the move asked');
+    wl.dispose();
   } finally {
     dom.uninstall();
   }

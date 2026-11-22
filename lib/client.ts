@@ -14,6 +14,7 @@ import { createEngine, createWsLink, type Engine, type Event, type GpuSource, ty
 import { createView, watchOutput, type OutputControl, type OutputWatch, type View, type ViewWindow } from './view.ts';
 import { createInput, type Input } from './input.ts';
 import { createWindowManager, type WindowManager } from './wm.ts';
+import type { InteractiveEvent, PointerPress } from './wm.ts';
 import { createClipboardBridge, type ClipboardBridge } from './clipboard.ts';
 import { reconnecting } from './link-ws.ts';
 
@@ -70,9 +71,25 @@ export interface WlandOptions {
    *  fullscreen (WindowManagerOptions.browserFullscreen). Default false:
    *  fullscreen windows fill the container. */
   browserFullscreen?: boolean;
-  /** The window manager's Alt+F9/F10/F11 bindings (minimize, maximize,
-   *  fullscreen). Default true. */
-  shortcuts?: boolean;
+  /** The window manager's bindings (WindowManagerOptions.shortcuts): true
+   *  or false is the Alt+F9/F10/F11 keys (minimize, maximize, fullscreen)
+   *  alone; `{ keys, drag }` sets the keys and Alt+drag apart. Default
+   *  true (both on). */
+  shortcuts?: boolean | { keys?: boolean; drag?: boolean };
+  /** Your window manager takes interactive move and resize: an app's
+   *  xdg_toplevel.move / .resize and the Alt+drag binding, each with the
+   *  pointer press it came from (WindowManagerOptions.interactive). Return
+   *  true when you handle it; then take the pointer for your drag with
+   *  `wl.input.grab(press.pointerId)`. */
+  interactive?(ev: InteractiveEvent, press: PointerPress): boolean;
+  /** Who decides keyboard focus (InputOptions.autoFocus). Default true,
+   *  wland: a press or a new window focuses it, and focus passes to the
+   *  topmost window left when the focused one goes. False: yours — only
+   *  `wl.input.focus(conn, surface)` gives it and `wl.input.blur()` takes
+   *  it (a window entry's raise() focuses too); a press is forwarded
+   *  without focusing, a new window takes nothing (ViewOptions.focusOnMap
+   *  off), and the window manager focuses nothing it restores. */
+  autoFocus?: boolean;
   /** Bridge the Wayland clipboard and the page's clipboard (plain text,
    *  both ways; lib/clipboard.ts): an app's copy made while the desktop has
    *  focus reaches the page clipboard when the browser allows a write (a
@@ -200,7 +217,8 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
   };
   const log = (line: string) => each(onEvent, { type: 'log', line });
 
-  const view = createView({ container, webgl: options.webgl, log, onWindowsChange, mount: options.mount, unmount: options.unmount });
+  const view = createView({ container, webgl: options.webgl, log, onWindowsChange, mount: options.mount, unmount: options.unmount,
+    focusOnMap: options.autoFocus !== false });
   // set before the link starts: events only flow after engine.start()
   let engine: Engine | undefined, input: Input | undefined, wm: WindowManager | undefined;
   let clip: ClipboardBridge | null = null;
@@ -251,9 +269,10 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       },
     });
     if (options.clipboard !== false) clip = createClipboardBridge({ engine, container, log });
-    input = createInput({ engine, view, container, onFocusChange: options.onFocusChange || onWindowsChange, clipboard: clip?.hooks });
+    input = createInput({ engine, view, container, onFocusChange: options.onFocusChange || onWindowsChange, clipboard: clip?.hooks,
+      autoFocus: options.autoFocus });
     wm = createWindowManager({ engine, view, input, container, log,
-      browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts });
+      browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts, interactive: options.interactive });
     output = watchOutput(engine, container, scale);
   } catch (e) {
     teardown();
