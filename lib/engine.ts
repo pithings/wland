@@ -70,8 +70,15 @@ export type { ByteStream, StreamSource } from './link-stream.ts';
 // window for that reason.)
 
 /** Surface role: 0 none (unmapped), 1 toplevel, 2 subsurface, 3 cursor
- *  image, 4 popup, 5 dnd icon. */
+ *  image, 4 popup, 5 dnd icon (the ROLE_* constants). */
 export type Role = 0 | 1 | 2 | 3 | 4 | 5;
+/** Role values (SurfaceEvent.role, CommitEvent.role). */
+export const ROLE_NONE = 0;
+export const ROLE_TOPLEVEL = 1;
+export const ROLE_SUBSURFACE = 2;
+export const ROLE_CURSOR = 3;
+export const ROLE_POPUP = 4;
+export const ROLE_DND_ICON = 5;
 
 /** The transport to the relay. `createWsLink` is the WebSocket one. */
 export interface Link {
@@ -831,7 +838,6 @@ const CURSORS = [
 ];
 
 const SURFACE_DESTROYED = 0xffffffff;
-const ROLE_SUBSURFACE = 2, ROLE_POPUP = 4;
 const BACKPRESSURE_BYTES = 256 * 1024;
 
 // STREAM.md frame types the engine handles itself (the rest go to the core)

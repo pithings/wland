@@ -5,7 +5,7 @@
 // (that is where the backpressure signal lives). The types below are the
 // contract.
 
-import type { Engine, Event as WlandEvent } from './engine.ts';
+import { ROLE_POPUP, ROLE_TOPLEVEL, type Engine, type Event as WlandEvent } from './engine.ts';
 import type { View } from './view.ts';
 
 export interface InputOptions {
@@ -148,7 +148,6 @@ function browserLocks(ev: Pick<KeyboardEvent, 'getModifierState' | 'shiftKey'> &
   }
   return { capsLock: ev.getModifierState('CapsLock'), numLock };
 }
-const ROLE_TOPLEVEL = 1, ROLE_POPUP = 4;
 /** How long a paste chord's keys wait for the browser's paste event. */
 const PASTE_WAIT_MS = 300;
 const KEY_CTRL = 29, KEY_META_LEFT = 125, KEY_META_RIGHT = 126;

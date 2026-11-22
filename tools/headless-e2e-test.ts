@@ -82,7 +82,9 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { GpuRef } from '../lib/engine.ts';
-import { createHeadless, NO_SELECTION_BRIDGE, type Headless, type HeadlessWindow, type RgbaImage } from '../lib/headless.ts';
+import {
+  createHeadless, NO_SELECTION_BRIDGE, ROLE_POPUP, ROLE_SUBSURFACE, type Headless, type HeadlessWindow, type RgbaImage,
+} from '../lib/headless.ts';
 import { xDisplayOf } from '../lib/index.ts';
 import { app, appHome, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
 import { parsePresentationShm, presentationChecks } from '../test/support/presentation-shm.ts';
@@ -101,7 +103,6 @@ const env: NodeJS.ProcessEnv = {
 };
 delete env.DISPLAY; // nothing here may fall back to X11
 
-const ROLE_SUBSURFACE = 2, ROLE_POPUP = 4;
 const procs = new Set<ChildProcess>();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

@@ -35,7 +35,7 @@
 //
 // The types below are the contract.
 
-import type { Engine, Event as WlandEvent } from './engine.ts';
+import { ROLE_DND_ICON, ROLE_POPUP, ROLE_TOPLEVEL, type Engine, type Event as WlandEvent } from './engine.ts';
 import type { Input } from './input.ts';
 import type { View, ViewWindow } from './view.ts';
 
@@ -75,7 +75,6 @@ export interface WindowManager {
   dispose(): void;
 }
 
-const ROLE_TOPLEVEL = 1, ROLE_POPUP = 4, ROLE_DND_ICON = 5;
 const EDGE_CURSORS: Record<number, string | undefined> = { 1: 'n-resize', 2: 's-resize', 4: 'w-resize', 8: 'e-resize',
                        5: 'nw-resize', 9: 'ne-resize', 6: 'sw-resize', 10: 'se-resize' };
 

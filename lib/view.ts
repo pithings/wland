@@ -46,7 +46,10 @@
 // `mount`/`unmount` to host each one in your own window frame. The types
 // below are the contract.
 
-import { stackOrder, type CommitEvent, type Engine, type Event, type Role } from './engine.ts';
+import {
+  ROLE_CURSOR, ROLE_DND_ICON, ROLE_NONE, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL, stackOrder,
+  type CommitEvent, type Engine, type Event, type Role,
+} from './engine.ts';
 import { make2DPresenter, makeGLPresenter, probeWebGL, type Pixels, type Presenter } from './present.ts';
 
 export interface ViewWindow {
@@ -131,8 +134,6 @@ export interface View {
    *  element; pointerlockchange) and put back the container styles it set. */
   dispose(): void;
 }
-
-const ROLE_NONE = 0, ROLE_TOPLEVEL = 1, ROLE_SUBSURFACE = 2, ROLE_CURSOR = 3, ROLE_POPUP = 4, ROLE_DND_ICON = 5;
 
 const keyOf = (conn: number, surface: number) => `c${conn}s${surface}`;
 

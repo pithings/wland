@@ -11,7 +11,7 @@
 // The types below are the contract.
 
 import { createEngine, createWsLink, type Engine, type Event, type GpuSource, type HandleSource, type Link } from './engine.ts';
-import { createView, watchOutput, type OutputControl, type OutputWatch, type View } from './view.ts';
+import { createView, watchOutput, type OutputControl, type OutputWatch, type View, type ViewWindow } from './view.ts';
 import { createInput, type Input } from './input.ts';
 import { createWindowManager, type WindowManager } from './wm.ts';
 import { createClipboardBridge, type ClipboardBridge } from './clipboard.ts';
@@ -84,9 +84,25 @@ export interface WlandOptions {
    *  throws (this one included) is reported asynchronously and does not keep
    *  the others from the event. */
   onEvent?(event: Event): void;
-  /** The window list (windows()) changed: windows, titles, roles, focus,
-   *  window states (maximized, fullscreen, minimized). */
+  /** The window list (windows()) changed: windows, titles, roles, window
+   *  states (maximized, fullscreen, minimized) — and keyboard focus, unless
+   *  `onFocusChange` is given. */
   onWindowsChange?(): void;
+  /** Keyboard focus moved to another window, or to none (InputOptions.
+   *  onFocusChange). Default: onWindowsChange. */
+  onFocusChange?(): void;
+  /** Host each window's element in your own window frame
+   *  (ViewOptions.mount): put `win.element` in the page. Default: cascaded
+   *  inside `container`, stacked on top, raised on pointerdown. With your
+   *  own, initial placement, stacking and raising are yours. The window
+   *  manager still runs as with the default (popups, dnd, the bindings) and
+   *  still positions the element itself for an app's move/resize grab and
+   *  for maximize/fullscreen (left/top 0): inside your frame, that is
+   *  relative to wherever you put the element. */
+  mount?(win: ViewWindow): void;
+  /** Take a window's element out of your frame (ViewOptions.unmount).
+   *  Default: element.remove(). */
+  unmount?(win: ViewWindow): void;
 }
 
 /** A row of a taskbar / window list. Minimized windows are listed too
@@ -130,8 +146,11 @@ export interface Wland {
 /** The display's frame interval (ms) from successive rAF timestamps: the
  *  median of the last 15 deltas, so dropped frames and a hidden tab's gap
  *  don't move it; 0 until 5 are known. rAF follows the display's refresh
- *  (timestamps are frame starts), which a page has no other way to learn. */
-function frameInterval(): (time: number) => number {
+ *  (timestamps are frame starts), which a page has no other way to learn.
+ *  For an embedder composing the parts itself, as createWland's frame loop
+ *  does: `const interval = frameInterval();` then, per rAF,
+ *  `engine.tick(t, interval(t))`. Each call makes an independent estimator. */
+export function frameInterval(): (time: number) => number {
   const deltas: number[] = [];
   let last = -1, estimate = 0;
   return (time) => {
@@ -167,7 +186,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
   };
   const log = (line: string) => each(onEvent, { type: 'log', line });
 
-  const view = createView({ container, webgl: options.webgl, log, onWindowsChange });
+  const view = createView({ container, webgl: options.webgl, log, onWindowsChange, mount: options.mount, unmount: options.unmount });
   // set before the link starts: events only flow after engine.start()
   let engine: Engine | undefined, input: Input | undefined, wm: WindowManager | undefined;
   let clip: ClipboardBridge | null = null;
@@ -217,7 +236,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       },
     });
     if (options.clipboard !== false) clip = createClipboardBridge({ engine, container, log });
-    input = createInput({ engine, view, container, onFocusChange: onWindowsChange, clipboard: clip?.hooks });
+    input = createInput({ engine, view, container, onFocusChange: options.onFocusChange || onWindowsChange, clipboard: clip?.hooks });
     wm = createWindowManager({ engine, view, input, container, log,
       browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts });
     output = watchOutput(engine, container, scale);

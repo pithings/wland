@@ -26,13 +26,17 @@
 
 import {
   createEngine, createStreamLink, createWsLink, inRegion, readSelectionText, setSelectionText, stackOrder,
+  ROLE_DND_ICON, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
   type CommitEvent, type Engine, type Event, type GpuRef, type GpuSource, type HandleSource, type Link, type Role,
   type StreamSource,
 } from './engine.ts';
 import { swizzleRect } from './present.ts';
 
 export type * from './engine.ts';
-export { NO_SELECTION_BRIDGE, readSelectionText, setSelectionText, TEXT_MIMES } from './engine.ts';
+export {
+  NO_SELECTION_BRIDGE, readSelectionText, setSelectionText, TEXT_MIMES,
+  ROLE_CURSOR, ROLE_DND_ICON, ROLE_NONE, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
+} from './engine.ts';
 
 export interface HeadlessOptions {
   /** The relay: a Link, a WebSocket URL (`ws://host:port/ws` →
@@ -340,7 +344,6 @@ export interface Headless {
   dispose(): void;
 }
 
-const ROLE_TOPLEVEL = 1, ROLE_SUBSURFACE = 2, ROLE_POPUP = 4, ROLE_DND_ICON = 5;
 const KEY_ESC = 1, KEY_SHIFT = 42;
 const KEY_ALT = new Set([56, 100]), KEY_OTHER_MODS = new Set([29, 97, 42, 54, 125, 126]); // ctrl, shift, meta
 const KEY_F9 = 67, KEY_F10 = 68, KEY_F11 = 87;
