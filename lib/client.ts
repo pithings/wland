@@ -50,6 +50,12 @@ export interface WlandOptions {
    *  release(image) and ACKs. Without it, apps on `wlandr --dmabuf virtgpu`
    *  are offered no linux-dmabuf and render in software (wl_shm). */
   gpu?: GpuSource<CanvasImageSource>;
+  /** Who draws window frames for apps that let the compositor choose
+   *  (EngineOptions.decorations): 'client' (default) or 'server' — for an
+   *  embedder whose `mount` draws a frame around windows marked `decorated`
+   *  (ViewWindow / WindowEntry); without one they stay frameless (wland
+   *  draws none). */
+  decorations?: 'client' | 'server';
   /** Default: wland.wasm next to the engine module. */
   wasm?: string | URL | BufferSource | WebAssembly.Module;
   /** Pin the scale apps render at: a device pixel ratio, integer or
@@ -85,8 +91,8 @@ export interface WlandOptions {
    *  the others from the event. */
   onEvent?(event: Event): void;
   /** The window list (windows()) changed: windows, titles, app ids, size
-   *  hints, roles, window states (maximized, fullscreen, minimized) — and
-   *  keyboard focus, unless `onFocusChange` is given. */
+   *  hints, decorations, roles, window states (maximized, fullscreen,
+   *  minimized) — and keyboard focus, unless `onFocusChange` is given. */
   onWindowsChange?(): void;
   /** Keyboard focus moved to another window, or to none (InputOptions.
    *  onFocusChange). Default: onWindowsChange. */
@@ -112,6 +118,9 @@ export interface WindowEntry {
   title: string;
   /** xdg_toplevel.set_app_id ('' until the app sets one). */
   appId: string;
+  /** The embedder is expected to draw this window's frame (decorations
+   *  'server': ViewWindow.decorated). */
+  decorated: boolean;
   focused: boolean;
   maximized: boolean;
   fullscreen: boolean;
@@ -223,6 +232,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       link: options.link || defaultLink(),
       buffers: options.buffers,
       gpu: options.gpu,
+      decorations: options.decorations,
       // a 2D-only view takes buffer-source commits swizzled by the core; a GL
       // view takes the rows as written (its shader swaps channels)
       rgba: !view.webgl,
@@ -273,6 +283,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       key: w.key,
       title: w.title,
       appId: w.appId,
+      decorated: w.decorated,
       focused: inp.focused(w.conn, w.surface),
       maximized: w.maximized,
       fullscreen: w.fullscreen,

@@ -1207,6 +1207,43 @@ test('createWland: mount / unmount and onFocusChange are passed on; app id and s
   }
 });
 
+test('createWland: `decorated` is on the window mount gets when the decoration event came first, on windows(), and a change after the mount is announced through onWindowsChange', async () => {
+  const dom = installFakeDom();
+  try {
+    const link = scriptedLink();
+    const mounted: ViewWindow[] = [];
+    let windowsChanges = 0;
+    const wl: Wland = await createWland({
+      container: dom.container(), wasm, link, webgl: 'never', scale: 1, decorations: 'server',
+      mount: (win) => { mounted.push(win); dom.container().appendChild(win.element); },
+      onWindowsChange: () => { windowsChanges++; },
+    });
+    link.cb!.onOpen();
+    const feed = (ev: Ev) => { wl.view.handle(ev); wl.input.handle(ev); wl.wm.handle(ev); };
+    const commit = (surface: number): Ev => ({
+      type: 'commit', conn: 1, surface, role: 1, root: surface, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 1, height: 1 },
+      width: 1, height: 1, logicalWidth: 1, logicalHeight: 1, format: 'rgba', stride: 0,
+      damage: new Int32Array([0, 0, 1, 1]), pixels: new Uint8Array(4),
+    });
+    // the core tells it at the initial configure, before the first buffer
+    feed({ type: 'decoration', conn: 1, surface: 5, decorated: true });
+    feed(commit(5));
+    feed(commit(6)); // never asked: client-side
+    assert.deepEqual(mounted.map((w) => [w.key, w.decorated]), [['c1s5', true], ['c1s6', false]]);
+    assert.deepEqual(wl.windows().map((w) => [w.key, w.decorated]), [['c1s5', true], ['c1s6', false]]);
+    const before = windowsChanges;
+    feed({ type: 'decoration', conn: 1, surface: 5, decorated: false });
+    assert.ok(windowsChanges > before);
+    assert.equal(wl.view.window(1, 5)!.decorated, false);
+    assert.equal(wl.windows().find((w) => w.key === 'c1s5')!.decorated, false);
+    wl.dispose();
+    await new Promise((r) => setTimeout(r, 0)); // the IME sink's blur check (a microtask) runs on the fake DOM
+  } finally {
+    dom.uninstall();
+  }
+});
+
 test('wm: a move/resize or drag asked for after the release starts nothing; a grab ends at a release it never saw (a move with no button down), a pointercancel or the window blur; Alt+drag ends with its capture', async () => {
   const dom = installFakeDom();
   try {

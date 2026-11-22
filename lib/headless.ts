@@ -55,6 +55,10 @@ export interface HeadlessOptions {
    *  offered no linux-dmabuf (they render in software over wl_shm); either
    *  way HeadlessSurface.gpu names the buffer. */
   gpu?: GpuSource<RgbaImage>;
+  /** EngineOptions.decorations: 'client' (default) or 'server' (toplevels
+   *  that ask through xdg-decoration are configured server_side and their
+   *  HeadlessWindow says `decorated`; the scene draws no frame either way). */
+  decorations?: 'client' | 'server';
   /** EngineOptions.wasm (default: wland.wasm next to the engine module). */
   wasm?: string | URL | BufferSource | WebAssembly.Module;
   /** Output size in logical px (what maximize and fullscreen fill).
@@ -90,7 +94,7 @@ export interface HeadlessOptions {
    *  readable here. A throwing consumer is reported asynchronously. */
   onEvent?(event: Event): void;
   /** The window list changed: windows, titles, app ids, size hints,
-   *  roles, focus, stacking. */
+   *  decorations, roles, focus, stacking. */
   onWindowsChange?(): void;
 }
 
@@ -135,6 +139,9 @@ export interface HeadlessWindow {
   title: string;
   /** xdg_toplevel.set_app_id ('' until the app sets one). */
   appId: string;
+  /** Configured server_side (decorations 'server', DecorationEvent): the
+   *  app draws no frame of its own; the box is its content. */
+  decorated: boolean;
   /** The app's size hints (SizeLimitsEvent), window geometry px; 0 = no
    *  limit in that dimension. resize() is clamped to them. */
   minW: number;
@@ -454,6 +461,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   const titles = new Map<string, string>();
   const appIds = new Map<string, string>();
   const limits = new Map<string, { minW: number; minH: number; maxW: number; maxH: number }>(); // toplevel key → size hints
+  const decorated = new Set<string>(); // toplevel keys configured server_side
   const popups = new Map<string, { conn: number; surface: number }>(); // mapped popups (wm.ts)
   const textInput = new Set<number>(); // conns with text-input enabled
   const regions = new Map<string, Int32Array>(); // surface key → input region (absent: the whole surface)
@@ -628,7 +636,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   function dropConn(conn: number) {
     for (const [key, s] of surfaces) if (s.conn === conn) surfaces.delete(key);
     for (const key of wins.keys()) if (wins.get(key)!.conn === conn) wins.delete(key);
-    for (const map of [titles, appIds, limits]) for (const key of map.keys()) if (key.startsWith(`c${conn}s`)) map.delete(key);
+    for (const map of [titles, appIds, limits, decorated]) for (const key of map.keys()) if (key.startsWith(`c${conn}s`)) map.delete(key);
     for (const [key, p] of popups) if (p.conn === conn) popups.delete(key);
     for (const key of regions.keys()) if (key.startsWith(`c${conn}s`)) regions.delete(key);
     textInput.delete(conn);
@@ -677,6 +685,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         titles.delete(key);
         appIds.delete(key);
         limits.delete(key);
+        decorated.delete(key);
         popups.delete(key);
         regions.delete(key);
         forget((c, s) => c === ev.conn && s === ev.surface);
@@ -721,6 +730,11 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         changed();
         break;
       }
+      case 'decoration':
+        if (ev.decorated) decorated.add(keyOf(ev.conn, ev.surface));
+        else decorated.delete(keyOf(ev.conn, ev.surface));
+        changed();
+        break;
       case 'text-input':
         if (ev.active) textInput.add(ev.conn); else textInput.delete(ev.conn);
         break;
@@ -1139,6 +1153,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     link: toLink(options.link),
     buffers: options.buffers,
     gpu: options.gpu,
+    decorations: options.decorations,
     onEvent(ev) {
       // the scene first: it copies a commit's pixels, which may die at the
       // first engine call; the embedder next, while they are still valid;
@@ -1160,7 +1175,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     const o = originOfWin(win);
     return {
       key: win.key, conn: win.conn, surface: win.surface, title: titles.get(win.key) ?? win.key,
-      appId: appIds.get(win.key) ?? '', minW: 0, minH: 0, maxW: 0, maxH: 0, ...limits.get(win.key),
+      appId: appIds.get(win.key) ?? '', decorated: decorated.has(win.key), minW: 0, minH: 0, maxW: 0, maxH: 0, ...limits.get(win.key),
       x: win.x, y: win.y,
       width: win.fullscreen ? output.width : win.gw || root.logicalWidth,
       height: win.fullscreen ? output.height : win.gh || root.logicalHeight,
@@ -1322,6 +1337,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       titles.clear();
       appIds.clear();
       limits.clear();
+      decorated.clear();
       popups.clear();
       regions.clear();
       active = hover = pressed = grab = dnd = lock = null;

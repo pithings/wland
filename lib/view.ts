@@ -70,6 +70,13 @@ export interface ViewWindow {
   title: string;
   /** xdg_toplevel.set_app_id ('' until the app sets one). */
   appId: string;
+  /** The embedder is expected to draw this window's frame: the app was
+   *  configured server_side (EngineOptions.decorations 'server',
+   *  DecorationEvent) and draws none; its element is its content. Known by
+   *  `mount` when the app asked before its first commit (the usual case);
+   *  a later change (the app asks for client_side, drops its decoration
+   *  object) is announced through onWindowsChange. */
+  decorated: boolean;
   /** The app's size hints (SizeLimitsEvent: xdg_toplevel.set_min_size /
    *  set_max_size as of its last commit), window geometry px; 0 = no limit
    *  in that dimension. */
@@ -95,7 +102,7 @@ export interface ViewOptions {
   /** Take a window's element out of the page. Default: element.remove(). */
   unmount?(win: ViewWindow): void;
   /** Window list changed: a window came or went, its title, app id, size
-   *  hints, role or states changed. */
+   *  hints, decoration, role or states changed. */
   onWindowsChange?(): void;
   /** WebGL present for toplevels: 'auto' (only on hardware-accelerated
    *  WebGL), 'always', or 'never'. Default 'auto'. */
@@ -148,8 +155,8 @@ export interface View {
 
 const keyOf = (conn: number, surface: number) => `c${conn}s${surface}`;
 
-/** A window element per toplevel (title, app id and size hints live in
- *  `titles`, `appIds`, `limits`: they can precede it). `origin` is the
+/** A window element per toplevel (title, app id, size hints and decoration
+ *  live in `titles`, `appIds`, `limits`, `decorated`: they can precede it). `origin` is the
  *  toplevel surface's origin inside it: the canvases' parent, offset by the
  *  window geometry's position. `g` is the last box laid out (the geometry,
  *  or the toplevel's size while none is known; w 0 = nothing yet). */
@@ -215,6 +222,7 @@ export function createView(options: ViewOptions): View {
   const titles = new Map<string, string>(); // toplevel key → title (titles can precede the window)
   const appIds = new Map<string, string>(); // toplevel key → app id (likewise)
   const limits = new Map<string, { minW: number; minH: number; maxW: number; maxH: number }>(); // toplevel key → size hints
+  const decorated = new Set<string>(); // toplevel keys configured server_side (likewise)
   const cursors = new Map<number, Cursor>(); // conn → its pointer image
   const imageSet = imageSetFn();
   let overlay: { s: Surface; hx: number; hy: number } | null = null; // the cursor canvas following the pointer
@@ -341,6 +349,7 @@ export function createView(options: ViewOptions): View {
     titles.delete(key);
     appIds.delete(key);
     limits.delete(key);
+    decorated.delete(key);
   }
 
   // dnd icons live in the container itself (no window), fixed, input-inert;
@@ -717,7 +726,7 @@ export function createView(options: ViewOptions): View {
         cursors.delete(ev.conn);
         for (const s of surfaces.values()) if (s.conn === ev.conn) dropSurface(s);
         for (const win of windows.values()) if (win.conn === ev.conn) dropWindow(win.key);
-        for (const map of [titles, appIds, limits]) for (const key of map.keys()) if (key.startsWith(`c${ev.conn}s`)) map.delete(key);
+        for (const map of [titles, appIds, limits, decorated]) for (const key of map.keys()) if (key.startsWith(`c${ev.conn}s`)) map.delete(key);
         onWindowsChange();
         break;
       }
@@ -736,6 +745,11 @@ export function createView(options: ViewOptions): View {
         onWindowsChange();
         break;
       }
+      case 'decoration':
+        if (ev.decorated) decorated.add(keyOf(ev.conn, ev.surface));
+        else decorated.delete(keyOf(ev.conn, ev.surface));
+        onWindowsChange();
+        break;
       case 'maximize':
       case 'fullscreen':
       case 'minimize': {
@@ -770,6 +784,7 @@ export function createView(options: ViewOptions): View {
     key: win.key, conn: win.conn, surface: win.surface, element: win.element,
     title: titles.get(win.key) || win.key,
     appId: appIds.get(win.key) ?? '',
+    decorated: decorated.has(win.key),
     minW: 0, minH: 0, maxW: 0, maxH: 0, ...limits.get(win.key),
     maximized: win.maximized, fullscreen: win.fullscreen, minimized: win.minimized,
   });
@@ -830,6 +845,7 @@ export function createView(options: ViewOptions): View {
       titles.clear();
       appIds.clear();
       limits.clear();
+      decorated.clear();
       for (const [k, v] of Object.entries(savedStyle)) cstyle[k] = v;
       onWindowsChange();
     },

@@ -254,6 +254,35 @@ test('scene: a window carries its app id and size hints (applied at the commit, 
   hl.dispose();
 });
 
+test('scene: decorations \'server\' — a window whose app asked through xdg-decoration is `decorated` from its first commit on, until it asks for client_side; one that never asked is not', async () => {
+  let changes = 0;
+  const ctx = await setup({ decorations: 'server', onWindowsChange: () => { changes++; } });
+  const { hl } = ctx;
+  const a = client(ctx, 1);
+  const g = globals(ctx.link, 1);
+  const DM = a.id();
+  const surface = a.id(), xdg = a.id(), toplevel = a.id(), deco = a.id();
+  a.send(
+    msg(REG, 0, g.zxdg_decoration_manager_v1.name, 'zxdg_decoration_manager_v1', 1, DM),
+    msg(COMP, 0, surface), msg(WM, 2, xdg, surface), msg(xdg, 1, toplevel), msg(toplevel, 2, 'framed'),
+    msg(DM, 1, deco, toplevel), // before the initial commit, as SDL does
+    msg(surface, 6),
+  );
+  assert.deepEqual(ctx.events.filter((e) => e.type === 'decoration'), [{ type: 'decoration', conn: 1, surface, decorated: true }]);
+  a.paint(surface, 40, 30, [0, 0, 255, 255]);
+  const key = `c1s${surface}`;
+  assert.equal(hl.window(key)!.decorated, true);
+  const plain = a.toplevel('plain');
+  a.paint(plain.surface, 20, 20, [255, 0, 0, 255]);
+  assert.equal(hl.window(`c1s${plain.surface}`)!.decorated, false);
+
+  const before = changes;
+  a.send(msg(deco, 1, 1)); // set_mode(client_side)
+  assert.equal(hl.window(key)!.decorated, false);
+  assert.ok(changes > before, 'onWindowsChange');
+  hl.dispose();
+});
+
 test('scene: windows cascade, take focus on map, and go away with their surface or conn (no leave; focus passes on)', async () => {
   let changes = 0;
   const ctx = await setup({ onWindowsChange: () => { changes++; } });
@@ -264,7 +293,7 @@ test('scene: windows cascade, take focus on map, and go away with their surface 
   a.paint(ta.surface, 40, 30, [255, 0, 0, 255]);
   const [w1] = hl.windows();
   assert.deepEqual({ ...w1 }, {
-    key: `c1s${ta.surface}`, conn: 1, surface: ta.surface, title: 'first', appId: '', minW: 0, minH: 0, maxW: 0, maxH: 0,
+    key: `c1s${ta.surface}`, conn: 1, surface: ta.surface, title: 'first', appId: '', decorated: false, minW: 0, minH: 0, maxW: 0, maxH: 0,
     x: 24, y: 48, width: 40, height: 30, originX: 24, originY: 48, z: w1.z, maximized: false, fullscreen: false, minimized: false, focused: true,
   });
   assert.deepEqual(calls, [['keyboardEnter', 1, ta.surface]]);
