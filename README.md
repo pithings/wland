@@ -159,8 +159,10 @@ const wl = await createWland({
 });
 ```
 
-Each window also has `minimize()`, `restore()`, `setMaximized(on)` and
-`setFullscreen(on)`.
+Each window also has `appId` (the app's `set_app_id`, e.g. for its icon),
+`minimize()`, `restore()`, `setMaximized(on)`, `setFullscreen(on)` and
+`close()` (asks the app to close the window; the app decides, and may ask
+about unsaved work first).
 
 ### Show connection status
 
@@ -358,7 +360,7 @@ one, for example to draw your own window frames.
 
 ```js
 import {
-  createEngine, createWsLink, createView, watchOutput, createInput, createWindowManager,
+  createEngine, createWsLink, createView, watchOutput, createInput, createWindowManager, frameInterval,
 } from 'wland/client';
 
 const view = createView({ container });
@@ -377,7 +379,8 @@ input = createInput({ engine, view, container });
 wm = createWindowManager({ engine, view, input, container });
 
 watchOutput(engine, container);   // size, pixel ratio, tab visibility
-const frame = (t) => { engine.tick(t); requestAnimationFrame(frame); };
+const interval = frameInterval();  // the display's refresh, from rAF
+const frame = (t) => { engine.tick(t, interval(t)); requestAnimationFrame(frame); };
 requestAnimationFrame(frame);
 
 engine.start();
@@ -392,6 +395,11 @@ const view = createView({
   unmount(win) { myFrames.remove(win.key); },
 });
 ```
+
+`createWland` takes the same `mount` and `unmount` options (and
+`onFocusChange`, separate from `onWindowsChange`). Each `ViewWindow` also
+carries the app's `appId` and size hints (`minW`, `minH`, `maxW`, `maxH`;
+0 = no limit), so your frames need not offer a size the app refuses.
 
 The default wm expects the default mount. With your own frames, handle the
 `move`, `resize`, `maximize`, `fullscreen` and `minimize` events yourself.

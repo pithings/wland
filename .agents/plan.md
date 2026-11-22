@@ -61,6 +61,24 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
     that is never committed to a surface, so the relay must ship its pixels
     on a new path (read at add_buffer/set_icon, under the pool SIGBUS guard;
     a new frame or COMMIT naming the icon) — relay + core + lib work.
+- **Windows in an embedder's window manager** (unkernel's WINDOW.md, kept
+  outside this repo). Milestone 1, done (2026-11-22): `Engine.close` →
+  xdg_toplevel.close (`WindowEntry.close`, headless `close`); `appId`
+  (set_app_id: 'app-id' events) and `minW/minH/maxW/maxH` (set_min/
+  max_size, now double-buffered as the spec says, invalid_size checked:
+  'size-limits' events) on ViewWindow / HeadlessWindow, `appId` on
+  WindowEntry; createWland passes `mount`/`unmount`/`onFocusChange` on;
+  `ROLE_*` and `frameInterval` exported. Both paths: wasm imports/export
+  and session CALL 29 / EVENTs 14–15 (STREAM.md), replayed to a late
+  viewer. Checked: core unit tests, session_test.zig (replay + close +
+  live hints), node tests (engine, session, headless, client),
+  headless-e2e's foot phase (app id; close() and foot exits by itself)
+  on a passthrough and a `--profile session` relay and with real foot.
+  Open, in
+  WINDOW.md's order: server-side decorations as the embedder's choice,
+  move/resize owned by the embedder (a grab handle), visibility owned by
+  the embedder, window positions for popup constraints, tiled states and
+  acked-configure serials, a focus policy, settable configure_bounds.
 - **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
   Firefox render but ignore all input): the core kept one wl_pointer /
   wl_keyboard / data device id per client, the last made, and Firefox
