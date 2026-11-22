@@ -29,6 +29,11 @@ pub const App = struct {
 
     /// Connect, read the globals and bind the usual ones.
     pub fn init(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ctx: anytype) App {
+        return initSeat(gpa, environ, ctx, 8);
+    }
+
+    /// init, with wl_seat bound at (at most) `seat_version`.
+    pub fn initSeat(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ctx: anytype, seat_version: u32) App {
         var app: App = .{ .c = wl.Client.connect(gpa, environ) catch wl.fail("connect failed", .{}) };
         const c = app.c;
         c.start(ctx);
@@ -36,7 +41,7 @@ pub const App = struct {
         app.subcompositor = c.bind("wl_subcompositor", 1);
         app.shm = c.mustBind("wl_shm", 1);
         app.wm_base = c.bind("xdg_wm_base", 6);
-        app.seat = c.bind("wl_seat", 8);
+        app.seat = c.bind("wl_seat", seat_version);
         app.output = c.bind("wl_output", 4);
         app.cursor_shape = c.bind("wp_cursor_shape_manager_v1", 1);
         return app;

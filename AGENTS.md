@@ -66,6 +66,9 @@ any of them (update this list when it does).
   claim; SIGBUS).
 - Input is role-gated (keyboard → toplevels only, pointer not to cursor
   surfaces) and focus-gated; a leave for a destroyed surface kills the client.
+  Seat events go to every wl_pointer/wl_keyboard/data device a client made,
+  from every wl_seat binding (Firefox binds it twice), one serial, versions
+  gated per object (`SeatObjects`, at most 8 per kind).
 - xdg_toplevel.move/resize start a grab only for a press still held on
   that window (core `inImplicitGrab`; wm.ts re-checks the DOM's buttons and
   ends a grab whose button is up). A popup's x/y counts from the parent's

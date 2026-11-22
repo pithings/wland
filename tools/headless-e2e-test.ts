@@ -41,6 +41,12 @@
 //     minimized/restored (hidden, then raised and focused again);
 //     weston-fullscreen asks itself ('f', and -f: mapped fullscreen).
 //  4. clipboard: wl-copy → wl-paste across two conns.
+//     Firefox's seat shape (fixture `browser`, fixtures only): wl_seat bound
+//     twice (GTK's v5, Firefox's own v8); GTK's wl_pointer and wl_keyboard
+//     — the ones Firefox's input handling listens on — get every enter,
+//     button, wheel, key and leave, with the same serials as its own
+//     (each version-gated on its own); Ctrl+V pastes through GTK's data
+//     device.
 //  5. nautilus (fixture `files`): renders; the hamburger menu is an
 //     xdg_popup, an outside press dismisses it; its header bar's minimize
 //     button (shown: wm_capabilities has minimize; nautilus's button layout
@@ -556,6 +562,57 @@ async function clipboard() {
   await noWindows();
 }
 
+async function browser() {
+  console.log("== Firefox's seat shape: wl_seat bound twice ==");
+  // real Firefox aborts here at GTK's first icon (glycin's sandbox): the
+  // real check is by hand (testing.md)
+  if (realApps) return console.log('  skipped: fixtures only (real Firefox: testing.md "Setup")');
+  const spec = need('browser');
+  const copySpec = need('copy', ['--foreground', 'wland-two-seats']);
+  if (!spec || !copySpec) return;
+  const copy = runApp(copySpec); // a selection for GTK's data device
+  await until(() => hl.engine.selection().mimes.length > 0, 5000, 'wl-copy to own the clipboard');
+  await noWindows();
+  const ff = runLogged(spec);
+  const win = await oneWindow(spec.name);
+  const lines = () => ff.text().split('\n');
+  const has = (re: RegExp) => lines().some((l) => re.test(l));
+  /** pair → event → the serials it got, in order */
+  const serials = (pair: 'gtk' | 'own', event: string) =>
+    lines().filter((l) => l.startsWith(`${pair} ${event} `)).map((l) => Number(/serial=(\d+)/.exec(l)![1]));
+  const same = (event: string) => {
+    const g = serials('gtk', event), o = serials('own', event);
+    return g.length > 0 && g.join() === o.join() ? g : null;
+  };
+  check(/seats gtk=v5 own=v8/.test(ff.text()), 'GTK bound wl_seat at v5, Firefox its own at v8');
+  await until(() => same('wl_keyboard.enter') && same('wl_keyboard.modifiers'), 5000, 'both keyboards to get the enter');
+  check(win.focused, `mapped focused: GTK's keyboard got enter + modifiers, the same serials as Firefox's (${same('wl_keyboard.enter')})`);
+  check(has(/^gtk wl_data_device\.selection mimes=.*text\/plain/), "GTK's data device was offered the selection");
+
+  const cx = win.x + win.width / 2, cy = win.y + win.height / 2;
+  hl.pointerMove(cx, cy);
+  hl.click(cx, cy);
+  await until(() => serials('gtk', 'wl_pointer.button').length >= 2 && serials('own', 'wl_pointer.button').length >= 2, 5000, 'both pointers to get the click');
+  check(same('wl_pointer.enter') && same('wl_pointer.button'), `a click: GTK's wl_pointer got enter + press + release, the serials Firefox's got (${same('wl_pointer.button')})`);
+  check(has(/^gtk wl_pointer\.motion$/) && has(/^gtk wl_pointer\.frame$/), "GTK's pointer got motion and frames (v5)");
+  hl.scroll(3);
+  await until(() => has(/^gtk wl_pointer\.axis$/) && has(/^own wl_pointer\.axis$/), 5000, 'both pointers to get the wheel');
+  check(has(/^gtk wl_pointer\.axis_discrete$/) && !has(/^gtk wl_pointer\.axis_value120$/) && has(/^own wl_pointer\.axis_value120$/) && !has(/^own wl_pointer\.axis_discrete$/),
+    'the wheel, version-gated per object: axis_discrete for GTK\'s v5 pointer, axis_value120 for Firefox\'s v8 one');
+  hl.type('a');
+  await until(() => serials('gtk', 'wl_keyboard.key').length >= 2, 5000, "GTK's keyboard to get the key");
+  check(same('wl_keyboard.key'), `a key: GTK's wl_keyboard got press + release, the serials Firefox's got (${same('wl_keyboard.key')})`);
+  hl.press('ControlLeft', 'KeyV');
+  await until(() => has(/^gtk paste: /), 5000, "Ctrl+V on GTK's keyboard");
+  check(has(/^gtk paste: wland-two-seats$/), `Ctrl+V pasted through GTK's data device (${lines().find((l) => l.startsWith('gtk paste: '))})`);
+  hl.pointerMove(1, 1);
+  await until(() => serials('gtk', 'wl_pointer.leave').length > 0, 5000, "GTK's pointer to get the leave");
+  check(same('wl_pointer.leave') && alive(ff.p), 'the pointer left: both got the leave (one serial); no version-gate failure');
+  await stop(ff.p);
+  await stop(copy);
+  await noWindows();
+}
+
 /** The clipboard phase against a relay without FEATURE selection_cache (an
  *  older wlandr, WLAND_E2E_RELAY): the embedder's halves are refused at once
  *  and no app's paste blocks; apps still copy and paste among themselves. */
@@ -926,6 +983,7 @@ try {
   await foot();
   await states();
   await clipboard();
+  await browser();
   await nautilus();
   await x11();
   await scale2();

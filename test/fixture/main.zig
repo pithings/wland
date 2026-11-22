@@ -20,6 +20,8 @@
 //!                                (hamburger, right-click; shadowed), double
 //!                                click, minimize/maximize, drag and drop
 //!   fullscreen [-f]              weston-fullscreen: `f` toggles fullscreen
+//!   browser                      Firefox's seat shape: wl_seat bound twice
+//!                                (GTK's v5, its own v8); acts on GTK's objects
 //!   dmabuf                       weston-simple-dmabuf-egl: linux-dmabuf buffers
 //!                                (memfds: needs a relay that takes them, e.g.
 //!                                the test-only `--dmabuf virtgpu:@fake`)
@@ -29,7 +31,7 @@ const wl = @import("wl.zig");
 
 const usage =
     \\usage: wland-fixture <mode> [args]
-    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen dmabuf
+    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf
     \\
 ;
 
@@ -60,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "term", @import("term.zig").run },
         .{ "files", @import("files.zig").run },
         .{ "fullscreen", @import("fullscreen.zig").run },
+        .{ "browser", @import("browser.zig").run },
         .{ "dmabuf", @import("dmabuf.zig").run },
     };
     inline for (modes) |m| {

@@ -30,6 +30,8 @@ export const realApps: boolean = appSet === 'real';
 export type AppRole =
   | 'info' | 'shm' | 'presentation' | 'copy' | 'paste'
   | 'cursor' | 'constraints' | 'relative' | 'term' | 'files' | 'fullscreen'
+  // Firefox's seat shape (wl_seat bound twice: GTK's, then its own)
+  | 'browser'
   // a GPU client (linux-dmabuf); the fixture's buffers are memfds, which
   // only the relay's test-only `--dmabuf virtgpu:@fake` takes
   | 'dmabuf';
@@ -145,6 +147,9 @@ function real(role: AppRole, args: string[]): AppSpec {
     case 'cursor': return spec('weston-flower', args);
     case 'constraints': return spec('weston-constraints', args);
     case 'fullscreen': return spec('weston-fullscreen', args);
+    // (the headless E2E's phase is fixture-only: Firefox aborts in this
+    // container at GTK's first icon, testing.md "Setup")
+    case 'browser': return spec('firefox', ['--no-remote', '--new-instance', ...args]);
     case 'dmabuf': return spec('weston-simple-dmabuf-egl', args);
     // no libdecor: its GTK plugin aborts in this container (testing.md)
     case 'relative': return { ...spec('python3', ['-c', SDL_RELATIVE, '60'], { SDL_VIDEO_DRIVER: 'wayland', SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR: '0' }), name: 'SDL3 (python3)' };

@@ -528,6 +528,52 @@ pub const own_selection_max_mimes = 32;
 pub const max_mime_len = 256;
 /// Most mime types one client source keeps (each is an event per offer).
 pub const max_source_mimes = 128;
+/// Most objects of one seat kind (wl_pointer, wl_keyboard, wl_data_device,
+/// primary selection device, relative pointer) a client gets events on.
+/// Every one of them gets every event (SeatObjects), so the cap bounds both
+/// the core's memory and the fan-out; a toolkit makes one per wl_seat
+/// binding (Firefox: GTK's and its own = 2). One beyond it is ignored like
+/// the spec's other bad requests without an error code: the object exists
+/// and stays silent.
+pub const max_seat_objects = 8;
+
+/// The objects of one kind a client made for the one seat — from every
+/// wl_seat binding it holds (Firefox binds wl_seat twice: GTK's, whose
+/// objects its input handling listens on, and its own) — in creation
+/// order, each with its version (the binding's it came from): seat events
+/// go to every one, version-gated per object, with one serial. Released or
+/// destroyed objects leave it. Fixed-size: at most max_seat_objects.
+const SeatObjects = struct {
+    items: [max_seat_objects]Obj = undefined,
+    len: u8 = 0,
+
+    const Obj = struct { id: u32, version: u32 };
+
+    fn slice(s: *const SeatObjects) []const Obj {
+        return s.items[0..s.len];
+    }
+
+    /// false: full (the object is ignored)
+    fn add(s: *SeatObjects, id: u32, version: u32) bool {
+        for (s.items[0..s.len]) |*o| if (o.id == id) {
+            o.version = version; // a reused id (the old object went unseen)
+            return true;
+        };
+        if (s.len == max_seat_objects) return false;
+        s.items[s.len] = .{ .id = id, .version = version };
+        s.len += 1;
+        return true;
+    }
+
+    /// Order-preserving: events keep going out in creation order.
+    fn remove(s: *SeatObjects, id: u32) void {
+        for (s.items[0..s.len], 0..) |o, i| if (o.id == id) {
+            std.mem.copyForwards(Obj, s.items[i .. s.len - 1], s.items[i + 1 .. s.len]);
+            s.len -= 1;
+            return;
+        };
+    }
+};
 
 /// An in-flight dnd session (wl_data_device.start_drag). The embedder owns
 /// pointer tracking — it drives dragMotion/dragDrop/dragCancel like a
@@ -546,11 +592,25 @@ const Drag = struct {
     icon_surface: u32,
     focus_conn: u32 = 0,
     focus_surface: u32 = 0,
-    /// server-allocated wl_data_offer at the current target (0 over nothing
-    /// or during a null-source drag)
-    focus_offer: u32 = 0,
+    /// server-allocated wl_data_offers at the current target, one per
+    /// wl_data_device of its client (none over nothing or during a
+    /// null-source drag); accept / set_actions count on any of them
+    focus_offers: [max_seat_objects]u32 = undefined,
+    focus_offer_n: u8 = 0,
     /// last wl_data_offer.accept named a mime (a drop without this cancels)
     accepted: bool = false,
+
+    fn isFocusOffer(d: *const Drag, offer_id: u32) bool {
+        return offer_id != 0 and std.mem.indexOfScalar(u32, d.focus_offers[0..d.focus_offer_n], offer_id) != null;
+    }
+
+    /// The target went (left, destroyed, its conn closed): no focus.
+    fn clearFocus(d: *Drag) void {
+        d.focus_conn = 0;
+        d.focus_surface = 0;
+        d.focus_offer_n = 0;
+        d.accepted = false;
+    }
 };
 
 const Conn = struct {
@@ -571,15 +631,19 @@ const Conn = struct {
     /// bound wl_output object ids — the embedder pushes a fresh mode + done
     /// to each when the desktop resizes (live mode)
     output_ids: std.ArrayList(u32) = .empty,
-    pointer_id: u32 = 0,
-    pointer_version: u32 = 0,
-    keyboard_id: u32 = 0,
-    keyboard_version: u32 = 0,
+    /// wl_pointer / wl_keyboard objects, from every wl_seat binding (see
+    /// SeatObjects). Focus is the conn's, held whether or not it has any:
+    /// one made while its client has focus is sent the enter at once.
+    pointers: SeatObjects = .{},
+    keyboards: SeatObjects = .{},
     pointer_focus: u32 = 0,
-    /// serial of the latest wl_pointer.enter sent to this conn —
+    /// serial of the latest pointer enter (one serial, sent to every
+    /// wl_pointer; a late wl_pointer's enter repeats it) —
     /// wp_cursor_shape_device_v1.set_shape and wl_pointer.set_cursor must
     /// echo it or be ignored
     pointer_enter_serial: u32 = 0,
+    /// serial of the latest keyboard enter (a late wl_keyboard's repeats it)
+    keyboard_enter_serial: u32 = 0,
     /// The implicit grab (see `inImplicitGrab`): the buttons this conn saw
     /// pressed and not yet released (bit = evdev code & 31), the serials of
     /// the presses that made it (first and latest: wrapping range) and the
@@ -608,15 +672,18 @@ const Conn = struct {
     pointer_x: i32 = 0,
     pointer_y: i32 = 0,
     pointer_time: u32 = 0,
-    /// zwp_relative_pointer_v1 ids (they share the seat's pointer focus)
-    relative_pointers: std.ArrayList(u32) = .empty,
+    /// zwp_relative_pointer_v1 objects (they share the seat's pointer
+    /// focus, whichever wl_pointer each was made for)
+    relative_pointers: SeatObjects = .{},
     /// pointer constraint object id → its state (see Constraint)
     constraints: std.AutoHashMapUnmanaged(u32, Constraint) = .empty,
     /// the surface whose lock the embedder was last told this conn wants (0 none)
     lock_surface: u32 = 0,
     keyboard_focus: u32 = 0,
     mods_depressed: u32 = 0,
-    data_device_id: u32 = 0,
+    /// wl_data_device objects (one per get_data_device: GTK and Firefox
+    /// make one per wl_seat binding); each gets its own wl_data_offers
+    data_devices: SeatObjects = .{},
     /// wl_data_source id → MIME types it offered (owned copies)
     source_mimes: std.AutoHashMapUnmanaged(u32, std.ArrayList([]u8)) = .empty,
     /// wl_data_source id → dnd action bitmask from set_actions (v3)
@@ -632,8 +699,8 @@ const Conn = struct {
     /// primary_offers), and the server learns primary offers via a SRVOBJ frame.
     next_server_id: u32 = objects.server_id_base,
     // ---- primary selection (M13), a mirror of the clipboard fields above ----
-    /// zwp_primary_selection_device_v1 object id (0 = none)
-    primary_device_id: u32 = 0,
+    /// zwp_primary_selection_device_v1 objects (each gets its own offers)
+    primary_devices: SeatObjects = .{},
     /// zwp_primary_selection_source_v1 id → MIME types it offered (owned copies)
     primary_source_mimes: std.AutoHashMapUnmanaged(u32, std.ArrayList([]u8)) = .empty,
     /// server-allocated zwp_primary_selection_offer_v1 id → the primary
@@ -972,7 +1039,6 @@ pub const Compositor = struct {
         conn.viewports.deinit(self.gpa);
         conn.frac_scales.deinit(self.gpa);
         conn.dmabuf_params.deinit(self.gpa);
-        conn.relative_pointers.deinit(self.gpa);
         conn.constraints.deinit(self.gpa);
         self.gpa.destroy(conn);
     }
@@ -1024,10 +1090,7 @@ pub const Compositor = struct {
                 drag.source_id = 0; // conn (and its source) already gone
                 self.dragCancel();
             } else if (drag.focus_conn == conn_id) {
-                drag.focus_conn = 0;
-                drag.focus_surface = 0;
-                drag.focus_offer = 0;
-                drag.accepted = false;
+                drag.clearFocus();
             }
         }
         self.logf("conn {d} closed", .{conn_id});
@@ -1341,13 +1404,17 @@ pub const Compositor = struct {
             return;
         }
         if (std.mem.eql(u8, iface.name, "wl_seat")) {
+            // every wl_seat binding's objects get the seat's events (a
+            // client may bind it twice: Firefox), at their binding's version
+            // (get_touch: no touch capability, no events — nothing to track)
+            const id = args[0].new_id;
             if (std.mem.eql(u8, msg.name, "get_pointer")) {
-                conn.pointer_id = args[0].new_id;
-                conn.pointer_version = entry.version;
+                if (!conn.pointers.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_pointer", id);
+                self.latePointerEnter(conn_id, conn, id, entry.version);
             } else if (std.mem.eql(u8, msg.name, "get_keyboard")) {
-                conn.keyboard_id = args[0].new_id;
-                conn.keyboard_version = entry.version;
-                self.sendKeymap(conn_id, conn);
+                if (!conn.keyboards.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_keyboard", id);
+                self.sendKeymap(conn_id, id, entry.version);
+                self.lateKeyboardEnter(conn_id, conn, id);
             }
             return;
         }
@@ -1547,7 +1614,10 @@ pub const Compositor = struct {
             if (std.mem.eql(u8, msg.name, "create_data_source")) {
                 try conn.source_mimes.put(self.gpa, args[0].new_id, .empty);
             } else if (std.mem.eql(u8, msg.name, "get_data_device")) {
-                conn.data_device_id = args[0].new_id;
+                const id = args[0].new_id;
+                if (!conn.data_devices.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_data_device", id);
+                // made while its client has keyboard focus: the selection now
+                if (conn.keyboard_focus != 0) self.offerSelection(conn_id, conn, .{ .id = id, .version = entry.version });
             }
         } else if (std.mem.eql(u8, iface.name, "wl_data_source")) {
             if (std.mem.eql(u8, msg.name, "offer")) {
@@ -1584,7 +1654,9 @@ pub const Compositor = struct {
             if (std.mem.eql(u8, msg.name, "create_source")) {
                 try conn.primary_source_mimes.put(self.gpa, args[0].new_id, .empty);
             } else if (std.mem.eql(u8, msg.name, "get_device")) {
-                conn.primary_device_id = args[0].new_id;
+                const id = args[0].new_id;
+                if (!conn.primary_devices.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "zwp_primary_selection_device_v1", id);
+                if (conn.keyboard_focus != 0) self.offerPrimarySelection(conn_id, conn, id);
             }
         } else if (std.mem.eql(u8, iface.name, "zwp_primary_selection_source_v1")) {
             // only `offer` (no set_actions — primary selection has no dnd)
@@ -1681,7 +1753,7 @@ pub const Compositor = struct {
             try self.dmabufParamsRequest(conn_id, conn, header.object_id, msg.name, args);
         } else if (std.mem.eql(u8, iface.name, "zwp_relative_pointer_manager_v1") and std.mem.eql(u8, msg.name, "get_relative_pointer")) {
             // one seat: every relative pointer shares its pointer focus
-            try conn.relative_pointers.append(self.gpa, args[0].new_id);
+            if (!conn.relative_pointers.add(args[0].new_id, entry.version)) return self.seatObjectIgnored(conn_id, "zwp_relative_pointer_v1", args[0].new_id);
         } else if (std.mem.eql(u8, iface.name, "zwp_pointer_constraints_v1") and
             (std.mem.eql(u8, msg.name, "lock_pointer") or std.mem.eql(u8, msg.name, "confine_pointer")))
         {
@@ -1850,10 +1922,7 @@ pub const Compositor = struct {
                 // drag focus dies just as silently (enter references ids)
                 if (self.drag) |*drag| {
                     if (conn_id == drag.focus_conn and header.object_id == drag.focus_surface) {
-                        drag.focus_conn = 0;
-                        drag.focus_surface = 0;
-                        drag.focus_offer = 0;
-                        drag.accepted = false;
+                        drag.clearFocus();
                     }
                     if (conn_id == drag.source_conn and header.object_id == drag.icon_surface) {
                         drag.icon_surface = 0;
@@ -1996,12 +2065,18 @@ pub const Compositor = struct {
             } else if (std.mem.eql(u8, iface.name, "zxdg_toplevel_decoration_v1")) {
                 if (surfaceByDecorationId(conn, header.object_id)) |surface| surface.decoration_id = 0;
             } else if (std.mem.eql(u8, iface.name, "zwp_relative_pointer_v1")) {
-                for (conn.relative_pointers.items, 0..) |rid, i| {
-                    if (rid == header.object_id) {
-                        _ = conn.relative_pointers.swapRemove(i);
-                        break;
-                    }
-                }
+                conn.relative_pointers.remove(header.object_id);
+            } else if (std.mem.eql(u8, iface.name, "wl_pointer")) {
+                // v3 release: the others keep the seat's events (and its
+                // focus, serials and implicit grab, which are the conn's)
+                conn.pointers.remove(header.object_id);
+            } else if (std.mem.eql(u8, iface.name, "wl_keyboard")) {
+                conn.keyboards.remove(header.object_id);
+            } else if (std.mem.eql(u8, iface.name, "wl_data_device")) {
+                // v2 release; its offers live on (the client destroys them)
+                conn.data_devices.remove(header.object_id);
+            } else if (std.mem.eql(u8, iface.name, "zwp_primary_selection_device_v1")) {
+                conn.primary_devices.remove(header.object_id);
             } else if (std.mem.eql(u8, iface.name, "zwp_locked_pointer_v1") or std.mem.eql(u8, iface.name, "zwp_confined_pointer_v1")) {
                 // destroying it unlocks / unconfines (no event: it is gone);
                 // a lock the embedder holds or asked for is let go
@@ -2484,7 +2559,7 @@ pub const Compositor = struct {
             surface.minimized = true;
             if (conn.pointer_focus != 0 and underMinimized(conn, conn.pointer_focus)) self.pointerLeave(conn_id);
             // (the leave's configure, no longer activated, carries `suspended`)
-            told = conn.keyboard_focus == id and conn.keyboard_id != 0;
+            told = conn.keyboard_focus == id;
             if (conn.keyboard_focus == id) self.keyboardLeave(conn_id);
             var it = conn.surfaces.iterator();
             while (it.next()) |kv| {
@@ -2928,9 +3003,10 @@ pub const Compositor = struct {
         }
     }
 
-    /// wl_keyboard.keymap needs an fd; emit via the FDMSG path. Followed by
+    /// wl_keyboard.keymap needs an fd; emit via the FDMSG path (each
+    /// keyboard its own: the relay makes a memfd per FDMSG). Followed by
     /// repeat_info for v4+ keyboards.
-    fn sendKeymap(self: *Compositor, conn_id: u32, conn: *Conn) void {
+    fn sendKeymap(self: *Compositor, conn_id: u32, keyboard_id: u32, version: u32) void {
         const fdmsg_fn = self.fdmsg_fn orelse {
             self.logf("no fdmsg transport; keyboard will not get a keymap", .{});
             return;
@@ -2939,16 +3015,56 @@ pub const Compositor = struct {
         var buf: [64]u8 = undefined;
         const iface = comptime protocol.find("wl_keyboard").?;
         const opcode = comptime iface.eventIndex("keymap").?;
-        const msg = wire.encodeMessage(&buf, conn.keyboard_id, opcode, &.{
+        const msg = wire.encodeMessage(&buf, keyboard_id, opcode, &.{
             .{ .uint = 1 },
             .fd,
             .{ .uint = keymap_text.len + 1 },
         });
         fdmsg_fn(self.ctx, conn_id, 2, msg, keymap_text); // kind 2 = keymap
-        if (conn.keyboard_version >= 4) {
-            self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "repeat_info", &.{
+        if (version >= 4) {
+            self.sendEvent(conn_id, keyboard_id, "wl_keyboard", "repeat_info", &.{
                 .{ .int = 25 }, .{ .int = 400 },
             });
+        }
+    }
+
+    /// A wl_keyboard made while its client holds keyboard focus (Firefox's
+    /// own, after GTK's got the enter): the enter it missed — the focus's
+    /// serial again, no keys held — and the modifiers, to it alone (weston
+    /// does the same). A wl_pointer's twin is latePointerEnter.
+    fn lateKeyboardEnter(self: *Compositor, conn_id: u32, conn: *Conn, keyboard_id: u32) void {
+        if (conn.keyboard_focus == 0) return;
+        self.sendEvent(conn_id, keyboard_id, "wl_keyboard", "enter", &.{
+            .{ .uint = conn.keyboard_enter_serial }, .{ .object = conn.keyboard_focus }, .{ .array = &.{} },
+        });
+        self.sendModifiersTo(conn_id, conn, keyboard_id);
+    }
+
+    /// A wl_pointer made while its client holds pointer focus: the enter it
+    /// missed, with the focus's serial (so a set_cursor naming it, from any
+    /// of the client's pointers, still counts) and the pointer's position
+    /// as the client last saw it, then a frame (v5+).
+    fn latePointerEnter(self: *Compositor, conn_id: u32, conn: *Conn, pointer_id: u32, version: u32) void {
+        if (conn.pointer_focus == 0) return;
+        self.sendEvent(conn_id, pointer_id, "wl_pointer", "enter", &.{
+            .{ .uint = conn.pointer_enter_serial }, .{ .object = conn.pointer_focus },
+            .{ .fixed = conn.pointer_x },           .{ .fixed = conn.pointer_y },
+        });
+        if (version >= 5) self.sendEvent(conn_id, pointer_id, "wl_pointer", "frame", &.{});
+    }
+
+    /// A seat object over max_seat_objects: it exists (the client may use
+    /// and destroy it) but is sent nothing.
+    fn seatObjectIgnored(self: *Compositor, conn_id: u32, comptime iface_name: []const u8, id: u32) void {
+        self.logf("c{d}: {s}@{d}: over {d} of them, it gets no events", .{ conn_id, iface_name, id, max_seat_objects });
+    }
+
+    /// One event to every object of `set` at version `min_version` or later
+    /// (seat events fan out to every binding's objects; the version gate is
+    /// per object, never per client).
+    fn seatEvent(self: *Compositor, conn_id: u32, set: *const SeatObjects, comptime iface_name: []const u8, comptime event_name: []const u8, args: []const wire.Value, min_version: u32) void {
+        for (set.slice()) |o| {
+            if (o.version >= min_version) self.sendEvent(conn_id, o.id, iface_name, event_name, args);
         }
     }
 
@@ -3139,13 +3255,19 @@ pub const Compositor = struct {
         }
     }
 
-    /// Introduce a fresh wl_data_offer proxying the selection, then the
-    /// selection event (null when the clipboard is empty). Spec order:
-    /// data_offer intro → offer(mime)* → selection.
+    /// The selection to each of the conn's wl_data_devices (offerSelection).
     fn deliverSelection(self: *Compositor, conn_id: u32, conn: *Conn) void {
-        if (conn.data_device_id == 0) return;
+        for (conn.data_devices.slice()) |dev| self.offerSelection(conn_id, conn, dev);
+    }
+
+    /// Introduce a fresh wl_data_offer proxying the selection on `dev` (its
+    /// own: an offer is the object of one data device), then the selection
+    /// event (null when the clipboard is empty). Spec order: data_offer
+    /// intro → offer(mime)* → selection. Offers are server ids of the
+    /// default type (wl_data_offer): no SRVOBJ.
+    fn offerSelection(self: *Compositor, conn_id: u32, conn: *Conn, dev: SeatObjects.Obj) void {
         const sel = self.selection orelse {
-            self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "selection", &.{.{ .object = 0 }});
+            self.sendEvent(conn_id, dev.id, "wl_data_device", "selection", &.{.{ .object = 0 }});
             return;
         };
         var own_mimes: [own_selection_max_mimes][]const u8 = undefined;
@@ -3159,15 +3281,29 @@ pub const Compositor = struct {
             break :blk (src_conn.source_mimes.get(sel.source) orelse return).items;
         };
 
-        const offer_id = conn.next_server_id;
-        conn.next_server_id += 1;
-        conn.objects.put(self.gpa, offer_id, protocol.find("wl_data_offer").?, 3) catch return;
-        conn.offers.put(self.gpa, offer_id, sel) catch return;
-        self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "data_offer", &.{.{ .new_id = offer_id }});
+        const offer_id = self.newOffer(conn, dev.version, sel, false) orelse return;
+        self.sendEvent(conn_id, dev.id, "wl_data_device", "data_offer", &.{.{ .new_id = offer_id }});
         for (mimes) |mime| {
             self.sendEvent(conn_id, offer_id, "wl_data_offer", "offer", &.{.{ .string = mime }});
         }
-        self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "selection", &.{.{ .object = offer_id }});
+        self.sendEvent(conn_id, dev.id, "wl_data_device", "selection", &.{.{ .object = offer_id }});
+    }
+
+    /// A fresh server id (the conn's one dense counter, objects.zig) for a
+    /// wl_data_offer — or a primary offer — proxying `sel`, at the version
+    /// of the device it is introduced on (a new_id in an event inherits it).
+    /// The id is spent only once both maps hold it. null: out of memory.
+    fn newOffer(self: *Compositor, conn: *Conn, version: u32, sel: Selection, primary: bool) ?u32 {
+        const offer_id = conn.next_server_id;
+        const iface = if (primary) comptime protocol.find("zwp_primary_selection_offer_v1").? else comptime protocol.find("wl_data_offer").?;
+        conn.objects.put(self.gpa, offer_id, iface, version) catch return null;
+        const map = if (primary) &conn.primary_offers else &conn.offers;
+        map.put(self.gpa, offer_id, sel) catch {
+            conn.objects.remove(offer_id);
+            return null;
+        };
+        conn.next_server_id += 1;
+        return offer_id;
     }
 
     /// A `receive(mime, fd)` arrived on a server-allocated offer (via FDMSG
@@ -3295,28 +3431,30 @@ pub const Compositor = struct {
     /// selection event (null when empty). Spec order: data_offer intro →
     /// offer(mime)* → selection. Mirror of deliverSelection.
     fn deliverPrimarySelection(self: *Compositor, conn_id: u32, conn: *Conn) void {
-        if (conn.primary_device_id == 0) return;
+        for (conn.primary_devices.slice()) |dev| self.offerPrimarySelection(conn_id, conn, dev.id);
+    }
+
+    /// One primary device's own offer + selection (offerSelection's twin).
+    fn offerPrimarySelection(self: *Compositor, conn_id: u32, conn: *Conn, device_id: u32) void {
         const sel = self.primary_selection orelse {
-            self.sendEvent(conn_id, conn.primary_device_id, "zwp_primary_selection_device_v1", "selection", &.{.{ .object = 0 }});
+            self.sendEvent(conn_id, device_id, "zwp_primary_selection_device_v1", "selection", &.{.{ .object = 0 }});
             return;
         };
         const src_conn = self.conns.get(sel.conn) orelse return;
         const mimes = src_conn.primary_source_mimes.get(sel.source) orelse return;
 
-        const offer_id = conn.next_server_id;
-        conn.next_server_id += 1;
-        conn.objects.put(self.gpa, offer_id, protocol.find("zwp_primary_selection_offer_v1").?, 1) catch return;
-        conn.primary_offers.put(self.gpa, offer_id, sel) catch return;
+        const offer_id = self.newOffer(conn, 1, sel, true) orelse return;
         // tell the server this server id is a PRIMARY offer (SRVOBJ frame) so
         // its fd interception watches primary_offer.receive (opcode 0), not
         // data_offer.receive (opcode 1). Must precede the data_offer event so
-        // the server records the type before the app can send receive.
+        // the server records the type before the app can send receive. One
+        // per offer: each device's offer is an id of its own.
         if (self.srvobj_fn) |f| f(self.ctx, conn_id, offer_id, srvobj_kind_primary_offer);
-        self.sendEvent(conn_id, conn.primary_device_id, "zwp_primary_selection_device_v1", "data_offer", &.{.{ .new_id = offer_id }});
+        self.sendEvent(conn_id, device_id, "zwp_primary_selection_device_v1", "data_offer", &.{.{ .new_id = offer_id }});
         for (mimes.items) |mime| {
             self.sendEvent(conn_id, offer_id, "zwp_primary_selection_offer_v1", "offer", &.{.{ .string = mime }});
         }
-        self.sendEvent(conn_id, conn.primary_device_id, "zwp_primary_selection_device_v1", "selection", &.{.{ .object = offer_id }});
+        self.sendEvent(conn_id, device_id, "zwp_primary_selection_device_v1", "selection", &.{.{ .object = offer_id }});
     }
 
     // ------------------------------------------------------------------
@@ -3374,43 +3512,53 @@ pub const Compositor = struct {
         if (conn_id == drag.focus_conn and surface_id == drag.focus_surface) {
             if (surface_id == 0) return;
             const conn = self.conns.get(conn_id) orelse return;
-            if (conn.data_device_id == 0) return;
-            self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "motion", &.{
+            self.seatEvent(conn_id, &conn.data_devices, "wl_data_device", "motion", &.{
                 .{ .uint = time_ms }, .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
-            });
+            }, 1);
             return;
         }
         self.dragLeaveFocus(drag);
         if (surface_id == 0) return;
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.data_device_id == 0 or conn.surfaces.get(surface_id) == null) return;
-        var offer_id: u32 = 0;
+        if (conn.data_devices.len == 0 or conn.surfaces.get(surface_id) == null) return;
+        var mimes: []const []u8 = &.{};
+        var actions: u32 = 0;
         if (drag.source_id != 0) {
-            // fresh offer per enter, same recipe as deliverSelection: intro →
-            // offer(mime)* → source_actions; registered in conn.offers so the
-            // server's receive interception routes transfers to the source
             const src_conn = self.conns.get(drag.source_conn) orelse return;
-            const mimes = src_conn.source_mimes.get(drag.source_id) orelse return;
-            offer_id = conn.next_server_id;
-            conn.next_server_id += 1;
-            conn.objects.put(self.gpa, offer_id, protocol.find("wl_data_offer").?, 3) catch return;
-            conn.offers.put(self.gpa, offer_id, .{ .conn = drag.source_conn, .source = drag.source_id }) catch return;
-            self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "data_offer", &.{.{ .new_id = offer_id }});
-            for (mimes.items) |mime| {
-                self.sendEvent(conn_id, offer_id, "wl_data_offer", "offer", &.{.{ .string = mime }});
-            }
-            const actions = src_conn.source_actions.get(drag.source_id) orelse 0;
-            self.sendEvent(conn_id, offer_id, "wl_data_offer", "source_actions", &.{.{ .uint = actions }});
+            mimes = (src_conn.source_mimes.get(drag.source_id) orelse return).items;
+            actions = src_conn.source_actions.get(drag.source_id) orelse 0;
         }
         drag.focus_conn = conn_id;
         drag.focus_surface = surface_id;
-        drag.focus_offer = offer_id;
+        drag.focus_offer_n = 0;
         drag.accepted = false;
-        self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "enter", &.{
-            .{ .uint = nextSerial(conn) }, .{ .object = surface_id },
-            .{ .fixed = x_fixed },         .{ .fixed = y_fixed },
-            .{ .object = offer_id },
-        });
+        // one enter serial for every data device of the target (wlroots:
+        // each gets the enter, with an offer of its own)
+        const serial = nextSerial(conn);
+        for (conn.data_devices.slice()) |dev| {
+            var offer_id: u32 = 0;
+            if (drag.source_id != 0) {
+                // fresh offer per enter, same recipe as offerSelection: intro
+                // → offer(mime)* → source_actions (v3); registered in
+                // conn.offers so the server's receive interception routes
+                // transfers to the source (out of memory: an enter with none)
+                if (self.newOffer(conn, dev.version, .{ .conn = drag.source_conn, .source = drag.source_id }, false)) |id| {
+                    offer_id = id;
+                    self.sendEvent(conn_id, dev.id, "wl_data_device", "data_offer", &.{.{ .new_id = id }});
+                    for (mimes) |mime| {
+                        self.sendEvent(conn_id, id, "wl_data_offer", "offer", &.{.{ .string = mime }});
+                    }
+                    if (dev.version >= 3) self.sendEvent(conn_id, id, "wl_data_offer", "source_actions", &.{.{ .uint = actions }});
+                    drag.focus_offers[drag.focus_offer_n] = id;
+                    drag.focus_offer_n += 1;
+                }
+            }
+            self.sendEvent(conn_id, dev.id, "wl_data_device", "enter", &.{
+                .{ .uint = serial },   .{ .object = surface_id },
+                .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
+                .{ .object = offer_id },
+            });
+        }
     }
 
     /// Embedder: button released. A drop lands only on an accepting target;
@@ -3423,9 +3571,7 @@ pub const Compositor = struct {
             return;
         }
         if (self.conns.get(drag.focus_conn)) |conn| {
-            if (conn.data_device_id != 0) {
-                self.sendEvent(drag.focus_conn, conn.data_device_id, "wl_data_device", "drop", &.{});
-            }
+            self.seatEvent(drag.focus_conn, &conn.data_devices, "wl_data_device", "drop", &.{}, 1);
         }
         if (drag.source_id != 0) {
             if (self.conns.get(drag.source_conn)) |src_conn| {
@@ -3452,16 +3598,10 @@ pub const Compositor = struct {
     /// Send leave to the current target, if any. wl_data_device.leave carries
     /// no surface id, so it is safe even mid-teardown.
     fn dragLeaveFocus(self: *Compositor, drag: *Drag) void {
-        defer {
-            drag.focus_conn = 0;
-            drag.focus_surface = 0;
-            drag.focus_offer = 0;
-            drag.accepted = false;
-        }
+        defer drag.clearFocus();
         if (drag.focus_surface == 0) return;
         const conn = self.conns.get(drag.focus_conn) orelse return;
-        if (conn.data_device_id == 0) return;
-        self.sendEvent(drag.focus_conn, conn.data_device_id, "wl_data_device", "leave", &.{});
+        self.seatEvent(drag.focus_conn, &conn.data_devices, "wl_data_device", "leave", &.{}, 1);
     }
 
     /// Tear down the session: icon role reverts (the embedder re-hides it)
@@ -3486,7 +3626,7 @@ pub const Compositor = struct {
     /// Target accepted (or revoked, mime == null) the drag offer.
     fn dragAccept(self: *Compositor, conn_id: u32, offer_id: u32, mime: ?[]const u8) void {
         const drag = if (self.drag) |*d| d else return;
-        if (conn_id != drag.focus_conn or offer_id != drag.focus_offer or drag.source_id == 0) return;
+        if (conn_id != drag.focus_conn or !drag.isFocusOffer(offer_id) or drag.source_id == 0) return;
         // no source offers a mime over max_mime_len: such an accept names
         // none of the offer's types — a revoke (and `target` echoes it)
         const m: ?[]const u8 = if (mime) |s| (if (s.len > max_mime_len) null else s) else null;
@@ -3500,7 +3640,7 @@ pub const Compositor = struct {
     /// to both ends (v3 flow; GTK will not complete a drop without it).
     fn dragOfferActions(self: *Compositor, conn_id: u32, offer_id: u32, actions: u32, preferred: u32) void {
         const drag = if (self.drag) |*d| d else return;
-        if (conn_id != drag.focus_conn or offer_id != drag.focus_offer or drag.source_id == 0) return;
+        if (conn_id != drag.focus_conn or !drag.isFocusOffer(offer_id) or drag.source_id == 0) return;
         const src_conn = self.conns.get(drag.source_conn) orelse return;
         const both = actions & (src_conn.source_actions.get(drag.source_id) orelse 0);
         const chosen: u32 = if (preferred & both != 0)
@@ -3539,7 +3679,8 @@ pub const Compositor = struct {
     pub fn pointerEnter(self: *Compositor, conn_id: u32, surface_id: u32, x_fixed: i32, y_fixed: i32) void {
         if (self.drag != null) return; // the dnd grab owns the pointer
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.pointer_id == 0) return;
+        // (focus is the conn's whether or not it has a wl_pointer yet: one
+        // made later is sent this enter then, latePointerEnter)
         // pointer may enter toplevels and subsurfaces (CSD hover), never
         // cursors or dnd icons
         switch (self.surfaceRole(conn_id, surface_id)) {
@@ -3554,10 +3695,12 @@ pub const Compositor = struct {
         conn.pointer_enter_serial = serial; // set_shape/set_cursor must echo this serial
         noteInputSerial(conn, serial); // a hover alone doesn't make it the last input conn
         conn.cursor_surface = 0; // a new enter takes a fresh set_cursor
-        self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "enter", &.{
+        // one serial for every wl_pointer: set_cursor/set_shape from any
+        // of them names it
+        self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "enter", &.{
             .{ .uint = serial }, .{ .object = surface_id },
             .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
-        });
+        }, 1);
         self.pointerFrame(conn_id, conn);
         conn.pointer_x = x_fixed;
         conn.pointer_y = y_fixed;
@@ -3568,16 +3711,16 @@ pub const Compositor = struct {
 
     pub fn pointerLeave(self: *Compositor, conn_id: u32) void {
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.pointer_id == 0 or conn.pointer_focus == 0) return;
+        if (conn.pointer_focus == 0) return;
         const focus = conn.pointer_focus;
         conn.pointer_focus = 0;
         conn.buttons_held = 0; // the implicit grab is over (its release goes elsewhere)
         // its constraint ends first (unlocked/unconfined while the client
         // still sees its surface under the pointer), then the leave
         self.updateConstraints(conn_id, conn);
-        self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "leave", &.{
+        self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "leave", &.{
             .{ .uint = nextSerial(conn) }, .{ .object = focus },
-        });
+        }, 1);
         self.pointerFrame(conn_id, conn);
         // the shape or cursor surface the client set applied only while its
         // surface held the pointer — reset to the default pointer now
@@ -3599,7 +3742,7 @@ pub const Compositor = struct {
     pub fn pointerMotion(self: *Compositor, conn_id: u32, time_ms: u32, x_fixed: i32, y_fixed: i32, rel: ?Relative) void {
         if (self.drag != null) return;
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.pointer_id == 0 or conn.pointer_focus == 0) return;
+        if (conn.pointer_focus == 0) return;
         const c = activeConstraint(conn);
         const moved = rel != null and (rel.?.dx != 0 or rel.?.dy != 0 or rel.?.dx_unaccel != 0 or rel.?.dy_unaccel != 0);
         const locked = c != null and c.?.lock;
@@ -3616,19 +3759,17 @@ pub const Compositor = struct {
             conn.pointer_x = x;
             conn.pointer_y = y;
             conn.pointer_time = time_ms;
-            self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "motion", &.{
+            self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "motion", &.{
                 .{ .uint = time_ms }, .{ .fixed = x }, .{ .fixed = y },
-            });
+            }, 1);
         }
         if (moved) {
             const r = rel.?;
-            for (conn.relative_pointers.items) |id| {
-                self.sendEvent(conn_id, id, "zwp_relative_pointer_v1", "relative_motion", &.{
-                    .{ .uint = @truncate(r.utime >> 32) }, .{ .uint = @truncate(r.utime) },
-                    .{ .fixed = r.dx },                    .{ .fixed = r.dy },
-                    .{ .fixed = r.dx_unaccel },            .{ .fixed = r.dy_unaccel },
-                });
-            }
+            self.seatEvent(conn_id, &conn.relative_pointers, "zwp_relative_pointer_v1", "relative_motion", &.{
+                .{ .uint = @truncate(r.utime >> 32) }, .{ .uint = @truncate(r.utime) },
+                .{ .fixed = r.dx },                    .{ .fixed = r.dy },
+                .{ .fixed = r.dx_unaccel },            .{ .fixed = r.dy_unaccel },
+            }, 1);
         }
         self.pointerFrame(conn_id, conn);
         // into a constraint's region (it may start), out of a wanted lock's
@@ -3638,7 +3779,7 @@ pub const Compositor = struct {
     pub fn pointerButton(self: *Compositor, conn_id: u32, time_ms: u32, button: u32, pressed: bool) void {
         if (self.drag != null) return;
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.pointer_id == 0 or conn.pointer_focus == 0) return;
+        if (conn.pointer_focus == 0) return;
         const serial = nextSerial(conn);
         noteInputSerial(conn, serial);
         self.last_input_conn = conn_id;
@@ -3651,10 +3792,10 @@ pub const Compositor = struct {
             conn.grab_serial_last = serial;
             conn.buttons_held |= bit;
         } else conn.buttons_held &= ~bit;
-        self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "button", &.{
+        self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "button", &.{
             .{ .uint = serial }, .{ .uint = time_ms },
             .{ .uint = button }, .{ .uint = if (pressed) 1 else 0 },
-        });
+        }, 1);
         self.pointerFrame(conn_id, conn);
     }
 
@@ -3706,47 +3847,51 @@ pub const Compositor = struct {
     /// axis_source(wheel) [v5+] · axis_relative_direction(identical) [v9+] ·
     /// axis_value120 [v8+] or axis_discrete [v5-7] · axis · frame [v5+]. The
     /// high-res / discrete events are each coupled BEFORE their axis event.
+    /// Each wl_pointer gets the whole frame its own version allows (a v9
+    /// GTK pointer and a v5 one of the same client differ).
     pub fn pointerAxis(self: *Compositor, conn_id: u32, time_ms: u32, axis: u32, value_fixed: i32, value120: i32) void {
         if (self.drag != null) return;
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.pointer_id == 0 or conn.pointer_focus == 0) return;
-        const v = conn.pointer_version;
-        if (v >= 5) {
-            self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "axis_source", &.{.{ .uint = axis_source_wheel }});
-        }
-        if (v >= 9) {
-            self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "axis_relative_direction", &.{
-                .{ .uint = axis }, .{ .uint = axis_direction_identical },
+        if (conn.pointer_focus == 0) return;
+        for (conn.pointers.slice()) |p| {
+            const v = p.version;
+            if (v >= 5) {
+                self.sendEvent(conn_id, p.id, "wl_pointer", "axis_source", &.{.{ .uint = axis_source_wheel }});
+            }
+            if (v >= 9) {
+                self.sendEvent(conn_id, p.id, "wl_pointer", "axis_relative_direction", &.{
+                    .{ .uint = axis }, .{ .uint = axis_direction_identical },
+                });
+            }
+            if (v >= 8) {
+                // spec: value120 must not be zero — skip the high-res event on a
+                // pure-continuous scroll rather than emit a zero
+                if (value120 != 0) {
+                    self.sendEvent(conn_id, p.id, "wl_pointer", "axis_value120", &.{
+                        .{ .uint = axis }, .{ .int = value120 },
+                    });
+                }
+            } else if (v >= 5) {
+                // deprecated axis_discrete carries whole detents only; fractional
+                // (trackpad-style) deltas stay purely continuous for old clients
+                const steps = @divTrunc(value120, value120_per_notch);
+                if (steps != 0) {
+                    self.sendEvent(conn_id, p.id, "wl_pointer", "axis_discrete", &.{
+                        .{ .uint = axis }, .{ .int = steps },
+                    });
+                }
+            }
+            self.sendEvent(conn_id, p.id, "wl_pointer", "axis", &.{
+                .{ .uint = time_ms }, .{ .uint = axis }, .{ .fixed = value_fixed },
             });
+            if (v >= 5) self.sendEvent(conn_id, p.id, "wl_pointer", "frame", &.{});
         }
-        if (v >= 8) {
-            // spec: value120 must not be zero — skip the high-res event on a
-            // pure-continuous scroll rather than emit a zero
-            if (value120 != 0) {
-                self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "axis_value120", &.{
-                    .{ .uint = axis }, .{ .int = value120 },
-                });
-            }
-        } else if (v >= 5) {
-            // deprecated axis_discrete carries whole detents only; fractional
-            // (trackpad-style) deltas stay purely continuous for old clients
-            const steps = @divTrunc(value120, value120_per_notch);
-            if (steps != 0) {
-                self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "axis_discrete", &.{
-                    .{ .uint = axis }, .{ .int = steps },
-                });
-            }
-        }
-        self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "axis", &.{
-            .{ .uint = time_ms }, .{ .uint = axis }, .{ .fixed = value_fixed },
-        });
-        self.pointerFrame(conn_id, conn);
     }
 
+    /// wl_pointer.frame to every v5+ wl_pointer (the end of one logical
+    /// pointer event; older pointers have no frames).
     fn pointerFrame(self: *Compositor, conn_id: u32, conn: *Conn) void {
-        if (conn.pointer_version >= 5) {
-            self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "frame", &.{});
-        }
+        self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "frame", &.{}, 5);
     }
 
     // ------------------------------------------------------------------
@@ -3830,9 +3975,9 @@ pub const Compositor = struct {
             if (p[0] == conn.pointer_x and p[1] == conn.pointer_y) continue;
             conn.pointer_x = p[0];
             conn.pointer_y = p[1];
-            self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "motion", &.{
+            self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "motion", &.{
                 .{ .uint = conn.pointer_time }, .{ .fixed = p[0] }, .{ .fixed = p[1] },
-            });
+            }, 1);
             self.pointerFrame(conn_id, conn);
         }
         self.updateConstraints(conn_id, conn);
@@ -4155,7 +4300,9 @@ pub const Compositor = struct {
 
     pub fn keyboardEnter(self: *Compositor, conn_id: u32, surface_id: u32) void {
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.keyboard_id == 0 or conn.keyboard_focus == surface_id) return;
+        // (focus is the conn's whether or not it has a wl_keyboard yet: one
+        // made later is sent this enter then, lateKeyboardEnter)
+        if (conn.keyboard_focus == surface_id) return;
         // keyboard focus only ever lands on toplevels — apps crash on focus
         // events for surfaces without window state (foot + cursor surface)
         if (self.surfaceRole(conn_id, surface_id) != .toplevel) return;
@@ -4167,9 +4314,10 @@ pub const Compositor = struct {
         const serial = nextSerial(conn);
         noteInputSerial(conn, serial);
         self.last_input_conn = conn_id;
-        self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "enter", &.{
+        conn.keyboard_enter_serial = serial;
+        self.seatEvent(conn_id, &conn.keyboards, "wl_keyboard", "enter", &.{
             .{ .uint = serial }, .{ .object = surface_id }, .{ .array = &.{} },
-        });
+        }, 1);
         self.sendModifiers(conn_id, conn);
         // clipboard follows keyboard focus (wl_data_device.selection on enter)
         self.deliverSelection(conn_id, conn);
@@ -4181,10 +4329,10 @@ pub const Compositor = struct {
 
     pub fn keyboardLeave(self: *Compositor, conn_id: u32) void {
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.keyboard_id == 0 or conn.keyboard_focus == 0) return;
-        self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "leave", &.{
+        if (conn.keyboard_focus == 0) return;
+        self.seatEvent(conn_id, &conn.keyboards, "wl_keyboard", "leave", &.{
             .{ .uint = nextSerial(conn) }, .{ .object = conn.keyboard_focus },
-        });
+        }, 1);
         const before = conn.keyboard_focus;
         conn.keyboard_focus = 0;
         self.textInputLeave(conn_id, conn);
@@ -4264,15 +4412,16 @@ pub const Compositor = struct {
 
     pub fn keyboardKey(self: *Compositor, conn_id: u32, time_ms: u32, evdev_key: u32, pressed: bool) void {
         const conn = self.conns.get(conn_id) orelse return;
-        if (conn.keyboard_id == 0) return;
         const serial = nextSerial(conn);
         noteInputSerial(conn, serial);
         self.last_input_conn = conn_id;
-        self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "key", &.{
+        // one serial for every wl_keyboard
+        self.seatEvent(conn_id, &conn.keyboards, "wl_keyboard", "key", &.{
             .{ .uint = serial },    .{ .uint = time_ms },
             .{ .uint = evdev_key }, .{ .uint = if (pressed) 1 else 0 },
-        });
-        // modifier bookkeeping
+        }, 1);
+        // modifier bookkeeping (with no wl_keyboard too: the lock keys are
+        // the seat's, and a keyboard made later is told the state)
         const mod: u32 = switch (evdev_key) {
             key_leftshift, key_rightshift => mod_shift,
             key_leftctrl, key_rightctrl => mod_ctrl,
@@ -4302,7 +4451,7 @@ pub const Compositor = struct {
         var it = self.conns.iterator();
         while (it.next()) |kv| {
             const conn = kv.value_ptr.*;
-            if (conn.keyboard_id != 0 and conn.keyboard_focus != 0) self.sendModifiers(kv.key_ptr.*, conn);
+            if (conn.keyboard_focus != 0) self.sendModifiers(kv.key_ptr.*, conn);
         }
     }
 
@@ -4313,14 +4462,26 @@ pub const Compositor = struct {
         return .{ .caps_lock = self.mods_locked & mod_lock != 0, .num_lock = self.mods_locked & mod_num != 0 };
     }
 
+    /// wl_keyboard.modifiers to every wl_keyboard, one serial.
     fn sendModifiers(self: *Compositor, conn_id: u32, conn: *Conn) void {
-        self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "modifiers", &.{
+        if (conn.keyboards.len == 0) return; // no serial spent on nobody
+        self.seatEvent(conn_id, &conn.keyboards, "wl_keyboard", "modifiers", &self.modifierArgs(conn), 1);
+    }
+
+    /// wl_keyboard.modifiers to one wl_keyboard (a late one's).
+    fn sendModifiersTo(self: *Compositor, conn_id: u32, conn: *Conn, keyboard_id: u32) void {
+        self.sendEvent(conn_id, keyboard_id, "wl_keyboard", "modifiers", &self.modifierArgs(conn));
+    }
+
+    /// A fresh serial and the conn's modifier state, as modifiers' args.
+    fn modifierArgs(self: *Compositor, conn: *Conn) [5]wire.Value {
+        return .{
             .{ .uint = nextSerial(conn) },
             .{ .uint = conn.mods_depressed },
             .{ .uint = 0 },
             .{ .uint = self.mods_locked },
             .{ .uint = 0 },
-        });
+        };
     }
 
     fn deleteId(self: *Compositor, conn_id: u32, id: u32) void {
@@ -6003,7 +6164,7 @@ const WinTest = struct {
     /// A left-button press held on the toplevel (wl_seat 9, wl_pointer 10
     /// bound on first use): its serial, what move/resize must name.
     fn press(comp: *Compositor) !u32 {
-        if (comp.conns.get(1).?.pointer_id == 0) {
+        if (comp.conns.get(1).?.pointers.len == 0) {
             try send(comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
             try send(comp, 9, 0, &.{.{ .new_id = 10 }}); // get_pointer
         }
@@ -8752,7 +8913,7 @@ test "selection requests: honoured from the keyboard-focused client, or with a r
 
     // the target accepting with a mime no source can offer: a revoke
     comp.dragMotion(2, 11, 0, 256, 256);
-    const offer = comp.drag.?.focus_offer;
+    const offer = comp.drag.?.focus_offers[0];
     try std.testing.expect(offer != 0);
     const over = [_]u8{'x'} ** (max_mime_len + 1);
     try T.send(&comp, 2, offer, comptime T.doffer.requestIndex("accept").?, &.{ .{ .uint = 0 }, .{ .string = "text/plain" } });
@@ -8950,4 +9111,523 @@ test "own selection to a relay with FEATURE selection_cache: each payload's byte
     const calls3 = sink.fdmsg_calls;
     try comp.setOwnSelection(&.{});
     try std.testing.expectEqual(calls3, sink.fdmsg_calls);
+}
+
+/// Seat tests (Firefox binds wl_seat twice): conn 1's v6 toplevel
+/// (wmBaseToplevel: surface 6, xdg_surface 7, toplevel 8) past its initial
+/// commit, keymaps through the FDMSG sink, cursor images recorded.
+const SeatTest = struct {
+    const ptr = protocol.find("wl_pointer").?;
+    const kbd = protocol.find("wl_keyboard").?;
+    const p_enter = ptr.eventIndex("enter").?;
+    const p_leave = ptr.eventIndex("leave").?;
+    const p_motion = ptr.eventIndex("motion").?;
+    const p_button = ptr.eventIndex("button").?;
+    const p_frame = ptr.eventIndex("frame").?;
+    const p_axis = ptr.eventIndex("axis").?;
+    const p_source = ptr.eventIndex("axis_source").?;
+    const p_discrete = ptr.eventIndex("axis_discrete").?;
+    const p_v120 = ptr.eventIndex("axis_value120").?;
+    const p_dir = ptr.eventIndex("axis_relative_direction").?;
+    const k_enter = kbd.eventIndex("enter").?;
+    const k_leave = kbd.eventIndex("leave").?;
+    const k_key = kbd.eventIndex("key").?;
+    const k_mods = kbd.eventIndex("modifiers").?;
+    const k_repeat = kbd.eventIndex("repeat_info").?;
+    const set_cursor_op = ptr.requestIndex("set_cursor").?;
+    const p_release = ptr.requestIndex("release").?;
+    const k_release = kbd.requestIndex("release").?;
+
+    fn setup(comp: *Compositor) !void {
+        comp.fdmsg_fn = TestSink.fdmsg;
+        comp.cursor_surface_fn = TestSink.cursorSurface;
+        try wmBaseToplevel(comp, 1);
+        try send(comp, 6, protocol.find("wl_surface").?.requestIndex("commit").?, &.{});
+    }
+    fn send(comp: *Compositor, obj: u32, op: u16, args: []const wire.Value) !void {
+        var buf: [128]u8 = undefined;
+        try comp.onWire(1, wire.encodeMessage(&buf, obj, op, args));
+    }
+    /// bind wl_seat (global 4) at `version` as `id`
+    fn bindSeat(comp: *Compositor, id: u32, version: u32) !void {
+        try send(comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = version, .id = id } } });
+    }
+    fn getPointer(comp: *Compositor, seat: u32, id: u32) !void {
+        try send(comp, seat, 0, &.{.{ .new_id = id }});
+    }
+    fn getKeyboard(comp: *Compositor, seat: u32, id: u32) !void {
+        try send(comp, seat, 1, &.{.{ .new_id = id }});
+    }
+    /// conn 1's events on `obj` with `opcode` since the last clear
+    fn count(sink: *const TestSink, obj: u32, opcode: u16) usize {
+        var n: usize = 0;
+        for (sink.events.items) |e| {
+            if (e.conn_id == 1 and e.object_id == obj and e.opcode == opcode) n += 1;
+        }
+        return n;
+    }
+    /// the first arg (a serial, uint) of the one `opcode` event each of
+    /// `ids` got — the same for all of them, or the test fails
+    fn sameSerial(sink: *const TestSink, ids: []const u32, opcode: u16) !u32 {
+        var serial: ?u32 = null;
+        for (ids) |id| {
+            try std.testing.expectEqual(@as(usize, 1), count(sink, id, opcode));
+            for (sink.events.items) |e| {
+                if (e.conn_id != 1 or e.object_id != id or e.opcode != opcode) continue;
+                const s = std.mem.readInt(u32, e.bytes[wire.header_size..][0..4], .little);
+                if (serial) |want| try std.testing.expectEqual(want, s) else serial = s;
+            }
+        }
+        return serial.?;
+    }
+    /// the args of the last `opcode` event on `obj`
+    fn argsOf(sink: *const TestSink, obj: u32, opcode: u16, sig: []const wire.ArgType, vals: *[wire.max_args]wire.Value) ![]const wire.Value {
+        var i = sink.events.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = &sink.events.items[i];
+            if (e.conn_id == 1 and e.object_id == obj and e.opcode == opcode) return wire.decodeArgs(e.bytes[wire.header_size..e.len], sig, vals);
+        }
+        return error.NoSuchEvent;
+    }
+};
+
+test "seat: two wl_seat bindings (Firefox) — every wl_pointer and wl_keyboard gets enter, motion, button, axis, key, modifiers, leave with one serial, version-gated per object" {
+    const T = SeatTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+
+    // GTK's seat at v9, Firefox's at v7, a third at v3: pointer + keyboard each
+    try T.bindSeat(&comp, 20, 9);
+    try T.getPointer(&comp, 20, 21);
+    try T.getKeyboard(&comp, 20, 22);
+    try T.bindSeat(&comp, 23, 7);
+    try T.getPointer(&comp, 23, 24);
+    try T.getKeyboard(&comp, 23, 25);
+    try T.bindSeat(&comp, 26, 3);
+    try T.getPointer(&comp, 26, 27);
+    try T.getKeyboard(&comp, 26, 28);
+    // a keymap each (an FDMSG per keyboard); repeat_info only from v4
+    try std.testing.expectEqual(@as(u32, 3), sink.fdmsg_calls);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 22, T.k_repeat));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 25, T.k_repeat));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 28, T.k_repeat));
+
+    const kbds = [_]u32{ 22, 25, 28 };
+    const ptrs = [_]u32{ 21, 24, 27 };
+    sink.events.clearRetainingCapacity();
+    comp.keyboardEnter(1, 6);
+    const k_enter = try T.sameSerial(&sink, &kbds, T.k_enter);
+    const k_mods = try T.sameSerial(&sink, &kbds, T.k_mods);
+    try std.testing.expect(k_mods != k_enter);
+    try std.testing.expectEqual(k_enter, comp.conns.get(1).?.keyboard_enter_serial);
+
+    sink.events.clearRetainingCapacity();
+    comp.keyboardKey(1, 5, 30, true); // 'a'
+    const key = try T.sameSerial(&sink, &kbds, T.k_key);
+    comp.keyboardKey(1, 6, 42, true); // Shift: modifiers to all, one serial
+    _ = try T.sameSerial(&sink, &kbds, T.k_mods);
+    try std.testing.expect(comp.maySetSelection(1, comp.conns.get(1).?, key));
+
+    sink.events.clearRetainingCapacity();
+    comp.pointerEnter(1, 6, 256, 512);
+    const p_enter = try T.sameSerial(&sink, &ptrs, T.p_enter);
+    try std.testing.expectEqual(p_enter, comp.conns.get(1).?.pointer_enter_serial);
+    // frame: v5+ only, per object
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_frame));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_frame));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 27, T.p_frame));
+
+    sink.events.clearRetainingCapacity();
+    comp.pointerMotion(1, 7, 1024, 2048, null);
+    for (ptrs) |p| try std.testing.expectEqual(@as(usize, 1), T.count(&sink, p, T.p_motion));
+    var vals: [wire.max_args]wire.Value = undefined;
+    for (ptrs) |p| try std.testing.expectEqual(@as(i32, 2048), (try T.argsOf(&sink, p, T.p_motion, &.{ .uint, .fixed, .fixed }, &vals))[2].fixed);
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 27, T.p_frame));
+
+    sink.events.clearRetainingCapacity();
+    comp.pointerButton(1, 8, 0x110, true);
+    const press = try T.sameSerial(&sink, &ptrs, T.p_button);
+    // the implicit grab is the conn's: a move naming the press is honoured
+    // whichever pointer the client read it from
+    comp.interactive_fn = TestSink.interactive;
+    try T.send(&comp, 8, comptime protocol.find("xdg_toplevel").?.requestIndex("move").?, &.{ .{ .object = 23 }, .{ .uint = press } });
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_kind);
+    comp.pointerButton(1, 9, 0x110, false);
+
+    // a wheel detent: each pointer the frame its version knows
+    sink.events.clearRetainingCapacity();
+    comp.pointerAxis(1, 10, 0, 2560, 120);
+    // v9: axis_source, axis_relative_direction, axis_value120, axis, frame
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_source));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_dir));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_v120));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 21, T.p_discrete));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_axis));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_frame));
+    // v7: axis_source, axis_discrete, axis, frame
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_source));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 24, T.p_dir));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 24, T.p_v120));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_discrete));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_axis));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_frame));
+    // v3: axis alone
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 27, T.p_axis));
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len - 9);
+
+    sink.events.clearRetainingCapacity();
+    comp.pointerLeave(1);
+    _ = try T.sameSerial(&sink, &ptrs, T.p_leave);
+    comp.keyboardLeave(1);
+    _ = try T.sameSerial(&sink, &kbds, T.k_leave);
+}
+
+test "seat: a released wl_pointer / wl_keyboard leaves the set, the others keep working; set_cursor from any pointer with the enter's serial applies" {
+    const T = SeatTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    try T.bindSeat(&comp, 20, 9);
+    try T.getPointer(&comp, 20, 21);
+    try T.getKeyboard(&comp, 20, 22);
+    try T.bindSeat(&comp, 23, 9);
+    try T.getPointer(&comp, 23, 24);
+    try T.getKeyboard(&comp, 23, 25);
+    comp.keyboardEnter(1, 6);
+    comp.pointerEnter(1, 6, 0, 0);
+    const enter = comp.conns.get(1).?.pointer_enter_serial;
+
+    // set_cursor on the SECOND pointer naming the shared enter serial: applied
+    const calls0 = sink.cursor_calls;
+    try T.send(&comp, 24, T.set_cursor_op, &.{ .{ .uint = enter }, .{ .object = 0 }, .{ .int = 0 }, .{ .int = 0 } });
+    try std.testing.expectEqual(calls0 + 1, sink.cursor_calls);
+    try T.send(&comp, 21, T.set_cursor_op, &.{ .{ .uint = enter }, .{ .object = 0 }, .{ .int = 0 }, .{ .int = 0 } });
+    try std.testing.expectEqual(calls0 + 2, sink.cursor_calls);
+
+    // GTK's pair released: only Firefox's still hears the seat
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 21, T.p_release, &.{});
+    try T.send(&comp, 22, T.k_release, &.{});
+    try std.testing.expectEqual(@as(usize, 2), sink.events.items.len); // two delete_ids
+    try std.testing.expectEqual(@as(u8, 1), comp.conns.get(1).?.pointers.len);
+    try std.testing.expectEqual(@as(u8, 1), comp.conns.get(1).?.keyboards.len);
+    sink.events.clearRetainingCapacity();
+    comp.pointerMotion(1, 1, 256, 256, null);
+    comp.pointerButton(1, 2, 0x110, true);
+    comp.keyboardKey(1, 3, 30, true);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_motion));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 24, T.p_button));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 25, T.k_key));
+    for (sink.events.items) |e| try std.testing.expect(e.object_id != 21 and e.object_id != 22);
+
+    // the freed id names a new wl_pointer: it is sent the enter it missed
+    // (the focus's serial, where the pointer is now), then a frame
+    sink.events.clearRetainingCapacity();
+    try T.getPointer(&comp, 20, 21);
+    var vals: [wire.max_args]wire.Value = undefined;
+    const a = try T.argsOf(&sink, 21, T.p_enter, &.{ .uint, .object, .fixed, .fixed }, &vals);
+    try std.testing.expectEqual(enter, a[0].uint);
+    try std.testing.expectEqual(@as(u32, 6), a[1].object);
+    try std.testing.expectEqual(@as(i32, 256), a[2].fixed);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_frame));
+    try std.testing.expectEqual(@as(usize, 2), sink.events.items.len);
+
+    // every pointer released while focused: focus stays the conn's, the
+    // leave goes to nobody and still ends the grab and the cursor image
+    try T.send(&comp, 21, T.p_release, &.{});
+    try T.send(&comp, 24, T.p_release, &.{});
+    sink.events.clearRetainingCapacity();
+    comp.pointerLeave(1);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    try std.testing.expectEqual(@as(u32, 0), comp.conns.get(1).?.pointer_focus);
+    try std.testing.expectEqual(@as(u32, 0), comp.conns.get(1).?.buttons_held);
+}
+
+test "seat: a wl_keyboard / wl_pointer made while its client has focus gets the enter (the focus's serial, current position) and modifiers; the first pointer made after the enter too" {
+    const T = SeatTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    try T.bindSeat(&comp, 20, 9);
+    try T.getKeyboard(&comp, 20, 22);
+    comp.keyboardEnter(1, 6);
+    const k_enter = comp.conns.get(1).?.keyboard_enter_serial;
+    comp.keyboardKey(1, 1, 42, true); // Shift held
+
+    // Firefox's own seat (v5), after GTK's keyboard got focus: keymap,
+    // repeat_info, then enter (same serial, no keys) and the modifiers —
+    // to it alone
+    try T.bindSeat(&comp, 23, 5);
+    sink.events.clearRetainingCapacity();
+    const fd0 = sink.fdmsg_calls;
+    try T.getKeyboard(&comp, 23, 25);
+    try std.testing.expectEqual(fd0 + 1, sink.fdmsg_calls);
+    try std.testing.expectEqual(@as(usize, 3), sink.events.items.len);
+    try std.testing.expectEqual(T.k_repeat, sink.events.items[0].opcode);
+    var vals: [wire.max_args]wire.Value = undefined;
+    const e = try T.argsOf(&sink, 25, T.k_enter, &.{ .uint, .object, .array }, &vals);
+    try std.testing.expectEqual(k_enter, e[0].uint);
+    try std.testing.expectEqual(@as(u32, 6), e[1].object);
+    try std.testing.expectEqual(@as(usize, 0), e[2].array.len);
+    const m = try T.argsOf(&sink, 25, T.k_mods, &.{ .uint, .uint, .uint, .uint, .uint }, &vals);
+    try std.testing.expectEqual(@as(u32, 1), m[1].uint); // Shift depressed
+    try std.testing.expectEqual(@as(u32, 1 << 4), m[3].uint); // NumLock locked
+    try std.testing.expectEqual(T.k_mods, sink.events.items[2].opcode); // after the enter
+
+    // no wl_pointer yet: the enter is the conn's focus, sent to nobody
+    sink.events.clearRetainingCapacity();
+    comp.pointerEnter(1, 6, 10 << 8, 20 << 8);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    const p_enter = comp.conns.get(1).?.pointer_enter_serial;
+    // the first wl_pointer: the enter it missed + frame
+    try T.getPointer(&comp, 20, 21);
+    const pe = try T.argsOf(&sink, 21, T.p_enter, &.{ .uint, .object, .fixed, .fixed }, &vals);
+    try std.testing.expectEqual(p_enter, pe[0].uint);
+    try std.testing.expectEqual(@as(i32, 10 << 8), pe[2].fixed);
+    try std.testing.expectEqual(@as(i32, 20 << 8), pe[3].fixed);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 21, T.p_frame));
+    comp.pointerMotion(1, 2, 30 << 8, 40 << 8, null);
+    // a second, late: where the pointer is now; the same serial
+    sink.events.clearRetainingCapacity();
+    try T.getPointer(&comp, 23, 24);
+    const pe2 = try T.argsOf(&sink, 24, T.p_enter, &.{ .uint, .object, .fixed, .fixed }, &vals);
+    try std.testing.expectEqual(p_enter, pe2[0].uint);
+    try std.testing.expectEqual(@as(i32, 30 << 8), pe2[2].fixed);
+    try std.testing.expectEqual(@as(i32, 40 << 8), pe2[3].fixed);
+    try std.testing.expectEqual(@as(usize, 2), sink.events.items.len);
+    // set_cursor from the late one, with that serial: applied
+    const calls0 = sink.cursor_calls;
+    try T.send(&comp, 24, T.set_cursor_op, &.{ .{ .uint = p_enter }, .{ .object = 0 }, .{ .int = 0 }, .{ .int = 0 } });
+    try std.testing.expectEqual(calls0 + 1, sink.cursor_calls);
+
+    // made with no focus: keymap only
+    comp.pointerLeave(1);
+    comp.keyboardLeave(1);
+    sink.events.clearRetainingCapacity();
+    try T.getKeyboard(&comp, 20, 30);
+    try T.getPointer(&comp, 20, 31);
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len); // repeat_info
+}
+
+test "seat: objects over max_seat_objects get no events (the cap); a release makes room" {
+    const T = SeatTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    try T.bindSeat(&comp, 20, 9);
+    for (0..max_seat_objects + 1) |i| try T.getPointer(&comp, 20, 30 + @as(u32, @intCast(i)));
+    for (0..max_seat_objects + 1) |i| try T.getKeyboard(&comp, 20, 50 + @as(u32, @intCast(i)));
+    const extra_p: u32 = 30 + max_seat_objects;
+    const extra_k: u32 = 50 + max_seat_objects;
+    try std.testing.expectEqual(@as(u32, max_seat_objects), sink.fdmsg_calls); // no keymap for the extra one
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, extra_k, T.k_repeat));
+    sink.events.clearRetainingCapacity();
+    comp.pointerEnter(1, 6, 0, 0);
+    comp.keyboardEnter(1, 6);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 30, T.p_enter));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, extra_p, T.p_enter));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, extra_k, T.k_enter));
+    try std.testing.expectEqual(@as(u8, max_seat_objects), comp.conns.get(1).?.pointers.len);
+    // the ignored object is still the client's: it can release it
+    try T.send(&comp, extra_p, T.p_release, &.{});
+    try std.testing.expectEqual(@as(u8, max_seat_objects), comp.conns.get(1).?.pointers.len);
+    // a release makes room: the next one is accepted (late enter)
+    try T.send(&comp, 30, T.p_release, &.{});
+    sink.events.clearRetainingCapacity();
+    try T.getPointer(&comp, 20, 70);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 70, T.p_enter));
+    // the other kinds share the cap: relative pointers, data devices
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 15 }, .{ .new_id_dynamic = .{ .interface = "zwp_relative_pointer_manager_v1", .version = 1, .id = 80 } } });
+    for (0..max_seat_objects + 1) |i| try T.send(&comp, 80, 1, &.{ .{ .new_id = 81 + @as(u32, @intCast(i)) }, .{ .object = 31 } });
+    try std.testing.expectEqual(@as(u8, max_seat_objects), comp.conns.get(1).?.relative_pointers.len);
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 100 } } });
+    for (0..max_seat_objects + 1) |i| try T.send(&comp, 100, 1, &.{ .{ .new_id = 101 + @as(u32, @intCast(i)) }, .{ .object = 20 } });
+    try std.testing.expectEqual(@as(u8, max_seat_objects), comp.conns.get(1).?.data_devices.len);
+}
+
+test "data devices: each of a client's wl_data_devices and primary devices gets an offer of its own (dense server ids, SRVOBJ per primary offer); a late one while focused gets the selection; release" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.fdmsg_fn = TestSink.fdmsg;
+    var buf: [256]u8 = undefined;
+
+    // conn 2: the source of both selections (clip manager 3 → source 4,
+    // device 5; primary manager 6 → source 7, device 8)
+    try comp.connOpen(2);
+    try comp.onWire(2, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
+    try comp.onWire(2, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 3 } } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 4 }}));
+    try comp.onWire(2, wire.encodeMessage(&buf, 4, 0, &.{.{ .string = "text/plain" }}));
+    try comp.onWire(2, wire.encodeMessage(&buf, 3, 1, &.{ .{ .new_id = 5 }, .{ .object = 9 } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 4 }, .{ .uint = testInputSerial(&comp, 2) } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 13 }, .{ .new_id_dynamic = .{ .interface = "zwp_primary_selection_device_manager_v1", .version = 1, .id = 6 } } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 6, 0, &.{.{ .new_id = 7 }}));
+    try comp.onWire(2, wire.encodeMessage(&buf, 7, 0, &.{.{ .string = "text/plain" }}));
+    try comp.onWire(2, wire.encodeMessage(&buf, 6, 1, &.{ .{ .new_id = 8 }, .{ .object = 9 } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 8, 0, &.{ .{ .object = 7 }, .{ .uint = testInputSerial(&comp, 2) } }));
+
+    // conn 1 (Firefox-shaped): two seats (20 GTK's, 23 its own), a keyboard,
+    // a data device and a primary device on each
+    const T = SeatTest;
+    try T.setup(&comp);
+    try T.bindSeat(&comp, 20, 9);
+    try T.bindSeat(&comp, 23, 9);
+    try T.getKeyboard(&comp, 20, 22);
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 30 } } });
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 13 }, .{ .new_id_dynamic = .{ .interface = "zwp_primary_selection_device_manager_v1", .version = 1, .id = 31 } } });
+    try T.send(&comp, 30, 1, &.{ .{ .new_id = 32 }, .{ .object = 20 } });
+    try T.send(&comp, 30, 1, &.{ .{ .new_id = 33 }, .{ .object = 23 } });
+    try T.send(&comp, 31, 1, &.{ .{ .new_id = 34 }, .{ .object = 20 } });
+    try T.send(&comp, 31, 1, &.{ .{ .new_id = 35 }, .{ .object = 23 } });
+    sink.events.clearRetainingCapacity();
+    const srvobj0 = sink.srvobj_calls;
+
+    const dd = comptime protocol.find("wl_data_device").?;
+    const pd = comptime protocol.find("zwp_primary_selection_device_v1").?;
+    const dd_offer = comptime dd.eventIndex("data_offer").?;
+    const dd_sel = comptime dd.eventIndex("selection").?;
+    const pd_offer = comptime pd.eventIndex("data_offer").?;
+    const pd_sel = comptime pd.eventIndex("selection").?;
+    const H = struct {
+        /// the offer `device` was introduced to and its selection names
+        /// (they must agree; the last of each since the clear)
+        fn offerOf(sk: *const TestSink, device: u32, intro: u16, sel: u16) !u32 {
+            var vals: [wire.max_args]wire.Value = undefined;
+            const id = (try SeatTest.argsOf(sk, device, intro, &.{.new_id}, &vals))[0].new_id;
+            try std.testing.expectEqual(id, (try SeatTest.argsOf(sk, device, sel, &.{.object}, &vals))[0].object);
+            return id;
+        }
+    };
+
+    comp.keyboardEnter(1, 6);
+    const a = try H.offerOf(&sink, 32, dd_offer, dd_sel);
+    const b = try H.offerOf(&sink, 33, dd_offer, dd_sel);
+    const pa = try H.offerOf(&sink, 34, pd_offer, pd_sel);
+    const pb = try H.offerOf(&sink, 35, pd_offer, pd_sel);
+    // one dense server-id space, in order: the data offers, then the primary
+    try std.testing.expectEqual(objects.server_id_base, a);
+    try std.testing.expectEqual(a + 1, b);
+    try std.testing.expectEqual(a + 2, pa);
+    try std.testing.expectEqual(a + 3, pb);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, a, comptime protocol.find("wl_data_offer").?.eventIndex("offer").?));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, b, comptime protocol.find("wl_data_offer").?.eventIndex("offer").?));
+    // each primary offer flagged on its own; the data offers are not
+    try std.testing.expectEqual(srvobj0 + 2, sink.srvobj_calls);
+    try std.testing.expect(sink.isPrimary(pa) and sink.isPrimary(pb));
+    try std.testing.expect(!sink.isPrimary(a) and !sink.isPrimary(b));
+
+    // a receive on the SECOND device's offers routes to the source too
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, b, 1, &.{ .{ .string = "text/plain" }, .fd }), 41);
+    try std.testing.expectEqual(@as(u32, 2), sink.fdmsg_conn);
+    try std.testing.expectEqual(@as(u32, 41), sink.fdmsg_token);
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, pb, 0, &.{ .{ .string = "text/plain" }, .fd }), 42);
+    try std.testing.expectEqual(@as(u32, 2), sink.fdmsg_conn);
+    try std.testing.expectEqual(@as(u32, 42), sink.fdmsg_token);
+
+    // a data device made while the client has keyboard focus: the selection now
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 30, 1, &.{ .{ .new_id = 36 }, .{ .object = 23 } });
+    const c = try H.offerOf(&sink, 36, dd_offer, dd_sel);
+    try std.testing.expectEqual(pb + 1, c);
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 32, dd_sel));
+
+    // GTK's data device released (v2+): a new selection reaches the others only
+    try T.send(&comp, 32, comptime dd.requestIndex("release").?, &.{});
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(2, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 0 }, .{ .uint = testInputSerial(&comp, 2) } })); // cleared
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 32, dd_sel));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 33, dd_sel));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 36, dd_sel));
+}
+
+test "dnd: a target with two wl_data_devices — each gets its own offer and the enter (one serial), motion, drop; accept on either counts" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.interactive_fn = TestSink.interactive;
+    comp.fdmsg_fn = TestSink.fdmsg;
+
+    try dndConnSetup(&comp, 1);
+    try dndConnSetup(&comp, 2);
+    var buf: [128]u8 = undefined;
+    // conn 2's second seat (30) and data device (31) on it, Firefox-style
+    try comp.onWire(2, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 5, .id = 30 } } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 6, 1, &.{ .{ .new_id = 31 }, .{ .object = 30 } }));
+    // conn 1 drags source 12 (text/plain; copy)
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, 0, &.{.{ .new_id = 12 }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 12, 0, &.{.{ .string = "text/plain" }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 12, 2, &.{.{ .uint = dnd_action_copy }}));
+    comp.pointerEnter(1, 7, 0, 0);
+    comp.pointerButton(1, 0, 0x110, true);
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = comp.conns.get(1).?.serial } }));
+
+    const dd = comptime protocol.find("wl_data_device").?;
+    const off = comptime protocol.find("wl_data_offer").?;
+    const src = comptime protocol.find("wl_data_source").?;
+    const Of = struct {
+        fn count(sk: *const TestSink, conn: u32, obj: u32, opcode: u16) usize {
+            var n: usize = 0;
+            for (sk.events.items) |e| {
+                if (e.conn_id == conn and e.object_id == obj and e.opcode == opcode) n += 1;
+            }
+            return n;
+        }
+        fn enter(sk: *const TestSink, obj: u32) ![2]u32 { // serial, offer
+            var vals: [wire.max_args]wire.Value = undefined;
+            for (sk.events.items) |e| {
+                if (e.conn_id != 2 or e.object_id != obj or e.opcode != dd.eventIndex("enter").?) continue;
+                const a = try wire.decodeArgs(e.bytes[wire.header_size..e.len], &.{ .uint, .object, .fixed, .fixed, .object }, &vals);
+                return .{ a[0].uint, a[4].object };
+            }
+            return error.NoEnter;
+        }
+    };
+
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 1000, 2560, 5120);
+    const e1 = try Of.enter(&sink, 11);
+    const e2 = try Of.enter(&sink, 31);
+    try std.testing.expectEqual(e1[0], e2[0]); // one serial
+    try std.testing.expect(e1[1] != e2[1] and e1[1] >= objects.server_id_base and e2[1] >= objects.server_id_base);
+    for ([_]u32{ e1[1], e2[1] }) |o| {
+        try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, o, off.eventIndex("offer").?));
+        try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, o, off.eventIndex("source_actions").?));
+    }
+
+    // accept + set_actions on the second device's offer: honoured
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(2, wire.encodeMessage(&buf, e2[1], 0, &.{ .{ .uint = 1 }, .{ .string = "text/plain" } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, e2[1], 4, &.{ .{ .uint = dnd_action_copy }, .{ .uint = dnd_action_copy } }));
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 1, 12, src.eventIndex("target").?));
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, e2[1], off.eventIndex("action").?));
+    try std.testing.expect(comp.drag.?.accepted);
+
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 1100, 2600, 5200);
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, 11, dd.eventIndex("motion").?));
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, 31, dd.eventIndex("motion").?));
+
+    sink.events.clearRetainingCapacity();
+    comp.dragDrop();
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, 11, dd.eventIndex("drop").?));
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 2, 31, dd.eventIndex("drop").?));
+    try std.testing.expectEqual(@as(usize, 1), Of.count(&sink, 1, 12, src.eventIndex("dnd_drop_performed").?));
+
+    // either device's offer carries the transfer to the source
+    comp.onPipeReceive(2, wire.encodeMessage(&buf, e1[1], 1, &.{ .{ .string = "text/plain" }, .fd }), 5);
+    try std.testing.expectEqual(@as(u32, 1), sink.fdmsg_conn);
+    try std.testing.expectEqual(@as(u32, 5), sink.fdmsg_token);
 }
