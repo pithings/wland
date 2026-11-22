@@ -624,6 +624,19 @@ with it. New findings go in the matching section.
   leaves itself (pointer: constraint first, via pointerLeave; keyboard)
   and popup_done to the window's popups, and from then on drops enters
   aimed at its tree; focus handoff stays the embedder's.
+- **Hidden is not minimized** (`Surface.hidden`, `setVisible`: the
+  embedder's window manager hides a window for its own reasons). It shares
+  only the rendering half of minimize: `underHidden` (minimized OR hidden,
+  root of the parent chain) holds frame callbacks in `tick` and discards
+  feedback in `surfaceShown`, and `toplevelStates` adds `suspended` (v6).
+  `underMinimized` keeps the input half (enters dropped, the leaves and
+  popup_done of applyMinimized) to minimized alone: hidden changes no
+  focus, no popup, no interactive event — the embedder routes input and
+  may well keep the keyboard on a hidden window. A configure goes out only
+  when `suspended` changes for the app (not while minimized or the tab is
+  hidden: setSuspended skips hidden windows like minimized ones). Reset
+  with the xdg_toplevel; a session viewer's init shows them all
+  (`resetEmbedderWindows`): the last viewer's window manager hid them.
 - **Pointer constraints: the core is the state machine, the embedder only
   reports the browser** (`Constraint` in compositor.zig). A constraint
   applies while its surface holds pointer focus and starts only with the

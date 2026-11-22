@@ -558,6 +558,16 @@ async function main() {
   const r0 = s.commitEvents;
   await sleep(1000);
   check(s.commitEvents - r0 > 20, `restored: commits again (${s.commitEvents - r0} in 1 s)`);
+  // hidden by the embedder (setVisible): held the same way, not minimized
+  engine.setVisible(shmConn, shmTop.surface, false);
+  await sleep(300);
+  const hid0 = s.commitEvents;
+  await sleep(1000);
+  check(s.commitEvents - hid0 <= 1, `hidden: frame callbacks held, ${s.commitEvents - hid0} commits in 1 s`);
+  engine.setVisible(shmConn, shmTop.surface, true);
+  const v0 = s.commitEvents;
+  await sleep(1000);
+  check(s.commitEvents - v0 > 20, `shown: commits again (${s.commitEvents - v0} in 1 s)`);
   shm.kill();
   await shm.exited;
   await until(() => s.disconnected.includes(shmConn), 3000, 'simple-shm conn close');

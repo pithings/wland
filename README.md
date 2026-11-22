@@ -420,6 +420,19 @@ wl.engine.setBounds(width, height, width - 2 * border, height - titleBar - 2 * b
 within (`configure_bounds`) and the size a maximized window gets; 0×0 goes
 back to the output's size.
 
+Showing and hiding windows can be yours too. With `manageDisplay: false`
+the view never sets a window element's `display` (by default it hides
+minimized windows), so a minimize effect can animate the element away.
+Tell wland when your window manager hides a window for its own reasons
+(a compact mode, another workspace): a hidden window's app stops
+rendering as if minimized (no frame callbacks, `suspended`), but it is not
+minimized and keeps focus; shown again, it draws from where it was.
+
+```js
+const wl = await createWland({ container, mount, unmount, manageDisplay: false });
+wl.engine.setVisible(conn, surface, false);   // or entry.setVisible(false) on wl.windows()
+```
+
 The default wm expects the default mount. With your own frames, your window
 manager can take what it owns and leave the rest (popups, drag and drop, the
 key bindings) to wland's:

@@ -117,7 +117,9 @@ any of them (update this list when it does).
   event (input's `clipboard` hooks), so the app reads the new selection.
 - Window states (maximized, fullscreen, minimized) are core state: the embedder
   asks (`setMaximized/setFullscreen/setMinimized`) and reacts to the events;
-  restoring a minimized window is only ever the embedder's.
+  restoring a minimized window is only ever the embedder's. Hidden
+  (`setVisible`) is the embedder's alone and not a window state: rendered
+  for like minimized (callbacks held, `suspended`), nothing else changes.
 - `activated` follows keyboard focus (keyboardEnter/Leave reconfigure the
   toplevel); a 'surface' event with role none means unmapped — the role
   object went, or attach(NULL) was committed.
