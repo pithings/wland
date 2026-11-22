@@ -96,6 +96,7 @@ const usage_link =
     \\                                is sent the scene and sends input (one at a time, the newest
     \\                                takes over). Needs --buffers copy and --dmabuf off or readback;
     \\                                not with --link-on-demand
+    ++ (if (build_options.session) "\n" else "\n                                (left out of this build: -Dsession=false)\n") ++
     \\  --xwayland MODE  X11 apps through xwayland-satellite, started with the first X client:
     \\
 ;
@@ -141,7 +142,8 @@ const features = blk: {
     // --no-fence-wait; STREAM FEATURE selection_cache (the clipboard
     // bridge); --xwayland; --link-on-demand (with --link-timeout);
     // --profile session
-    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand profile:session";
+    // (-Dsession=false builds lack the last)
+    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand" ++ (if (build_options.session) " profile:session" else "");
 };
 const version_text = "wlandr " ++ build_options.version ++ "\nfeatures: " ++ features ++ "\n";
 
@@ -306,6 +308,10 @@ fn parseArgs(args: anytype, out: anytype) !Options {
         out.print("--link-timeout applies to --link-on-demand only\n\n" ++ usage, .{});
         return error.LinkTimeoutNeedsOnDemand;
     }
+    if (o.profile == .session and !build_options.session) {
+        out.print("--profile session is left out of this build (-Dsession=false)\n\n" ++ usage, .{});
+        return error.SessionNotBuilt;
+    }
     if (o.profile == .session) {
         // v1 of the session host: pixels are BUFFER frames it keeps a copy
         // of (STREAM.md "Profiles"); handles and GPU resources are not
@@ -416,7 +422,8 @@ pub fn main(init: std.process.Init) !void {
     var wayland = try relay_mod.listenWayland(io, socket_path);
     // session: the compositor runs here, on the relay's one lifelong link,
     // before any app can connect (apps then never wait for an engine)
-    const session: ?*Session = if (opts.profile == .session) blk: {
+    // (comptime: -Dsession=false never compiles the host or its compositor)
+    const session: ?*Session = if (build_options.session and opts.profile == .session) blk: {
         const s = try Session.create(gpa, io);
         try s.start(relay);
         std.log.info("profile: session (id {x:0>16}): apps outlive links; engines are viewers", .{s.session_id});
@@ -606,7 +613,10 @@ const DialOptions = struct {
 
 /// One link's life: a viewer of the session host, or the relay's engine.
 fn serveOne(relay: *relay_mod.Relay, link: *@import("link.zig").Link, session: ?*Session) void {
-    if (session) |s| s.serveViewer(link) else relay_mod.serveLink(relay, link);
+    if (build_options.session) {
+        if (session) |s| return s.serveViewer(link);
+    }
+    relay_mod.serveLink(relay, link);
 }
 
 /// Run the relay over a byte-stream link. Frame callbacks: .engine — a
@@ -803,8 +813,10 @@ test {
     _ = @import("relay_test.zig");
     _ = @import("socket.zig");
     _ = @import("xwayland.zig");
-    _ = @import("session.zig");
-    _ = @import("session_test.zig");
+    if (build_options.session) {
+        _ = @import("session.zig");
+        _ = @import("session_test.zig");
+    }
     if (build_options.http) _ = @import("server.zig");
 }
 
@@ -892,16 +904,21 @@ test "arguments are validated whole, whatever their order, before anything is op
     }
     // --profile session: the copy backend, dmabuf off or readback, no on-demand dial
     try std.testing.expectEqual(Profile.passthrough, (try tryArgs(&.{ "--link", "fd:3" })).profile);
-    try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--link", "fd:3", "--profile", "session" })).profile);
-    try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--dmabuf", "readback" })).profile);
     try std.testing.expectEqual(Profile.passthrough, (try tryArgs(&.{ "--link", "fd:3", "--profile", "passthrough", "--buffers", "kwshm" })).profile);
     try std.testing.expectError(error.BadProfile, tryArgs(&.{ "--link", "fd:3", "--profile", "local" }));
     try std.testing.expectError(error.MissingProfileValue, tryArgs(&.{ "--link", "fd:3", "--profile" }));
-    try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--link", "fd:3", "--buffers", "procfd", "--profile", "session" }));
-    try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--profile", "session", "--link", "vsock:2:1", "--buffers", "kwshm" }));
-    try std.testing.expectError(error.SessionNeedsReadback, tryArgs(&.{ "--profile", "session", "--link", "fd:3", "--dmabuf", "virtgpu" }));
-    try std.testing.expectError(error.SessionNotOnDemand, tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--link-on-demand" }));
-    if (build_options.http) try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--port", "0" })).profile);
+    if (build_options.session) {
+        try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--link", "fd:3", "--profile", "session" })).profile);
+        try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--dmabuf", "readback" })).profile);
+        try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--link", "fd:3", "--buffers", "procfd", "--profile", "session" }));
+        try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--profile", "session", "--link", "vsock:2:1", "--buffers", "kwshm" }));
+        try std.testing.expectError(error.SessionNeedsReadback, tryArgs(&.{ "--profile", "session", "--link", "fd:3", "--dmabuf", "virtgpu" }));
+        try std.testing.expectError(error.SessionNotOnDemand, tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--link-on-demand" }));
+        if (build_options.http) try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--port", "0" })).profile);
+    } else {
+        // -Dsession=false: the flag is known, the profile is not there
+        try std.testing.expectError(error.SessionNotBuilt, tryArgs(&.{ "--link", "fd:3", "--profile", "session" }));
+    }
     const o = try tryArgs(&.{ "--link", "vsock:2:1023", "--buffers", "kwshm", "--dmabuf", "virtgpu:/dev/dri/renderD129" });
     try std.testing.expectEqual(buffers.Kind.kwshm, o.buffer_mode);
     try std.testing.expectEqual(std.meta.Tag(dmabuf.Backend).virtgpu, o.dmabuf.?.tag);
@@ -952,8 +969,9 @@ test "--version: the build's version, then one token per feature of this build" 
         }
     }.f;
     try std.testing.expectEqual(build_options.http, has(line, "http"));
-    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand", "profile:session" }) |t|
+    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand" }) |t|
         try std.testing.expect(has(line, t));
+    try std.testing.expectEqual(build_options.session, has(line, "profile:session"));
     try std.testing.expect(std.mem.indexOf(u8, line, "@fake") == null); // test-only, never offered
     try std.testing.expect(std.mem.indexOf(u8, line, "  ") == null); // no empty token
 }

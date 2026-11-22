@@ -19,6 +19,10 @@ pub fn build(b: *std.Build) void {
     // relay executable (wlandr). -Dhttp=false drops the HTTP/WebSocket server
     // (and std.http) for a smaller --link-only build — the shape a guest wants.
     const http = b.option(bool, "http", "Include the HTTP/WebSocket server (default true; false = --link-only)") orelse true;
+    // -Dsession=false leaves out the session profile (--profile session:
+    // session.zig and with it the whole compositor, which a passthrough
+    // relay never runs) — about 40% of the --link-only build.
+    const session = b.option(bool, "session", "Include the session profile, the compositor hosted in the relay (default true)") orelse true;
     // `wlandr --version` prints this: package.json's version unless
     // -Dversion= overrides it. The release workflow sets package.json's
     // (`npm pkg set version=...`) before building, so release binaries carry
@@ -26,6 +30,7 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version wlandr --version prints (default: package.json's)") orelse packageVersion(b);
     const server_options = b.addOptions();
     server_options.addOption(bool, "http", http);
+    server_options.addOption(bool, "session", session);
     server_options.addOption([]const u8, "version", version);
     const options_mod = server_options.createModule();
 
@@ -53,8 +58,9 @@ pub fn build(b: *std.Build) void {
     //   wlandr-linux-<arch>       the full relay (HTTP + WS and --link), at
     //                             -Doptimize (ReleaseFast); the npm package
     //                             ships these.
-    //   wlandr-link-linux-<arch>  -Dhttp=false ReleaseSmall: --link only, the
-    //                             build a VM guest wants (GitHub release only).
+    //   wlandr-link-linux-<arch>  -Dhttp=false -Dsession=false ReleaseSmall:
+    //                             --link only and passthrough only, the build
+    //                             a VM guest wants (GitHub release only).
     // No libc is linked, so all are static and run on any Linux (glibc, musl
     // or neither). The CPU is pinned to the arch's baseline — aarch64:
     // `generic` (ARMv8.0 + NEON, no LSE/CRC/crypto required; atomics are
@@ -63,6 +69,7 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "Build wlandr (full + --link-only) for linux x64 + arm64 (zig-out/release/)");
     const link_options = b.addOptions();
     link_options.addOption(bool, "http", false);
+    link_options.addOption(bool, "session", false);
     link_options.addOption([]const u8, "version", version);
     const link_options_mod = link_options.createModule();
     const releases = [_]struct { arch: std.Target.Cpu.Arch, node: []const u8 }{

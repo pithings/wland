@@ -27,9 +27,9 @@ readback`) or named by their virtio-gpu resource for the page's renderer
 
 ```sh
 zig build                     # wlandr + wland-fixture + wasm (ReleaseFast; wasm → lib/, committed: rebuild after core/ changes)
-zig build release             # static wlandr, linux x64 + arm64 → zig-out/release/: wlandr-linux-* (full, the package ships) + wlandr-link-linux-* (-Dhttp=false ReleaseSmall, guests; GitHub release only)
+zig build release             # static wlandr, linux x64 + arm64 → zig-out/release/: wlandr-linux-* (full, the package ships) + wlandr-link-linux-* (-Dhttp=false -Dsession=false ReleaseSmall, guests; GitHub release only)
 zig build -Doptimize=Debug    # symbols + safety; use when chasing UB
-zig build test                # native unit tests; also run with -Doptimize=Debug and -Dhttp=false
+zig build test                # native unit tests; also run with -Doptimize=Debug, -Dhttp=false and -Dsession=false
 npm test                      # zig test + smoke + typecheck + node --test test/*.test.ts (needs zig build)
 npm run typecheck             # tsc (TypeScript 7) over lib/ and test/
 npm run build                 # obuild: zig builds, then lib/ → dist/ (+ the wasm, the release wlandr binaries brotli'd); dist/ is wlandr's default web root (lib/index.html)

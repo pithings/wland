@@ -46,7 +46,9 @@ with it. New findings go in the matching section.
   ARMv8.0+NEON, atomics as LL/SC, no LSE/CRC/crypto — and x86-64 v1; no libc
   is linked, so they are static whatever the ABI), which its end hook
   brotli-compresses into `dist/wlandr-linux-<arch>.br`. The same step builds
-  `wlandr-link-linux-<arch>` (`-Dhttp=false` ReleaseSmall, the guest build):
+  `wlandr-link-linux-<arch>` (`-Dhttp=false -Dsession=false` ReleaseSmall, the
+  guest build: --link only, passthrough only — the session host and its
+  compositor are ~40% of it otherwise):
   release.yml attaches it to the GitHub release, the npm package leaves it
   out (nothing in it runs a --link-only relay). To check the baseline:
   `llvm-objdump -d --mattr=-all,+v8a,+neon,+fp-armv8` on the arm64 binaries

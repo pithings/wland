@@ -147,7 +147,14 @@ fn handleConn(server: *Server, stream: Io.net.Stream) void {
                 link.init(io, &ws, stream);
                 // returns once no relay (or session) thread can touch
                 // `link` (or `ws`)
-                if (server.session) |s| s.serveViewer(&link.link) else relay_mod.serveLink(server.relay, &link.link);
+                // (comptime: -Dsession=false never compiles the host)
+                if (@import("build_options").session) {
+                    if (server.session) |s| {
+                        s.serveViewer(&link.link);
+                        return;
+                    }
+                }
+                relay_mod.serveLink(server.relay, &link.link);
                 return;
             },
             .other => return,

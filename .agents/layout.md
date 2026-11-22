@@ -19,7 +19,8 @@ Where things live and which file owns what. Details are in the code.
   `--link-on-demand [--link-timeout MS]` (the dial loop `serveStreamLink`, bounded `dialWithin`;
   its state is relay.zig `OnDemand`);
   `--version` (version from package.json via `build.zig`, + a features line);
-  `-Dhttp=false` = a --link-only build).
+  `-Dhttp=false` = a --link-only build, `-Dsession=false` = no
+  `--profile session`: session.zig and the compositor left out).
 - `relay.zig` — app sockets, fd interception, pools, attach/commit tracking,
   the release ledger (`settleRelease`), ACK hand-over, frame-callback
   interception, pipe tokens, SRVOBJ, presentation timestamps (PRESENTED),
