@@ -1055,6 +1055,35 @@ test('view manageDisplay false: the view never writes a window element\'s displa
   }
 });
 
+test('view: `acked` on the window follows the \'acked\' events (the last one), without onWindowsChange; gone with the window', async () => {
+  const dom = installFakeDom();
+  try {
+    let changes = 0;
+    const view = createView({ container: dom.container(), webgl: 'never', onWindowsChange: () => { changes++; } });
+    view.handle({
+      type: 'commit', conn: 1, surface: 5, role: 1, root: 5, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 4, height: 4 }, width: 4, height: 4, logicalWidth: 4, logicalHeight: 4, format: 'rgba', stride: 0,
+      damage: new Int32Array(0), pixels: new Uint8Array(0),
+    });
+    assert.equal(view.window(1, 5)!.acked, null);
+    const before = changes;
+    view.handle({ type: 'acked', conn: 1, surface: 5, serial: 9, width: 300, height: 200 });
+    view.handle({ type: 'acked', conn: 1, surface: 5, serial: 11, width: 320, height: 0 });
+    assert.deepEqual(view.window(1, 5)!.acked, { serial: 11, width: 320, height: 0 });
+    assert.equal(changes, before);
+    view.handle({ type: 'destroy', conn: 1, surface: 5 });
+    view.handle({
+      type: 'commit', conn: 1, surface: 5, role: 1, root: 5, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 4, height: 4 }, width: 4, height: 4, logicalWidth: 4, logicalHeight: 4, format: 'rgba', stride: 0,
+      damage: new Int32Array(0), pixels: new Uint8Array(0),
+    });
+    assert.equal(view.window(1, 5)!.acked, null, 'a new surface with that id starts with none');
+    view.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
 test('wm: Alt+F11 / F10 / F9 act on the focused window, swallowed with their keyup; other modifiers pass; the API calls the engine', async () => {
   const dom = installFakeDom();
   try {

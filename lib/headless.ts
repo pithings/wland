@@ -35,6 +35,7 @@ import { swizzleRect } from './present.ts';
 export type * from './engine.ts';
 export {
   NO_SELECTION_BRIDGE, readSelectionText, setSelectionText, TEXT_MIMES,
+  EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT, EDGE_TOP,
   ROLE_CURSOR, ROLE_DND_ICON, ROLE_NONE, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
 } from './engine.ts';
 
@@ -172,6 +173,12 @@ export interface HeadlessWindow {
    *  like a minimized window (Engine.setVisible) — but not minimized, and
    *  focus stays where it was. */
   hidden: boolean;
+  /** The edges setTiled() last snapped it against (EDGE_* bits; 0 none). */
+  tiled: number;
+  /** The configure the app last acked and committed (AckedEvent): its
+   *  serial and the size it asked; null before any. See ConfigureEvent
+   *  for matching it to a resize() / setTiled() token. */
+  acked: { serial: number; width: number; height: number } | null;
   focused: boolean;
 }
 
@@ -284,8 +291,13 @@ export interface Headless {
   /** Place the window's box at (x, y), output logical px. */
   move(ref: WindowRef, x: number, y: number): void;
   /** Ask the app for a new size (xdg_toplevel.configure, clamped to its
-   *  hints); the scene follows its next commit. */
-  resize(ref: WindowRef, width: number, height: number): void;
+   *  hints); the scene follows its next commit. Returns the call's token
+   *  (Engine.requestResize; 0: nothing sent). */
+  resize(ref: WindowRef, width: number, height: number): number;
+  /** Snap the window against `edges` (Engine.setTiled: the tiled_* states;
+   *  EDGE_* bits, 0 = floating), with a size in the same configure when
+   *  given. Placing the box is move()'s. Returns the call's token. */
+  setTiled(ref: WindowRef, edges: number, width?: number, height?: number): number;
 
   /** Keys go to the focused window; dropped while none has focus. Escape
    *  during a drag cancels it instead, and while the pointer is locked
@@ -435,7 +447,8 @@ interface Surf {
 interface Win {
   key: string; conn: number; surface: number; x: number; y: number; z: number;
   gx: number; gy: number; gw: number; gh: number;
-  maximized: boolean; fullscreen: boolean; minimized: boolean; hidden: boolean; restore: { x: number; y: number } | null;
+  maximized: boolean; fullscreen: boolean; minimized: boolean; hidden: boolean; tiled: number;
+  restore: { x: number; y: number } | null;
 }
 type Target = { key: string; conn: number; surface: number };
 /** An app-initiated move/resize, driven by the scripted pointer. */
@@ -471,6 +484,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   const appIds = new Map<string, string>();
   const limits = new Map<string, { minW: number; minH: number; maxW: number; maxH: number }>(); // toplevel key → size hints
   const decorated = new Set<string>(); // toplevel keys configured server_side
+  const acked = new Map<string, { serial: number; width: number; height: number }>(); // toplevel key → last acked configure
   const popups = new Map<string, { conn: number; surface: number }>(); // mapped popups (wm.ts)
   const textInput = new Set<number>(); // conns with text-input enabled
   const regions = new Map<string, Int32Array>(); // surface key → input region (absent: the whole surface)
@@ -503,7 +517,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       // view.ts's default mount: cascade; the 48px headroom keeps what an
       // app draws above its window geometry on-screen
       win = { key, conn, surface: root, x: 24 + (placed % 8) * 40, y: 48 + (placed % 6) * 36, z: ++zTop,
-        gx: 0, gy: 0, gw: 0, gh: 0, maximized: false, fullscreen: false, minimized: false, hidden: false, restore: null };
+        gx: 0, gy: 0, gw: 0, gh: 0, maximized: false, fullscreen: false, minimized: false, hidden: false, tiled: 0, restore: null };
       placed++;
       wins.set(key, win);
       changed();
@@ -645,7 +659,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   function dropConn(conn: number) {
     for (const [key, s] of surfaces) if (s.conn === conn) surfaces.delete(key);
     for (const key of wins.keys()) if (wins.get(key)!.conn === conn) wins.delete(key);
-    for (const map of [titles, appIds, limits, decorated]) for (const key of map.keys()) if (key.startsWith(`c${conn}s`)) map.delete(key);
+    for (const map of [titles, appIds, limits, decorated, acked]) for (const key of map.keys()) if (key.startsWith(`c${conn}s`)) map.delete(key);
     for (const [key, p] of popups) if (p.conn === conn) popups.delete(key);
     for (const key of regions.keys()) if (key.startsWith(`c${conn}s`)) regions.delete(key);
     textInput.delete(conn);
@@ -672,7 +686,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         if (ev.role !== ROLE_POPUP) popups.delete(keyOf(ev.conn, ev.surface));
         // an unmapped toplevel's states went with its xdg_toplevel
         const win = wins.get(keyOf(ev.conn, ev.surface));
-        if (win && ev.role !== ROLE_TOPLEVEL) { win.maximized = win.fullscreen = win.minimized = win.hidden = false; place(win); }
+        if (win && ev.role !== ROLE_TOPLEVEL) { win.maximized = win.fullscreen = win.minimized = win.hidden = false; win.tiled = 0; place(win); }
         changed();
         break;
       }
@@ -695,6 +709,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         appIds.delete(key);
         limits.delete(key);
         decorated.delete(key);
+        acked.delete(key);
         popups.delete(key);
         regions.delete(key);
         forget((c, s) => c === ev.conn && s === ev.surface);
@@ -743,6 +758,9 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         if (ev.decorated) decorated.add(keyOf(ev.conn, ev.surface));
         else decorated.delete(keyOf(ev.conn, ev.surface));
         changed();
+        break;
+      case 'acked':
+        acked.set(keyOf(ev.conn, ev.surface), { serial: ev.serial, width: ev.width, height: ev.height });
         break;
       case 'text-input':
         if (ev.active) textInput.add(ev.conn); else textInput.delete(ev.conn);
@@ -1191,6 +1209,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       height: win.fullscreen ? output.height : win.gh || root.logicalHeight,
       originX: o.x, originY: o.y, z: win.z,
       maximized: win.maximized, fullscreen: win.fullscreen, minimized: win.minimized, hidden: win.hidden,
+      tiled: win.tiled, acked: acked.get(win.key) ?? null,
       focused: !!active && active.conn === win.conn && active.surface === win.surface,
     };
   };
@@ -1275,7 +1294,13 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     },
     resize(ref, width, height) {
       const win = wins.get(refKey(ref));
-      if (win) engine.requestResize(win.conn, win.surface, width, height);
+      return win ? engine.requestResize(win.conn, win.surface, width, height) : 0;
+    },
+    setTiled(ref, edges, width, height) {
+      const win = toplevel(ref);
+      if (!win) return 0;
+      win.tiled = edges & 15;
+      return engine.setTiled(win.conn, win.surface, edges, width, height);
     },
 
     keyDown,
@@ -1355,6 +1380,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       appIds.clear();
       limits.clear();
       decorated.clear();
+      acked.clear();
       popups.clear();
       regions.clear();
       active = hover = pressed = grab = dnd = lock = null;

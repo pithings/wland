@@ -92,6 +92,12 @@ export interface ViewWindow {
   maximized: boolean;
   fullscreen: boolean;
   minimized: boolean;
+  /** The configure the app last acked and committed (AckedEvent): its
+   *  serial and the size it asked (0 = the app's choice); null before any.
+   *  Compare the serial with the one your requestResize / setTiled call's
+   *  configure carried (ConfigureEvent.cause) to know it was answered. Not
+   *  announced through onWindowsChange: watch the 'acked' event. */
+  acked: { serial: number; width: number; height: number } | null;
 }
 
 export interface ViewOptions {
@@ -240,6 +246,7 @@ export function createView(options: ViewOptions): View {
   const appIds = new Map<string, string>(); // toplevel key → app id (likewise)
   const limits = new Map<string, { minW: number; minH: number; maxW: number; maxH: number }>(); // toplevel key → size hints
   const decorated = new Set<string>(); // toplevel keys configured server_side (likewise)
+  const acked = new Map<string, { serial: number; width: number; height: number }>(); // toplevel key → last acked configure
   const cursors = new Map<number, Cursor>(); // conn → its pointer image
   const imageSet = imageSetFn();
   let overlay: { s: Surface; hx: number; hy: number } | null = null; // the cursor canvas following the pointer
@@ -367,6 +374,7 @@ export function createView(options: ViewOptions): View {
     appIds.delete(key);
     limits.delete(key);
     decorated.delete(key);
+    acked.delete(key);
   }
 
   // dnd icons live in the container itself (no window), fixed, input-inert;
@@ -743,7 +751,7 @@ export function createView(options: ViewOptions): View {
         cursors.delete(ev.conn);
         for (const s of surfaces.values()) if (s.conn === ev.conn) dropSurface(s);
         for (const win of windows.values()) if (win.conn === ev.conn) dropWindow(win.key);
-        for (const map of [titles, appIds, limits, decorated]) for (const key of map.keys()) if (key.startsWith(`c${ev.conn}s`)) map.delete(key);
+        for (const map of [titles, appIds, limits, decorated, acked]) for (const key of map.keys()) if (key.startsWith(`c${ev.conn}s`)) map.delete(key);
         onWindowsChange();
         break;
       }
@@ -766,6 +774,9 @@ export function createView(options: ViewOptions): View {
         if (ev.decorated) decorated.add(keyOf(ev.conn, ev.surface));
         else decorated.delete(keyOf(ev.conn, ev.surface));
         onWindowsChange();
+        break;
+      case 'acked':
+        acked.set(keyOf(ev.conn, ev.surface), { serial: ev.serial, width: ev.width, height: ev.height });
         break;
       case 'maximize':
       case 'fullscreen':
@@ -804,6 +815,7 @@ export function createView(options: ViewOptions): View {
     decorated: decorated.has(win.key),
     minW: 0, minH: 0, maxW: 0, maxH: 0, ...limits.get(win.key),
     maximized: win.maximized, fullscreen: win.fullscreen, minimized: win.minimized,
+    acked: acked.get(win.key) ?? null,
   });
 
   return {
@@ -863,6 +875,7 @@ export function createView(options: ViewOptions): View {
       appIds.clear();
       limits.clear();
       decorated.clear();
+      acked.clear();
       for (const [k, v] of Object.entries(savedStyle)) cstyle[k] = v;
       onWindowsChange();
     },

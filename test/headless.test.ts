@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { crc32, inflateSync } from 'node:zlib';
-import { createHeadless, encodePNG, type Headless, type HeadlessOptions } from '../lib/headless.ts';
+import { createHeadless, EDGE_LEFT, encodePNG, type Headless, type HeadlessOptions } from '../lib/headless.ts';
 import { stackOrder, type BufferHandle, type Engine, type Event, type HandleSource, type Link, type LinkCallbacks } from '../lib/engine.ts';
 
 // --- STREAM frames + wayland wire ------------------------------------------
@@ -125,7 +125,7 @@ type Call = [string, ...unknown[]];
 const TIMED: Record<string, number> = { pointerMotion: 1, pointerButton: 1, pointerAxis: 1, key: 1, dragMotion: 2 };
 function spy(engine: Engine, rels: number[][]): Call[] {
   const calls: Call[] = [];
-  const e = engine as unknown as Record<string, (...a: unknown[]) => void>;
+  const e = engine as unknown as Record<string, (...a: unknown[]) => unknown>;
   for (const name of ['pointerEnter', 'pointerLeave', 'pointerMotion', 'pointerButton', 'pointerAxis',
     'keyboardEnter', 'keyboardLeave', 'key', 'textInputCommit', 'popupDismiss', 'requestResize',
     'dragMotion', 'dragDrop', 'dragCancel', 'pointerLockGranted', 'pointerLockLost', 'tick',
@@ -139,7 +139,7 @@ function spy(engine: Engine, rels: number[][]): Call[] {
       }
       if (name in TIMED) shown.splice(TIMED[name], 1);
       calls.push([name, ...shown]);
-      orig(...args);
+      return orig(...args);
     };
   }
   return calls;
@@ -294,7 +294,7 @@ test('scene: windows cascade, take focus on map, and go away with their surface 
   const [w1] = hl.windows();
   assert.deepEqual({ ...w1 }, {
     key: `c1s${ta.surface}`, conn: 1, surface: ta.surface, title: 'first', appId: '', decorated: false, minW: 0, minH: 0, maxW: 0, maxH: 0,
-    x: 24, y: 48, width: 40, height: 30, originX: 24, originY: 48, z: w1.z, maximized: false, fullscreen: false, minimized: false, hidden: false, focused: true,
+    x: 24, y: 48, width: 40, height: 30, originX: 24, originY: 48, z: w1.z, maximized: false, fullscreen: false, minimized: false, hidden: false, tiled: 0, acked: null, focused: true,
   });
   assert.deepEqual(calls, [['keyboardEnter', 1, ta.surface]]);
   assert.ok(changes > 0, 'onWindowsChange');
@@ -918,6 +918,27 @@ test('setVisible: a hidden window is neither drawn nor hit, keeps focus and stay
   assert.deepEqual(calls, [['setVisible', 2, tb.surface, true]]);
   assert.equal(hl.window(kb)!.hidden, false);
   assert.deepEqual(px(hl.screenshot(), 70, 90), [0, 255, 0, 255], 'its last buffer, at once');
+  hl.dispose();
+});
+
+test('setTiled / resize: tokens, the app\'s ack + commit is the window\'s `acked` (the configure acked and the size it asked); `tiled` is what was set', async () => {
+  const ctx = await setup();
+  const { hl, events } = ctx;
+  const a = client(ctx, 1);
+  const t = a.toplevel('tiled');
+  a.paint(t.surface, 40, 30, [255, 0, 0, 255]);
+  const k = `c1s${t.surface}`;
+  assert.equal(hl.window(k)!.acked, null);
+  const tok = hl.setTiled(k, EDGE_LEFT, 60, 50);
+  assert.ok(tok > 0);
+  assert.equal(hl.window(k)!.tiled, EDGE_LEFT);
+  const cfg = events.find((e) => e.type === 'configure' && e.cause === tok);
+  assert.ok(cfg && cfg.type === 'configure' && cfg.width === 60 && cfg.height === 50);
+  // (xdg_wm_base v1 here: no tiled state in what the app was told)
+  assert.equal(cfg.type === 'configure' && cfg.tiled, 0);
+  assert.equal(hl.resize(k, 70, 55), tok + 1);
+  a.send(msg(t.xdg, 4, cfg.serial), msg(t.surface, 6)); // ack the first, commit
+  assert.deepEqual(hl.window(k)!.acked, { serial: cfg.serial, width: 60, height: 50 });
   hl.dispose();
 });
 
