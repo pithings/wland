@@ -11,14 +11,16 @@
 // The types below are the contract.
 
 import { createEngine, createWsLink, type Engine, type Event, type GpuSource, type HandleSource, type Link } from './engine.ts';
-import { createView, watchOutput, type View } from './view.ts';
+import { createView, watchOutput, type OutputControl, type OutputWatch, type View } from './view.ts';
 import { createInput, type Input } from './input.ts';
 import { createWindowManager, type WindowManager } from './wm.ts';
+import { createClipboardBridge, type ClipboardBridge } from './clipboard.ts';
 
 export * from './engine.ts';
 export * from './view.ts';
 export * from './input.ts';
 export * from './wm.ts';
+export * from './clipboard.ts';
 
 export interface WlandOptions {
   /** Windows live in here. A positioned, fixed-size box: its client size is
@@ -37,11 +39,16 @@ export interface WlandOptions {
    *  holding its current content, row 0 at the top. The view draws it into
    *  the surface's canvas during the commit's dispatch (2D: the damaged
    *  rects; WebGL: the whole image as the texture), then the engine calls
-   *  release(image) and ACKs. */
+   *  release(image) and ACKs. Without it, apps on `wlandr --dmabuf virtgpu`
+   *  are offered no linux-dmabuf and render in software (wl_shm). */
   gpu?: GpuSource<CanvasImageSource>;
   /** Default: wland.wasm next to the engine module. */
   wasm?: string | URL | BufferSource | WebAssembly.Module;
-  /** Pin an integer scale; default tracks devicePixelRatio live. */
+  /** Pin the scale apps render at: a device pixel ratio, integer or
+   *  fractional (1.5), finite and > 0 (anything else rejects createWland
+   *  with a RangeError, as output.setScale throws one). Default:
+   *  devicePixelRatio, tracked live. Either way `output.setScale` changes it
+   *  after start. */
   scale?: number;
   /** See ViewOptions.webgl. */
   webgl?: 'auto' | 'always' | 'never';
@@ -52,6 +59,16 @@ export interface WlandOptions {
   /** The window manager's Alt+F9/F10/F11 bindings (minimize, maximize,
    *  fullscreen). Default true. */
   shortcuts?: boolean;
+  /** Bridge the Wayland clipboard and the page's clipboard (plain text,
+   *  both ways; lib/clipboard.ts): an app's copy made while the desktop has
+   *  focus reaches the page clipboard when the browser allows a write (a
+   *  key or click in the desktop), a paste in the desktop (Ctrl+V,
+   *  Shift+Insert; Cmd+V on Apple platforms) hands the page clipboard's
+   *  text to the focused app. It never reads the page clipboard outside a
+   *  paste unless the browser already granted clipboard-read. Default true;
+   *  false: the Wayland clipboard stays inside the desktop (and the copy /
+   *  paste chords go to the apps as plain keys). */
+  clipboard?: boolean;
   /** Every engine event (after the view, input and window manager saw it),
    *  plus the view's and window manager's log lines as 'log' events. A
    *  commit's `pixels` may no longer be readable here (the view presented
@@ -87,6 +104,12 @@ export interface Wland {
   view: View;
   input: Input;
   wm: WindowManager;
+  /** The output apps see. It follows `container`'s client size (a
+   *  ResizeObserver: resizing the container is all a page's layout has to
+   *  do) and devicePixelRatio; setSize / setScale pin either one from
+   *  then on, null follows the page again. Don't call engine.setOutput /
+   *  setScale yourself: the next resize or dpr change would undo it. */
+  output: OutputControl;
   windows(): WindowEntry[];
   /** Unmount wland without a page reload: disposes the engine (closes the
    *  link and every buffer token; nothing is emitted after it), stops the
@@ -96,8 +119,6 @@ export interface Wland {
   dispose(): void;
 }
 
-/** Resolves once the core is loaded and the link is starting; rejects if the
- *  wasm can't load. */
 /** The display's frame interval (ms) from successive rAF timestamps: the
  *  median of the last 15 deltas, so dropped frames and a hidden tab's gap
  *  don't move it; 0 until 5 are known. rAF follows the display's refresh
@@ -119,9 +140,16 @@ function frameInterval(): (time: number) => number {
   };
 }
 
+/** Resolves once the core is loaded and the link is starting; rejects if the
+ *  wasm can't load or an option is invalid, having undone everything it set
+ *  up (no listener, observer, element or link is left behind). */
 export async function createWland(options: WlandOptions): Promise<Wland> {
-  const { container } = options;
+  const { container, scale } = options;
   if (!container) throw new Error('createWland: options.container is required');
+  // checked before anything exists (watchOutput would throw it too, later)
+  if (scale != null && !(typeof scale === 'number' && Number.isFinite(scale) && scale > 0)) {
+    throw new RangeError(`createWland: scale ${scale} is not a positive number`);
+  }
   const onEvent = options.onEvent || (() => {});
   const onWindowsChange = options.onWindowsChange || (() => {});
   // a throwing consumer must not cost the others the event: report it
@@ -132,72 +160,90 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
   const log = (line: string) => each(onEvent, { type: 'log', line });
 
   const view = createView({ container, webgl: options.webgl, log, onWindowsChange });
-  let input: Input, wm: WindowManager; // set before the link starts: events only flow after engine.start()
+  // set before the link starts: events only flow after engine.start()
+  let engine: Engine | undefined, input: Input | undefined, wm: WindowManager | undefined;
+  let clip: ClipboardBridge | null = null;
+  let output: OutputWatch | undefined;
   let raf = 0; // the frame loop's pending request; 0 = not running
   let disposed = false;
-  const engine = await createEngine({
-    wasm: options.wasm,
-    link: options.link || createWsLink(
-      `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`),
-    buffers: options.buffers,
-    gpu: options.gpu,
-    // a 2D-only view takes buffer-source commits swizzled by the core; a GL
-    // view takes the rows as written (its shader swaps channels)
-    rgba: !view.webgl,
-    onEvent(ev) {
-      // the view first: a commit's pixels are only valid during dispatch,
-      // and may be invalid once anything has called back into the engine
-      each(view.handle, ev);
-      each(input.handle, ev);
-      each(wm.handle, ev);
-      each(onEvent, ev);
-      // one frame loop for the engine's life (a stream link may open again)
-      if (ev.type === 'open' && !raf && !disposed) raf = requestAnimationFrame(frame);
-    },
-  });
-  input = createInput({ engine, view, container, onFocusChange: onWindowsChange });
-  wm = createWindowManager({ engine, view, input, container, log,
-    browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts });
-  const unwatch = watchOutput(engine, container, options.scale);
+  // undo whatever exists, in dispose order; safe at any point of construction
+  const teardown = () => {
+    disposed = true;
+    engine?.dispose(); // first: no event reaches the parts below any more
+    cancelAnimationFrame(raf);
+    output?.();
+    wm?.dispose();
+    clip?.dispose();
+    input?.dispose();
+    view.dispose();
+  };
+  try {
+    engine = await createEngine({
+      wasm: options.wasm,
+      link: options.link || createWsLink(
+        `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`),
+      buffers: options.buffers,
+      gpu: options.gpu,
+      // a 2D-only view takes buffer-source commits swizzled by the core; a GL
+      // view takes the rows as written (its shader swaps channels)
+      rgba: !view.webgl,
+      onEvent(ev) {
+        // the view first: a commit's pixels are only valid during dispatch,
+        // and may be invalid once anything has called back into the engine
+        each(view.handle, ev);
+        each(input!.handle, ev);
+        each(wm!.handle, ev);
+        if (clip) each(clip.handle, ev);
+        each(onEvent, ev);
+        // one frame loop for the engine's life (a stream link may open again)
+        if (ev.type === 'open' && !raf && !disposed) raf = requestAnimationFrame(frame);
+      },
+    });
+    if (options.clipboard !== false) clip = createClipboardBridge({ engine, container, log });
+    input = createInput({ engine, view, container, onFocusChange: onWindowsChange, clipboard: clip?.hooks });
+    wm = createWindowManager({ engine, view, input, container, log,
+      browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts });
+    output = watchOutput(engine, container, scale);
+  } catch (e) {
+    teardown();
+    throw e;
+  }
+  const eng = engine, inp = input, mgr = wm, out = output;
 
   // frame callbacks and presentation feedback follow the page's frame
   // clock; rAF's timestamps also measure the display's frame interval
   const interval = frameInterval();
   const frame = (t: number) => {
-    engine.tick(t, interval(t));
+    eng.tick(t, interval(t));
     if (!disposed) raf = requestAnimationFrame(frame); // (an event may have disposed us)
   };
 
-  engine.start();
+  eng.start();
 
   return {
-    engine, view, input, wm,
+    engine: eng, view, input: inp, wm: mgr,
+    // inert after dispose (watchOutput's stop makes them no-ops)
+    output: { setSize: out.setSize, setScale: out.setScale, state: out.state },
     dispose() {
       if (disposed) return;
-      disposed = true;
-      engine.dispose(); // first: no event reaches the parts below any more
-      cancelAnimationFrame(raf);
-      unwatch();
-      wm.dispose();
-      input.dispose();
-      view.dispose();
+      teardown();
     },
     windows: () => view.windows().map((w) => ({
       key: w.key,
       title: w.title,
-      focused: input.focused(w.conn, w.surface),
+      focused: inp.focused(w.conn, w.surface),
       maximized: w.maximized,
       fullscreen: w.fullscreen,
       minimized: w.minimized,
       raise() {
-        if (view.window(w.conn, w.surface)?.minimized) return wm.restore(w.conn, w.surface);
+        if (view.window(w.conn, w.surface)?.minimized) return mgr.restore(w.conn, w.surface);
         view.raise(w.conn, w.surface);
-        input.focus(w.conn, w.surface);
+        inp.focus(w.conn, w.surface);
       },
-      minimize: () => wm.minimize(w.conn, w.surface),
-      restore: () => wm.restore(w.conn, w.surface),
-      setMaximized: (on: boolean) => wm.setMaximized(w.conn, w.surface, on),
-      setFullscreen: (on: boolean) => wm.setFullscreen(w.conn, w.surface, on),
+      minimize: () => mgr.minimize(w.conn, w.surface),
+      restore: () => mgr.restore(w.conn, w.surface),
+      setMaximized: (on: boolean) => mgr.setMaximized(w.conn, w.surface, on),
+      setFullscreen: (on: boolean) => mgr.setFullscreen(w.conn, w.surface, on),
     })),
   };
 }

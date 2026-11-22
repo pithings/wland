@@ -28,7 +28,9 @@
 //     after). 2D: clearRect + drawImage per damage rect (the whole image
 //     scaled to the buffer if its size differs). GL: the whole image
 //     uploaded as the texture (texImage2D from the source, no CPU copy).
-//     null: nothing drawn, the canvas keeps its content.
+//     null: nothing drawn, the canvas keeps its content (the engine then
+//     makes the surface's next commit's damage the whole buffer, so 2D
+//     never paints a few rects over that stale content).
 // Alpha policy is the copy path's everywhere: bgrx/xrgb opaque, bgra's
 // premultiplied alpha passed through unchanged (premultipliedAlpha:false, like
 // a 2D canvas's straight alpha — the approximation the copy path always made).
@@ -279,7 +281,15 @@ export function makeGLPresenter(canvas: HTMLCanvasElement, log: Log, onLost: () 
           for (let r = 0; r < h; r++) repack.set(pixels.subarray(off + r * stride, off + r * stride + w * 4), r * w * 4);
           src = repack.subarray(0, n);
         }
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, src);
+        try {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, src);
+        } catch (e) {
+          // pixels in a SharedArrayBuffer (HandleSource.view) where this
+          // browser's WebGL won't take shared views: upload a copy
+          if (!(src.buffer instanceof ArrayBuffer) && e instanceof TypeError) {
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, src.slice());
+          } else throw e;
+        }
       });
       if (rowLength) gl.pixelStorei((gl as WebGL2RenderingContext).UNPACK_ROW_LENGTH, 0);
       draw();

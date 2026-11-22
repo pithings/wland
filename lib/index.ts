@@ -16,16 +16,24 @@ const pkgRoot = fileURLToPath(new URL('..', import.meta.url));
  * carries it brotli-compressed next to this module
  * (`wlandr-<platform>-<arch>.br`); the first call unpacks it into the user's
  * cache directory, later calls (and later processes) reuse that file.
+ * Throws on a platform the relay can't run on (it is Linux-only): the
+ * package installs anywhere, since its browser side (wland/client,
+ * wland/engine, wland/headless) runs anywhere. `platform` / `arch` default
+ * to this process's.
  */
-export function serverBinary(): string {
+export function serverBinary(platform: string = process.platform, arch: string = process.arch): string {
+  if (platform !== 'linux') {
+    throw new Error(
+      `the wlandr relay runs on Linux only (it passes Wayland's file descriptors over unix sockets); this is ${platform}-${arch}. ` +
+      'The browser side (wland/client, wland/engine, wland/headless) works on any platform: point it at a wlandr ' +
+      'running on Linux (a machine, VM or container).',
+    );
+  }
   const local = join(pkgRoot, 'zig-out/bin/wlandr');
-  if (existsSync(local)) return local;
-  const packed = fileURLToPath(new URL(`./wlandr-${process.platform}-${process.arch}.br`, import.meta.url));
+  if (arch === process.arch && existsSync(local)) return local;
+  const packed = fileURLToPath(new URL(`./wlandr-linux-${arch}.br`, import.meta.url));
   if (existsSync(packed)) return unpack(packed);
-  throw new Error(
-    `no wlandr binary for ${process.platform}-${process.arch} (the server is ` +
-    'Linux-only — it relays SCM_RIGHTS fds over unix sockets). In a checkout, run `zig build`.',
-  );
+  throw new Error(`no wlandr binary for linux-${arch} (the package ships x64 and arm64). In a checkout, run \`zig build\`.`);
 }
 
 let unpacked: string | undefined;
@@ -158,7 +166,8 @@ export function startServer(options: ServerOptions = {}): Promise<ServerInfo> {
   const webRoot = options.webRoot ?? join(pkgRoot, 'dist');
   const runtimeDir = options.runtimeDir ?? process.env.XDG_RUNTIME_DIR ?? '/tmp/wland-run';
   const onLog = options.onLog ?? ((text: string) => { process.stderr.write(text); });
-  const bin = serverBinary();
+  let bin: string;
+  try { bin = serverBinary(); } catch (e) { return Promise.reject(e); } // (not Linux: a rejection, as for any start failure)
   mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   const args = ['--port', String(port), '--web-root', webRoot];
   if (options.host) args.push('--host', options.host);
@@ -255,7 +264,8 @@ const SOCKET_PATH_MAX = 107;
  */
 export function startRelay(options: RelayOptions = {}): Promise<RelayInfo> {
   const onLog = options.onLog ?? ((text: string) => { process.stderr.write(text); });
-  const bin = serverBinary();
+  let bin: string;
+  try { bin = serverBinary(); } catch (e) { return Promise.reject(e); }
   let ownDir: string | undefined;
   if (options.runtimeDir === undefined) {
     // $TMPDIR can be deep; the socket path cannot

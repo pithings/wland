@@ -28,13 +28,25 @@
 // can drop whatever it dresses windows in (shadows). Positions stay the
 // window manager's (wm.ts puts maximized and fullscreen windows at 0,0).
 //
+// Within a window the canvases stack as Wayland does (engine `stackOrder`:
+// subsurfaces above their parent or placed below it, popups above their
+// parent's subtree), and subsurfaces and popups move or restack when the
+// engine says another commit did that ('position': a popup following its
+// parent's window geometry, a parent's commit applying place_above).
+//
+// The container is the lib's: the view sets what touch input and window
+// stacking need on it (`touch-action: none` — else the browser claims a
+// touch drag as a pan and cancels it —, no text selection or touch callout,
+// `isolation: isolate` so window z-indexes stay inside it) and puts the old
+// values back on dispose. Its size, position and overflow are the page's.
+//
 // The view only consumes events (handle) and never calls the engine, so the
 // engine may live on another thread. Where window elements go is the
 // embedder's call: by default they are cascaded inside `container`, or pass
 // `mount`/`unmount` to host each one in your own window frame. The types
 // below are the contract.
 
-import type { CommitEvent, Engine, Event, Role } from './engine.ts';
+import { stackOrder, type CommitEvent, type Engine, type Event, type Role } from './engine.ts';
 import { make2DPresenter, makeGLPresenter, probeWebGL, type Pixels, type Presenter } from './present.ts';
 
 export interface ViewWindow {
@@ -114,9 +126,9 @@ export interface View {
    *  before its first commit. */
   readPixels(conn: number, surface: number): Pixels | null;
   /** Unmount every window and drop every canvas and presenter (WebGL
-   *  contexts included), and remove its document listeners (pointermove/
+   *  contexts included), remove its document listeners (pointermove/
    *  pointerdown: the pointer position, for a cursor image drawn as an
-   *  element; pointerlockchange). */
+   *  element; pointerlockchange) and put back the container styles it set. */
   dispose(): void;
 }
 
@@ -138,6 +150,10 @@ interface Win {
  *  for the canvas as hit target while there is one. */
 interface Surface {
   key: string; conn: number; surface: number; role: Role; root: number;
+  /** What it hangs from (CommitEvent.parent), its place among its
+   *  siblings (CommitEvent.z) and its creation order: the stacking
+   *  (restack). */
+  parent: number; z: number; seq: number;
   canvas: HTMLCanvasElement; presenter: Presenter | null; force2d: boolean; focusable: boolean;
   region: Int32Array | null; hit: HTMLElement | null;
   /** Presents so far and the last one's logical size (cursor images). */
@@ -153,6 +169,11 @@ interface Cursor { css: string; surface: number; hx: number; hy: number; image: 
 /** Browsers' cap on a CSS cursor image, CSS px a side (Chromium and Firefox
  *  ignore larger ones); above it the image is drawn as an element. */
 const CURSOR_MAX = 128;
+
+/** What the view sets on the container (and restores on dispose). */
+const CONTAINER_STYLE: Record<string, string> = {
+  touchAction: 'none', userSelect: 'none', webkitUserSelect: 'none', webkitTouchCallout: 'none', isolation: 'isolate',
+};
 
 // image-set() for a hi-dpi cursor image: the unprefixed or the -webkit-
 // spelling, '' when neither parses (then only a 1:1 image goes to CSS)
@@ -208,6 +229,14 @@ export function createView(options: ViewOptions): View {
   const stats = { webgl: 0, canvas2d: 0 };
   let zTop = 100;
   let placed = 0;
+  let seq = 0;
+  // touch drags are the lib's, not the browser's pans (see the file comment)
+  const cstyle = container.style as unknown as Record<string, string>;
+  const savedStyle: Record<string, string> = {};
+  for (const [k, v] of Object.entries(CONTAINER_STYLE)) {
+    savedStyle[k] = cstyle[k] ?? '';
+    cstyle[k] = v;
+  }
 
   function raiseWindow(win: { element: HTMLElement }) {
     win.element.style.zIndex = String(++zTop);
@@ -266,7 +295,7 @@ export function createView(options: ViewOptions): View {
     const key = keyOf(conn, surface);
     let s = surfaces.get(key);
     if (!s) {
-      s = { key, conn, surface, role: ROLE_NONE, root: surface, canvas: newCanvas(key),
+      s = { key, conn, surface, role: ROLE_NONE, root: surface, parent: 0, z: 0, seq: seq++, canvas: newCanvas(key),
             presenter: null, force2d: false, focusable: false, region: null, hit: null,
             frames: 0, lw: 0, lh: 0, url: '', urlFrame: 0 };
       surfaces.set(key, s);
@@ -389,7 +418,6 @@ export function createView(options: ViewOptions): View {
         st.position = 'absolute';
         st.left = `${ev.x}px`;
         st.top = `${ev.y}px`;
-        st.zIndex = ev.role === ROLE_POPUP ? '20' : '10';
         box(win, ev);
         break;
       }
@@ -442,6 +470,26 @@ export function createView(options: ViewOptions): View {
                           ['zIndex', cs.zIndex], ['display', display], ['clipPath', clip || '']] as const) {
       if (hs[k] !== v) hs[k] = v;
     }
+  }
+
+  // The window's canvases in Wayland's stacking order (engine stackOrder),
+  // as z-indexes inside the window element: the toplevel at the bottom
+  // unless a subsurface is placed below it. Run when the window's set of
+  // surfaces, their roles, parents or sibling order change.
+  function restack(conn: number, root: number) {
+    const win = windows.get(keyOf(conn, root));
+    if (!win) return;
+    const members: Surface[] = [];
+    for (const s of surfaces.values()) {
+      if (s.conn !== conn || s.root !== root || s.canvas.parentElement !== win.origin) continue;
+      if (s.role === ROLE_TOPLEVEL || s.role === ROLE_SUBSURFACE || s.role === ROLE_POPUP) members.push(s);
+    }
+    stackOrder(members, root).forEach((s, i) => {
+      const z = s.surface === root && i === 0 ? '' : String(i);
+      if (s.canvas.style.zIndex === z) return;
+      s.canvas.style.zIndex = z;
+      if (s.hit) s.hit.style.zIndex = z;
+    });
   }
 
   // --- pointer images ------------------------------------------------------
@@ -553,9 +601,15 @@ export function createView(options: ViewOptions): View {
       case 'commit': {
         const s = recordFor(ev.conn, ev.surface);
         const listed = s.role === ROLE_TOPLEVEL;
+        const parent = ev.parent ?? (ev.role === ROLE_TOPLEVEL ? 0 : ev.root), z = ev.z ?? 0;
+        const parentEl = s.canvas.parentElement;
+        const restacks = s.role !== ev.role || s.root !== ev.root || s.parent !== parent || s.z !== z;
         s.role = ev.role;
         s.root = ev.root;
+        s.parent = parent;
+        s.z = z;
         const mapped = layout(s, ev);
+        if (restacks || s.canvas.parentElement !== parentEl) restack(ev.conn, ev.root);
         // windows() lists a window once its root is a toplevel: a window made
         // by its decorations' commits (subsurfaces, foot's order) shows up
         // only at the toplevel's own first commit
@@ -593,11 +647,16 @@ export function createView(options: ViewOptions): View {
         // start_drag; popup roles die while the surface lives on)
         const s = surfaces.get(keyOf(ev.conn, ev.surface));
         if (s) {
+          const oldRoot = s.root;
           s.role = ev.role;
           s.root = ev.root;
+          s.parent = ev.parent ?? (ev.role === ROLE_TOPLEVEL ? 0 : ev.root);
+          s.z = ev.z ?? 0;
           if (ev.role === ROLE_DND_ICON) layoutIcon(s);
           else if ((ev.role === ROLE_CURSOR || ev.role === ROLE_NONE) && (!overlay || overlay.s !== s)) s.canvas.style.display = 'none';
           applyRegion(s);
+          restack(ev.conn, ev.root);
+          if (oldRoot !== ev.root) restack(ev.conn, oldRoot);
         }
         // an unmapped toplevel's window must not linger as an invisible
         // hit target; its next toplevel commit shows it again (its states
@@ -613,9 +672,24 @@ export function createView(options: ViewOptions): View {
       case 'destroy': {
         const key = keyOf(ev.conn, ev.surface);
         const s = surfaces.get(key);
-        if (s) dropSurface(s);
+        if (s) { dropSurface(s); restack(s.conn, s.root); }
         else { dropWindow(key); titles.delete(key); }
         onWindowsChange();
+        break;
+      }
+      case 'position': {
+        // moved by another surface's commit (a popup following its parent's
+        // window geometry): the canvas and its hit element follow; or
+        // restacked by its parent's (place_above / place_below)
+        const s = surfaces.get(keyOf(ev.conn, ev.surface));
+        if (!s || (s.role !== ROLE_SUBSURFACE && s.role !== ROLE_POPUP)) break;
+        s.canvas.style.left = `${ev.x}px`;
+        s.canvas.style.top = `${ev.y}px`;
+        applyRegion(s);
+        if (ev.z !== undefined && ev.z !== s.z) {
+          s.z = ev.z;
+          restack(ev.conn, s.root);
+        }
         break;
       }
       case 'disconnect': {
@@ -719,6 +793,7 @@ export function createView(options: ViewOptions): View {
       for (const s of [...surfaces.values()]) dropSurface(s);
       for (const key of [...windows.keys()]) dropWindow(key);
       titles.clear();
+      for (const [k, v] of Object.entries(savedStyle)) cstyle[k] = v;
       onWindowsChange();
     },
   };
@@ -737,43 +812,133 @@ function regionPath(region: Int32Array, w: number, h: number): string {
   return d && `path('${d}')`;
 }
 
+/** What watchOutput last told the engine (OutputControl.state). */
+export interface OutputState {
+  /** The output size in logical (CSS) px: what maximize and fullscreen
+   *  fill, wl_output's mode. 0 × 0 until a size is known. */
+  width: number;
+  height: number;
+  /** The device pixel ratio apps are told to render at (1.5 → wl_output
+   *  scale 2 and a fractional-scale preference of 1.5). */
+  scale: number;
+  /** Set by setSize / setScale; false = following the container /
+   *  devicePixelRatio. */
+  sizePinned: boolean;
+  scalePinned: boolean;
+}
+
+/** The output's controls after start (createWland's `output`). Invalid
+ *  values throw a RangeError and change nothing; after dispose (or the
+ *  watch stopped) every call does nothing. */
+export interface OutputControl {
+  /** Pin the output size in logical px, rounded (apps see it; the container
+   *  keeps its own size: size it to match, or windows may lie outside it),
+   *  or null to follow the container's client size again. Each side must be
+   *  finite and round to at least 1. */
+  setSize(size: { width: number; height: number } | null): void;
+  /** Pin the scale: a device pixel ratio, integer (2) or fractional (1.5),
+   *  finite and > 0, or null to follow devicePixelRatio again. */
+  setScale(scale: number | null): void;
+  state(): OutputState;
+}
+
+/** watchOutput's result: call it to stop watching; it is also the
+ *  output's OutputControl. */
+export type OutputWatch = (() => void) & OutputControl;
+
 /**
  * Keep the engine's output in step with the page: `container`'s size
  * (ResizeObserver → setOutput; what maximize fills), tab visibility (→
  * setSuspended) and the device pixel ratio (→ setScale: integer wl_output
- * scale + the fractional preferred scale, tracked live). `scale` pins an
- * integer scale instead of tracking devicePixelRatio. Returns the function
- * that stops watching (observer, listeners).
+ * scale + the fractional preferred scale, tracked live). `scale` pins a
+ * scale (integer or fractional) instead of tracking devicePixelRatio.
+ * A container with no size (display: none, detached) is not an output size:
+ * the last one stays (apps' maximized windows would be configured to 1 × 1).
+ * Returns the function that stops watching (observer, listeners), which
+ * also carries setSize / setScale to pin either after start, and null to
+ * follow the page again; once stopped they do nothing.
+ * Invalid values throw a RangeError and change nothing: a scale that is not
+ * a finite number > 0 (at start too, before anything is set up), a size
+ * that is not finite or rounds below 1 px.
  */
-export function watchOutput(engine: Engine, container: HTMLElement, scale?: number): () => void {
-  const sendSize = () => engine.setOutput(container.clientWidth, container.clientHeight);
-  const resize = new ResizeObserver(sendSize);
+export function watchOutput(engine: Engine, container: HTMLElement, scale?: number): OutputWatch {
+  const positive = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+  if (scale != null && !positive(scale)) throw new RangeError(`wland output: scale ${scale} is not a positive number`);
+  const state: OutputState = { width: 0, height: 0, scale: 1, sizePinned: false, scalePinned: false };
+  let stopped = false;
+  const size = (width: number, height: number) => {
+    state.width = Math.round(width);
+    state.height = Math.round(height);
+    engine.setOutput(state.width, state.height);
+  };
+  const follow = (force = false) => {
+    const w = container.clientWidth, h = container.clientHeight;
+    if (!state.sizePinned && w > 0 && h > 0 && (force || w !== state.width || h !== state.height)) size(w, h);
+  };
+  const resize = new ResizeObserver(() => follow());
   resize.observe(container);
-  sendSize();
+  follow();
 
   const sendVisibility = () => engine.setSuspended(document.hidden);
   document.addEventListener('visibilitychange', sendVisibility);
   sendVisibility();
 
+  const dpr = (v: number) => {
+    state.scale = v;
+    engine.setScale(v, v * 120);
+  };
+  // a `(resolution: Ndppx)` query flips exactly when dpr leaves its current
+  // value (browser zoom, moving the tab across displays); re-arm each time
   let media: MediaQueryList | null = null; // the armed resolution query
-  const stop = () => {
-    resize.disconnect();
-    document.removeEventListener('visibilitychange', sendVisibility);
+  const disarm = () => {
     if (media) media.removeEventListener('change', watch);
     media = null;
   };
-  if (scale) {
-    engine.setScale(scale, scale * 120);
-    return stop;
-  }
-  // a `(resolution: Ndppx)` query flips exactly when dpr leaves its current
-  // value (browser zoom, moving the tab across displays); re-arm each time
-  const dpr = () => window.devicePixelRatio || 1;
   function watch() {
-    engine.setScale(dpr(), dpr() * 120);
-    media = matchMedia(`(resolution: ${dpr()}dppx)`);
+    disarm();
+    const v = window.devicePixelRatio || 1;
+    dpr(v);
+    media = matchMedia(`(resolution: ${v}dppx)`);
     media.addEventListener('change', watch, { once: true });
   }
-  watch();
-  return stop;
+  const pinScale = (v: number | null) => {
+    if (stopped) return;
+    if (v === null) {
+      state.scalePinned = false;
+      watch();
+      return;
+    }
+    if (!positive(v)) throw new RangeError(`wland output: scale ${v} is not a positive number`);
+    disarm();
+    state.scalePinned = true;
+    dpr(v);
+  };
+  if (scale != null) pinScale(scale);
+  else watch();
+
+  const stop = () => {
+    stopped = true;
+    resize.disconnect();
+    document.removeEventListener('visibilitychange', sendVisibility);
+    disarm();
+  };
+  return Object.assign(stop, {
+    setSize(pin: { width: number; height: number } | null) {
+      if (stopped) return;
+      if (pin === null) {
+        state.sizePinned = false;
+        follow(true);
+        return;
+      }
+      // a size that rounds to 0 is the 1 × 1 maximize the follow() guard keeps out
+      const px = (v: unknown) => positive(v) && Math.round(v as number) >= 1;
+      if (!pin || !px(pin.width) || !px(pin.height)) {
+        throw new RangeError(`wland output: size ${pin && `${pin.width} × ${pin.height}`} is not two finite sizes of at least 1 px`);
+      }
+      state.sizePinned = true;
+      size(pin.width, pin.height);
+    },
+    setScale: pinScale,
+    state: (): OutputState => ({ ...state }),
+  });
 }

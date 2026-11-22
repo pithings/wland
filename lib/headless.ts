@@ -25,13 +25,14 @@
 // loading gets node:fs via process.getBuiltinModule, for a file: URL).
 
 import {
-  createEngine, createStreamLink, createWsLink, inRegion,
+  createEngine, createStreamLink, createWsLink, inRegion, readSelectionText, setSelectionText, stackOrder,
   type CommitEvent, type Engine, type Event, type GpuRef, type GpuSource, type HandleSource, type Link, type Role,
   type StreamSource,
 } from './engine.ts';
 import { swizzleRect } from './present.ts';
 
 export type * from './engine.ts';
+export { NO_SELECTION_BRIDGE, readSelectionText, setSelectionText, TEXT_MIMES } from './engine.ts';
 
 export interface HeadlessOptions {
   /** The relay: a Link, a WebSocket URL (`ws://host:port/ws` →
@@ -46,7 +47,9 @@ export interface HeadlessOptions {
    *  virtgpu): resolve a GPU buffer to its pixels as an RgbaImage of the
    *  ref's size (row 0 at the top; a different size is cropped, not scaled), copied
    *  into the scene during the commit. Without it a GPU surface is laid out
-   *  but stays empty; either way HeadlessSurface.gpu names the buffer. */
+   *  but stays empty, and in front of `wlandr --dmabuf virtgpu` apps are
+   *  offered no linux-dmabuf (they render in software over wl_shm); either
+   *  way HeadlessSurface.gpu names the buffer. */
   gpu?: GpuSource<RgbaImage>;
   /** EngineOptions.wasm (default: wland.wasm next to the engine module). */
   wasm?: string | URL | BufferSource | WebAssembly.Module;
@@ -253,7 +256,9 @@ export interface Headless {
   /** Keys go to the focused window; dropped while none has focus. Escape
    *  during a drag cancels it instead, and while the pointer is locked
    *  breaks the lock (breakLock), as a browser does — swallowed either way;
-   *  so are the window bindings (HeadlessOptions.shortcuts). */
+   *  so are the window bindings (HeadlessOptions.shortcuts). NumLock is
+   *  on and Caps Lock off until 'NumLock' / 'CapsLock' is pressed (or
+   *  engine.keyboardLocks sets them): 'Numpad7' types a 7. */
   keyDown(key: Key): void;
   keyUp(key: Key): void;
   /** Press the keys in order, release them in reverse: press('ControlLeft',
@@ -314,6 +319,22 @@ export interface Headless {
    *  commit. */
   surfacePixels(conn: number, surface: number): RgbaImage | null;
 
+  /** The clipboard (wl_data_device selection) as text: read from the app
+   *  that owns it through the relay (readSelectionText; the best text type
+   *  it offers), or null — empty, no text, over `maxBytes` (default 16
+   *  MiB), no answer within `timeout` ms. The selection's owner and types:
+   *  engine.selection(); its changes: 'selection' events. Rejects at once
+   *  with Error(NO_SELECTION_BRIDGE) when the relay can't bridge the
+   *  clipboard (engine.selectionBridged() false: wlandr 0.1.0). */
+  readClipboard(options?: { maxBytes?: number; timeout?: number }): Promise<string | null>;
+  /** Make `text` the clipboard selection (setSelectionText: the
+   *  compositor's own source, under every text type), as a page paste does;
+   *  like any selection only the focused window is offered it. '' or null
+   *  clears it if it is still this one. False while the link is not open,
+   *  or when the relay can't bridge the clipboard (logged once per link:
+   *  NO_SELECTION_BRIDGE; no app is offered it). */
+  writeClipboard(text: string | null): boolean;
+
   /** Dispose the engine (closes the link; nothing is emitted after it) and
    *  stop the clock. */
   dispose(): void;
@@ -339,6 +360,11 @@ const EVDEV: Record<string, number | undefined> = {
   F11: 87, F12: 88, ControlRight: 97, AltRight: 100, Home: 102, ArrowUp: 103,
   PageUp: 104, ArrowLeft: 105, ArrowRight: 106, End: 107, ArrowDown: 108,
   PageDown: 109, Insert: 110, Delete: 111, MetaLeft: 125, MetaRight: 126,
+  // the keypad and the rest of a full keyboard (all in the core's keymap)
+  NumLock: 69, ScrollLock: 70, Numpad7: 71, Numpad8: 72, Numpad9: 73, NumpadSubtract: 74,
+  Numpad4: 75, Numpad5: 76, Numpad6: 77, NumpadAdd: 78, Numpad1: 79, Numpad2: 80,
+  Numpad3: 81, Numpad0: 82, NumpadDecimal: 83, IntlBackslash: 86, NumpadEnter: 96,
+  NumpadDivide: 98, PrintScreen: 99, NumpadEqual: 117, Pause: 119, ContextMenu: 127,
 };
 
 // character → [evdev code, shift] on the US layout (the core's canned keymap)
@@ -361,10 +387,11 @@ const keyOf = (conn: number, surface: number) => `c${conn}s${surface}`;
 const refKey = (ref: WindowRef) => (typeof ref === 'string' ? ref : keyOf(ref.conn, ref.surface));
 const now = () => performance.now() >>> 0;
 
-/** A surface and its pixels. `seq` is the first-commit order: siblings
- *  stack in it, as canvases appended to a window element do. */
+/** A surface and its pixels. `parent` (CommitEvent.parent), `z`
+ *  (CommitEvent.z) and `seq`, the first-commit order, are its stacking
+ *  (engine stackOrder, as the view's). */
 interface Surf {
-  key: string; conn: number; surface: number; role: Role; root: number;
+  key: string; conn: number; surface: number; role: Role; root: number; parent: number; z: number;
   x: number; y: number; width: number; height: number; logicalWidth: number; logicalHeight: number;
   data: Uint8Array<ArrayBuffer>; commits: number; seq: number; mapped: boolean; gpu?: GpuRef;
 }
@@ -518,7 +545,8 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   }
 
   // A GPU commit: the damaged rects of the resolved image (tight RGBA rows
-  // of its own width), cropped to both sizes. No image: nothing changes.
+  // of its own width), cropped to both sizes. No image: nothing changes
+  // (and the engine makes the surface's next commit's damage whole).
   function latchImage(s: Surf, ev: CommitEvent) {
     const img = ev.image as RgbaImage | null | undefined;
     if (!img) return;
@@ -538,13 +566,15 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     const key = keyOf(ev.conn, ev.surface);
     let s = surfaces.get(key);
     if (!s) {
-      s = { key, conn: ev.conn, surface: ev.surface, role: ev.role, root: ev.root, x: 0, y: 0, width: 0, height: 0,
+      s = { key, conn: ev.conn, surface: ev.surface, role: ev.role, root: ev.root, parent: 0, z: 0, x: 0, y: 0, width: 0, height: 0,
         logicalWidth: 0, logicalHeight: 0, data: new Uint8Array(0), commits: 0, seq: seq++, mapped: false };
       surfaces.set(key, s);
     }
     latch(s, ev);
     s.role = ev.role;
     s.root = ev.root;
+    s.parent = ev.parent ?? (ev.role === ROLE_TOPLEVEL ? 0 : ev.root);
+    s.z = ev.z ?? 0;
     s.x = ev.x;
     s.y = ev.y;
     s.logicalWidth = ev.logicalWidth;
@@ -602,12 +632,23 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         // set_cursor, dnd icons, popup roles dying while the surface lives):
         // drawing and hit-testing gate on the current role
         const s = surfaces.get(keyOf(ev.conn, ev.surface));
-        if (s) { s.role = ev.role; s.root = ev.root; }
+        if (s) { s.role = ev.role; s.root = ev.root; s.parent = ev.parent ?? (ev.role === ROLE_TOPLEVEL ? 0 : ev.root); s.z = ev.z ?? 0; }
         if (ev.role !== ROLE_POPUP) popups.delete(keyOf(ev.conn, ev.surface));
         // an unmapped toplevel's states went with its xdg_toplevel
         const win = wins.get(keyOf(ev.conn, ev.surface));
         if (win && ev.role !== ROLE_TOPLEVEL) { win.maximized = win.fullscreen = win.minimized = false; place(win); }
         changed();
+        break;
+      }
+      case 'position': {
+        // moved by another surface's commit (a popup following its
+        // parent's window geometry), or restacked by its parent's
+        const s = surfaces.get(keyOf(ev.conn, ev.surface));
+        if (s && (s.role === ROLE_SUBSURFACE || s.role === ROLE_POPUP)) {
+          s.x = ev.x;
+          s.y = ev.y;
+          if (ev.z !== undefined) s.z = ev.z;
+        }
         break;
       }
       case 'destroy': {
@@ -772,17 +813,15 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     return !!root && root.role === ROLE_TOPLEVEL && root.commits > 0;
   };
   const shown = (win: Win) => visible(win) && !win.minimized;
-  // a window's surfaces bottom to top: toplevel, subsurfaces, popups
+  // a window's surfaces bottom to top, as Wayland stacks them (engine
+  // stackOrder): drawn in this order, hit-tested in reverse
   function layers(win: Win): Surf[] {
-    const subs: Surf[] = [], pops: Surf[] = [];
+    const members: Surf[] = [surfaces.get(win.key)!];
     for (const s of surfaces.values()) {
       if (s.conn !== win.conn || s.root !== win.surface || s.surface === win.surface) continue;
-      if (s.role === ROLE_SUBSURFACE) subs.push(s);
-      else if (s.role === ROLE_POPUP) pops.push(s);
+      if (s.role === ROLE_SUBSURFACE || s.role === ROLE_POPUP) members.push(s);
     }
-    subs.sort((a, b) => a.seq - b.seq);
-    pops.sort((a, b) => a.seq - b.seq);
-    return [surfaces.get(win.key)!, ...subs, ...pops];
+    return stackOrder(members, win.surface);
   }
   const stacked = () => [...wins.values()].filter(shown).sort((a, b) => a.z - b.z);
 
@@ -1232,6 +1271,9 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       const s = surfaces.get(keyOf(conn, surface));
       return s ? { width: s.width, height: s.height, data: s.data.slice() } : null;
     },
+
+    readClipboard: (opts) => readSelectionText(engine, opts),
+    writeClipboard: (text) => setSelectionText(engine, text),
 
     dispose() {
       if (disposed) return;

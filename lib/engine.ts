@@ -11,7 +11,8 @@
 //   adapter posts events across and turns calls into messages; nothing here
 //   returns a value a caller depends on.
 // - A commit event's `pixels` is a VIEW (into the link message, into wasm
-//   memory or into the staging buffer), valid only while the event is being
+//   memory, into the staging buffer or into the buffer source's own memory,
+//   HandleSource.view), valid only while the event is being
 //   dispatched. Consume it synchronously (paint, upload, or copy); a Worker
 //   adapter copies it and may transfer the copy. No second copy is made on
 //   the same-thread path. The same goes for a GPU commit's `image` (what
@@ -46,7 +47,9 @@ export type { ByteStream, StreamSource } from './link-stream.ts';
 // an adapter: post events to the page, post calls to the worker.
 //
 // Pixel lifetime: CommitEvent.pixels is a VIEW into the link message, into
-// wasm memory or into the engine's staging buffer. It is valid only while the
+// wasm memory, into the engine's staging buffer or into the buffer source's
+// memory (HandleSource.view: possibly a SharedArrayBuffer; `slice()` still
+// makes an ordinary copy). It is valid only while the
 // event is being dispatched (inside onEvent). Consume it synchronously — paint
 // it, upload it, or copy it. A Worker adapter copies it (`ev.pixels.slice()`)
 // and may transfer the copy. Everything else in an event (including `damage`)
@@ -111,10 +114,14 @@ export interface EngineOptions {
    *  are acknowledged without presenting. */
   buffers?: HandleSource;
   /** Resolves the GPU resources a relay names instead of shipping pixels
-   *  (COMMIT kind virtgpu; wlandr doesn't emit it yet); see GpuSource.
-   *  Without it, the first such commit raises an 'error' event; every one
-   *  is still dispatched (format 'gpu', `image` null: the surface
-   *  is laid out, its content not updated) and acknowledged. */
+   *  (COMMIT kind virtgpu: `wlandr --dmabuf virtgpu[:NODE]`); see GpuSource.
+   *  Without it the compositor offers no linux-dmabuf to a relay whose
+   *  dmabufs are GPU resources (its FEATURE dmabuf_kind), so GPU clients
+   *  render in software over wl_shm rather than into windows nothing could
+   *  show. Should such commits arrive anyway (a relay naming wl_shm buffers
+   *  as resources), the first raises an 'error' event; every one is still
+   *  dispatched (format 'gpu', `image` null: the surface is laid out, its
+   *  content not updated) and acknowledged. */
   gpu?: GpuSource;
   /** Deliver buffer-source commits as 'rgba' (packed per damage rect, the
    *  layout BUFFER frames carry) instead of 'bgra'/'bgrx' rows: the core's
@@ -161,16 +168,42 @@ export type BufferHandle =
  *   any read with a promise (each read is then a round trip).
  *   Throw/reject if the memory is gone (only happens while the app's
  *   connection is ending): that commit is skipped and acknowledged.
+ *   Not called for a COMMIT that readv() or view() (below) served.
+ * - readv() (optional; used instead of read() when present): the same
+ *   spans, all of one COMMIT in ONE call — `reads` in ascending offset
+ *   order, disjoint, each as read() would get it — and one promise if any.
+ *   For a source whose reads are round trips (memory in a worker): one
+ *   round trip per commit that copies only the damaged spans, where read()
+ *   would copy everything from the first damaged byte to the last. The
+ *   `dst`s are views of one staging buffer, valid until the call (or its
+ *   promise) settles. Same failure rule as read().
+ * - view() (optional; tried first when present): synchronous, no copy by
+ *   the source. Return views of the memory itself covering handle bytes
+ *   [offset, offset + length) — one Uint8Array, or several (scattered page
+ *   runs) that follow each other in order and add up to `length` — or
+ *   null/undefined to decline (the engine then uses readv()/read() for this
+ *   COMMIT). `length` is the committed buffer's extent (its first byte to
+ *   its last pixel's), one call per COMMIT. The engine copies the damaged
+ *   spans out of several views; ONE view it hands to the commit event as
+ *   `pixels` with no copy at all (the WebGL presenter uploads straight from
+ *   it). The views must stay readable until the commit's dispatch returns,
+ *   which means the memory must not change owner or move because of an
+ *   engine call made from that dispatch; the engine keeps none of them
+ *   afterwards. They may view a SharedArrayBuffer (memory another thread
+ *   owns): the relay doesn't release the wl_buffer before the ACK, which
+ *   follows the dispatch, so a well-behaved client isn't writing. Throw if
+ *   the memory is gone (same rule as read()); views that don't add up to
+ *   `length` fail the COMMIT the same way.
  * - close(): on HANDLE_CLOSE, for every handle of a connection when the app
  *   disconnects, and for all handles when the link closes — exactly once per
- *   token open() returned, and never while a read() of that token is pending
- *   (a close that falls due meanwhile, e.g. the link closing, waits until the
- *   read's promise settles). Never throws, also when the memory is already gone
+ *   token open() returned, and never while a read()/readv() of that token is
+ *   pending (a close that falls due meanwhile, e.g. the link closing, waits
+ *   until the read's promise settles). Never throws, also when the memory is already gone
  *   (export released, process exited); fire-and-forget any async work. Must
  *   not disturb other tokens: the same memory may be open under two handles.
  *
- * Sync or async: open() and read() may return a Promise. While one is
- * pending the engine processes no further link frames (later frames and
+ * Sync or async: open(), read() and readv() may return a Promise. While one
+ * is pending the engine processes no further link frames (later frames and
  * messages queue, in order; input calls carry on, tick() ships motion but
  * fires no frame callbacks), so ordering is kept. A plain return value takes
  * the synchronous path: no promise is made and nothing is copied twice.
@@ -178,22 +211,37 @@ export type BufferHandle =
  * unkernel:
  *   - kernel on the engine's thread (inline mode, or the engine running in
  *     the kernel's worker): open = check the export exists (a guest export's
- *     page list is at the host before its id can arrive); read = copy the
- *     page runs into `dst` synchronously (kwshm's `views()` are scattered page
- *     runs, valid only until the kernel runs again — use them inside read()
- *     and keep nothing). A token must stay bound to its export: once the
- *     guest releases it, read() fails rather than resolving the id again.
+ *     page list is at the host before its id can arrive); view =
+ *     `file.views(offset, length)` (kwshm's views are scattered page runs,
+ *     valid only until the kernel runs again — the engine is done with them
+ *     before that), or read = copy those runs into `dst`. A token must stay
+ *     bound to its export: once the guest releases it, view()/read() fail
+ *     rather than resolving the id again.
  *   - kernel in a worker, engine on the page: the host only gets copies,
  *     asynchronously (`ShmFile.read()` resolves when the kernel next yields):
- *     open = `vm.shm.openId(id)`, read = `dst.set(await file.read(offset,
- *     dst.length))`.
+ *     open = `vm.shm.openId(id)`, readv = `Promise.all(reads.map(async (r)
+ *     => r.dst.set(await file.read(r.offset, r.dst.length))))` — the calls
+ *     are posted together, so the commit waits for one kernel yield, not
+ *     one per span. (A worker whose kernel memory were a SharedArrayBuffer
+ *     shared with the page could offer view() instead: no round trip.)
  * No change notification and no refresh: the engine reads at commit time, and
  * a handle's size never changes (the relay opens a new handle instead).
  */
 export interface HandleSource<T = any> {
   open(handle: BufferHandle, conn: number): T | Promise<T>;
   read(token: T, offset: number, dst: Uint8Array): void | Promise<void>;
+  /** All spans of one COMMIT in one call; see above. */
+  readv?(token: T, reads: readonly HandleRead[]): void | Promise<void>;
+  /** The memory itself, no copy, synchronously; null declines. See above. */
+  view?(token: T, offset: number, length: number): Uint8Array | readonly Uint8Array[] | null | undefined;
   close(token: T): void;
+}
+
+/** One span of a HandleSource.readv(): copy `dst.length` bytes from handle
+ *  byte `offset` into `dst`. */
+export interface HandleRead {
+  offset: number;
+  dst: Uint8Array;
 }
 
 // --- GPU buffers (STREAM.md COMMIT kind virtgpu) ---------------------------
@@ -235,8 +283,10 @@ export interface GpuRef {
  * - resolve(): while the engine processes the COMMIT naming the resource,
  *   from its own thread, one at a time. Return the resource's CURRENT
  *   content (what the guest rendered before this commit), or null to show
- *   nothing new (the surface keeps its last content). Throwing counts as
- *   null and is logged. May return a Promise: the engine then processes no
+ *   nothing new (the surface keeps its last content, and the surface's
+ *   next commit — `damage` here and on the event — is the whole buffer:
+ *   the relay can't know this one was missed). Throwing counts as null and
+ *   is logged. May return a Promise: the engine then processes no
  *   further link frames until it settles (as with HandleSource), so order
  *   holds; prefer synchronous.
  * - The result rides the commit event (`image`). Consumers draw it during
@@ -254,9 +304,10 @@ export interface GpuRef {
 export interface GpuSource<T = unknown> {
   resolve(ref: GpuRef, commit: { conn: number; surface: number; damage: Int32Array }): T | null | Promise<T | null>;
   /** The image resolve() returned has been drawn (its commit's dispatch
-   *  returned): close it (ImageBitmap/VideoFrame) or recycle it. Not called
-   *  for an image whose commit was never dispatched (the link closed
-   *  while the promise was pending) — that one is simply dropped. */
+   *  returned): close it (ImageBitmap/VideoFrame) or recycle it. Called for
+   *  every non-null image resolve() produced, also one whose promise
+   *  settled after the link closed or the engine was disposed (its commit
+   *  is never dispatched nor ACKed). */
   release?(image: T): void;
 }
 
@@ -333,8 +384,17 @@ export interface Engine {
   pointerAxis(conn: number, time: number, axis: 0 | 1, value: number, value120: number): void;
   keyboardEnter(conn: number, surface: number): void;
   keyboardLeave(conn: number): void;
-  /** code: linux evdev keycode. */
+  /** code: linux evdev keycode. Caps Lock (58) and NumLock (69) presses
+   *  toggle the seat's lock modifiers. */
   key(conn: number, time: number, code: number, pressed: boolean): void;
+  /** The keyboard's real Caps Lock / NumLock state (the browser's
+   *  getModifierState): the seat's locked modifiers are set to it, and
+   *  focused apps are told if that changed them. Call it before a key whose
+   *  meaning depends on them (keypad digits need NumLock). The seat's state
+   *  — this call's, then any Caps Lock / NumLock presses — carries over a
+   *  link reopen (a call while the link is closed wins). Until called
+   *  NumLock is on and Caps Lock off. */
+  keyboardLocks(capsLock: boolean, numLock: boolean): void;
   /** The browser locked its pointer for the lock a 'pointer-lock' event
    *  asked for (pointerlockchange to that surface's element): the app is
    *  told `locked`. Report only grants of the lock asked for last. */
@@ -371,6 +431,42 @@ export interface Engine {
   dragMotion(conn: number, surface: number, time: number, x: number, y: number): void;
   dragDrop(): void;
   dragCancel(): void;
+
+  // --- clipboard (wl_data_device selection; not the primary) ---
+  /** The clipboard selection now: its owner (0 = the embedder's own, or
+   *  none) and the mime types it offers ([] = empty). See SelectionEvent. */
+  selection(): { conn: number; mimes: string[] };
+  /** Whether this link's relay bridges the clipboard for the embedder
+   *  (its FEATURE selection_cache): true — setSelection and readSelection
+   *  work; false — a relay that predates it (wlandr 0.1.0): setSelection
+   *  sets nothing (false), readSelection rejects with
+   *  NO_SELECTION_BRIDGE, apps' selections still work between apps;
+   *  null — not known yet (no link, or none of its frames past the
+   *  FEATUREs has arrived; by an app's first CONN_OPEN it is known).
+   *  Decided again on every link. */
+  selectionBridged(): boolean | null;
+  /** Make the clipboard selection the embedder's own (the page's
+   *  clipboard, say): it replaces an app's selection (that source is
+   *  cancelled) and, like any selection, reaches only the keyboard-focused
+   *  client, which reads it through the relay (the core keeps the bytes and
+   *  answers each receive; the relay writes them into the app's pipe).
+   *  Keys are mime types; a string is stored UTF-8, and the same value
+   *  (string or Uint8Array) under several types is kept once.
+   *  `null` clears the selection if it is still the embedder's own (never an
+   *  app's). False: not set (the link is not open, its relay can't bridge
+   *  the clipboard (selectionBridged() not true: logged once per link), no
+   *  entry, a mime longer than 256 bytes, more than 32 types, over 64 MiB
+   *  in all). */
+  setSelection(data: Record<string, string | Uint8Array> | null): boolean;
+  /** Read the clipboard selection as `mime` from the app that owns it
+   *  (through the relay: a pipe it reads, bounded). Resolves the bytes, or
+   *  null: no selection, `mime` not offered, the app wrote more than
+   *  `maxBytes` (default 16 MiB) or did not finish within `timeout` ms
+   *  (default 5000; the relay gives up at 5 s whatever this says), or the
+   *  link closed. The embedder's own selection resolves from what it set.
+   *  Rejects at once with Error(NO_SELECTION_BRIDGE) when the link's relay
+   *  can't read selections (selectionBridged() false). */
+  readSelection(mime: string, options?: { maxBytes?: number; timeout?: number }): Promise<Uint8Array | null>;
 }
 
 // --- events ---------------------------------------------------------------
@@ -379,7 +475,8 @@ export type Event =
   | OpenEvent | ErrorEvent | CloseEvent | LogEvent
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
   | TitleEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
-  | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent;
+  | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
+  | SelectionEvent | PositionEvent;
 
 /** The link is up and the compositor initialised; input calls work now. */
 export interface OpenEvent { type: 'open' }
@@ -399,6 +496,10 @@ export interface SurfaceEvent {
   role: Role;
   /** The toplevel at the top of its parent chain (itself if none). */
   root: number;
+  /** See CommitEvent.parent. */
+  parent?: number;
+  /** See CommitEvent.z. */
+  z?: number;
 }
 
 /** Pixel formats a commit can carry ('gpu': none — see CommitEvent.gpu):
@@ -425,7 +526,24 @@ export interface CommitEvent {
   surface: number;
   role: Role;
   root: number;
-  /** Position relative to the root's origin (subsurfaces, popups), logical px. */
+  /** The surface it hangs from — a subsurface's parent, a popup's parent
+   *  xdg surface — 0 for a toplevel or none: stacking is by this tree (a
+   *  subsurface above its parent unless placed below it, a popup above its
+   *  parent and that parent's subsurfaces; see `z` and `stackOrder`).
+   *  Absent (an embedder's own event): `root` for a subsurface or popup. */
+  parent?: number;
+  /** A subsurface's place in its parent's stack (wl_subsurface.place_above
+   *  / place_below, as of the parent's last commit): 1, 2, … above the
+   *  parent from the bottom up, −1, −2, … below it — drawn UNDER the parent
+   *  surface (video players put the video there) —, the closest first; 0
+   *  for any other role. It changes when the app restacks its subsurfaces:
+   *  then a 'position' event says so. Absent (an embedder's own event): 0,
+   *  siblings oldest first above their parent. */
+  z?: number;
+  /** Position relative to the root's origin (subsurfaces, popups), logical
+   *  px. A later commit of another surface in the window can move it (a
+   *  popup follows its parent's window geometry; a subsurface its parent
+   *  popup's reposition): then a 'position' event says so. */
   x: number;
   y: number;
   /** The window (`root`, a toplevel) is maximized / fullscreen /
@@ -453,7 +571,12 @@ export interface CommitEvent {
   /** Bytes per row of `pixels` for 'bgra'/'bgrx'; 0 for 'rgba' (packed per
    *  rect, no common stride). */
   stride: number;
-  /** Damage rects in buffer px, [x, y, w, h] per rect. Owned by the event. */
+  /** Damage rects in buffer px, [x, y, w, h] per rect, relative to the
+   *  content the surface's previous commit event delivered: copying just
+   *  these onto it gives the whole buffer. So it is the whole buffer when
+   *  that previous event delivered nothing (a 'gpu' commit with a null
+   *  `image`), when a COMMIT was not delivered at all (a failed read), for
+   *  a surface's first commit, and after a size change. Owned by the event. */
   damage: Int32Array;
   /** A VIEW valid only during dispatch, and only until the dispatch calls
    *  back into the engine (see "Pixel lifetime" at the top).
@@ -470,13 +593,30 @@ export interface CommitEvent {
   gpu?: GpuRef;
   /** format 'gpu': what EngineOptions.gpu resolved `gpu` to, valid only
    *  during dispatch (draw it, don't keep it); null without a resolver or
-   *  when it found nothing (keep showing the last content). */
+   *  when it found nothing (keep showing the last content; the next
+   *  commit's damage is then the whole buffer). */
   image?: unknown;
 }
 
 export interface DestroyEvent { type: 'destroy'; conn: number; surface: number }
+/** A subsurface or popup moved or was restacked without a commit of its
+ *  own: its parent chain changed (a popup's parent window geometry — a CSD
+ *  window maximizing —, a parent popup's reposition, a parent subsurface's
+ *  set_position), or its parent's commit applied a place_above /
+ *  place_below. `x`/`y`/`z` as CommitEvent's: from the root's origin, the
+ *  place among its siblings (absent: unchanged). */
+export interface PositionEvent { type: 'position'; conn: number; surface: number; x: number; y: number; z?: number }
 /** The app hung up; drop everything for this conn. */
 export interface DisconnectEvent { type: 'disconnect'; conn: number }
+/** The clipboard selection changed: an app set or cleared it, its source or
+ *  conn went, the embedder set its own (setSelection), or the link closed.
+ *  `conn`: the app that owns it (0 = the embedder's own, or none);
+ *  `mimes`: the types it offers ([] = the clipboard is empty). An app's
+ *  `conn` with no `mimes` is that app clearing it (set_selection(null));
+ *  `conn` 0 with none: its owner went (source destroyed, app gone, link
+ *  closed) or the embedder cleared its own. Read the data with
+ *  readSelection. Not the primary selection. */
+export interface SelectionEvent { type: 'selection'; conn: number; mimes: string[] }
 export interface TitleEvent { type: 'title'; conn: number; surface: number; title: string }
 /** The pointer image `conn` set while its surface holds the pointer; the
  *  last of these wins until the pointer leaves the client's surfaces.
@@ -566,12 +706,88 @@ export interface RelativeMotion { dx: number; dy: number; dxUnaccel?: number; dy
 /** Whether surface-local point (x, y) is in an input region
  *  (InputRegionEvent.region; null = the whole surface). Bounds against the
  *  surface itself are the caller's. */
+/** What readSelection (readSelectionText, wland/headless readClipboard)
+ *  rejects with, and what's logged when setSelection is refused, on a link
+ *  whose relay can't bridge the clipboard (Engine.selectionBridged() false:
+ *  no FEATURE selection_cache, e.g. wlandr 0.1.0). */
+export const NO_SELECTION_BRIDGE: string = 'relay does not support clipboard bridging (no FEATURE selection_cache: wlandr 0.1.0?)';
+
+/** The clipboard types plain text goes by, best first: what a text read
+ *  asks the app for (the first one its selection offers) and what a text
+ *  selection the embedder sets offers (wl-copy's set, all UTF-8). */
+export const TEXT_MIMES: readonly string[] = ['text/plain;charset=utf-8', 'UTF8_STRING', 'text/plain', 'TEXT', 'STRING'];
+
+/** The clipboard selection as UTF-8 text (Engine.readSelection with the
+ *  best text type it offers), or null: no text in it, too large, timed
+ *  out. A malformed sequence decodes to U+FFFD. Rejects with
+ *  Error(NO_SELECTION_BRIDGE) on a link whose relay can't read it. */
+export async function readSelectionText(engine: Engine, options?: { maxBytes?: number; timeout?: number }): Promise<string | null> {
+  if (engine.selectionBridged() === false) throw new Error(NO_SELECTION_BRIDGE);
+  const offered = engine.selection().mimes;
+  const mime = TEXT_MIMES.find((m) => offered.includes(m));
+  if (!mime) return null;
+  const bytes = await engine.readSelection(mime, options);
+  return bytes ? new TextDecoder().decode(bytes) : null;
+}
+
+/** Make `text` the clipboard selection (Engine.setSelection under every
+ *  TEXT_MIMES type, one copy); '' or null clears the embedder's own. */
+export function setSelectionText(engine: Engine, text: string | null): boolean {
+  if (!text) return engine.setSelection(null);
+  const data: Record<string, string> = {};
+  for (const m of TEXT_MIMES) data[m] = text;
+  return engine.setSelection(data);
+}
+
 export function inRegion(region: Int32Array | null, x: number, y: number): boolean {
   if (!region) return true;
   for (let i = 0; i + 3 < region.length; i += 4) {
     if (x >= region[i] && y >= region[i + 1] && x < region[i] + region[i + 2] && y < region[i + 1] + region[i + 3]) return true;
   }
   return false;
+}
+
+/** A window's surfaces bottom to top, as Wayland stacks them: from the
+ *  root, each surface with what hangs from it — its subsurfaces placed
+ *  below it (`z` < 0, each with its own subtree), the surface, its
+ *  subsurfaces above it (`z` > 0, or 0/absent), then its popups — so a
+ *  popup is above its parent and all of that parent's subsurfaces, and a
+ *  popup's subsurfaces are above (or below) the popup but under its child
+ *  popups. Subsurfaces go by `z` (CommitEvent.z), then `seq`; popups by
+ *  `seq`. `parent` 0 or not among `nodes` hangs from the root. Surfaces
+ *  the walk doesn't reach (no root among them) come last, in `seq` order. */
+export function stackOrder<T extends { surface: number; parent: number; role: number; seq: number; z?: number }>(nodes: readonly T[], root: number): T[] {
+  const by = new Map<number, T>();
+  for (const n of nodes) by.set(n.surface, n);
+  const kids = new Map<number, T[]>();
+  for (const n of nodes) {
+    if (n.surface === root) continue;
+    const p = n.parent && n.parent !== n.surface && by.has(n.parent) ? n.parent : root;
+    let list = kids.get(p);
+    if (!list) kids.set(p, list = []);
+    list.push(n);
+  }
+  const out: T[] = [];
+  const seen = new Set<number>();
+  // siblings bottom to top: subsurfaces by z, then popups, each by seq
+  const below = (n: T) => n.role !== ROLE_POPUP && (n.z ?? 0) < 0;
+  const order = (a: T, b: T) => {
+    const pa = a.role === ROLE_POPUP ? 1 : 0, pb = b.role === ROLE_POPUP ? 1 : 0;
+    return pa - pb || (pa ? 0 : (a.z ?? 0) - (b.z ?? 0)) || a.seq - b.seq;
+  };
+  const visit = (n: T) => {
+    if (seen.has(n.surface)) return; // (a cycle)
+    seen.add(n.surface);
+    const list = (kids.get(n.surface) || []).slice().sort(order);
+    for (const k of list) if (below(k)) visit(k);
+    out.push(n);
+    for (const k of list) if (!below(k)) visit(k);
+  };
+  const top = by.get(root);
+  if (top) visit(top);
+  else for (const k of (kids.get(root) || []).slice().sort(order)) visit(k);
+  for (const n of [...nodes].sort((a, b) => a.seq - b.seq)) if (!seen.has(n.surface)) visit(n);
+  return out;
 }
 
 // --- implementation ---------------------------------------------------------
@@ -590,6 +806,7 @@ const CURSORS = [
 ];
 
 const SURFACE_DESTROYED = 0xffffffff;
+const ROLE_SUBSURFACE = 2, ROLE_POPUP = 4;
 const BACKPRESSURE_BYTES = 256 * 1024;
 
 // STREAM.md frame types the engine handles itself (the rest go to the core)
@@ -635,6 +852,19 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   const buffers = options.buffers || null;
   const gpu = options.gpu || null;
   let gpuWarned = false; // the no-resolver error, once per link
+  // `${conn}:${surface}` of surfaces whose last COMMIT showed nothing new
+  // (no image resolved, a failed read, a broken handle) though the relay
+  // believes it did: their next COMMIT is presented whole, whatever damage
+  // the relay sent — a consumer copying just the damaged rects would paint
+  // them over stale content. (A surface's first COMMIT and one after a
+  // resize are whole already: the relay's rule, STREAM.md COMMIT "Damage".)
+  const stale = new Set<string>();
+  // `${conn}:${surface}` → the subsurfaces and popups as last placed (their
+  // commit's x/y/z, or a 'position' since): after a link message that may
+  // have moved or restacked one (the core's positions-dirty flag: a
+  // set_position, a parent's commit, a popup's reposition, …) their
+  // positions are read again (reposition)
+  const placed = new Map<string, { conn: number; surface: number; x: number; y: number; z: number }>();
   const wantRgba = !!options.rgba;
 
   const dec = new TextDecoder();
@@ -644,9 +874,25 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   // output state, kept so it can be set before the link opens and re-applied
   // when it does (wland_init resets the compositor)
   const output = { scale: 1, scale120: 120, width: 0, height: 0, suspended: false };
+  // the lock state the next link's compositor starts from (bit 0 Caps Lock,
+  // bit 1 NumLock): the embedder's last keyboardLocks, or the core's state
+  // as the last link closed (the lock keys toggle it there); -1 none
+  let locks = -1;
   let live = false; // link open and compositor initialised
   let disposed = false;
   const conns = new Set<number>(); // app conns the core holds (CONN_OPEN seen, not yet closed)
+  // the clipboard selection as the core last reported it, and the bytes of
+  // the embedder's own (setSelection) while it is the selection
+  let selection: { conn: number; mimes: string[] } = { conn: 0, mimes: [] };
+  let ownSelection: Map<string, Uint8Array> | null = null;
+  // readSelection calls waiting for the relay's answer, by read id
+  const selectionReads = new Map<number, { resolve: (v: Uint8Array | null) => void; timer: ReturnType<typeof setTimeout> }>();
+  let nextRead = 1;
+  // this link's relay bridges the clipboard (wasm.zig wland_selection_bridged,
+  // read after each run of frames until known; null: not yet), and whether
+  // NO_SELECTION_BRIDGE was logged on it
+  let bridge: boolean | null = null;
+  let noBridgeLogged = false;
   let ex: CoreExports; // wasm exports (core/src/wasm.zig)
 
   // --- event dispatch: queue while the core runs, drain when it returns ---
@@ -693,13 +939,14 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   let gen = 0;       // link generation: bumped on close, voids pending promises
   let stall = false; // a buffer-source promise is pending: frames wait
 
-  // The read whose promise is pending (frames stall meanwhile, so at most
-  // one): its token is not closed under it — a close that comes meanwhile
-  // (the link closing, dispose) waits until the read settles.
-  let reading: { token: unknown; close: boolean } | null = null; // close: a close is waiting
+  // Reads whose promise is pending: their token is not closed under them — a
+  // close that comes meanwhile (the link closing, dispose) waits until the
+  // read settles. Frames stall meanwhile, so at most one per link; a read
+  // of a closed link may still be pending while the next link's is.
+  const reading = new Set<{ token: unknown; close: boolean }>(); // close: a close is waiting
 
   function closeToken(token: unknown) {
-    if (reading && reading.token === token) { reading.close = true; return; }
+    for (const rd of reading) if (rd.token === token) { rd.close = true; return; }
     // exactly once per token open() returned; close never throws by contract
     try { buffers!.close(token); } catch (e) { emit({ type: 'error', detail: `buffer source close: ${e}` }); }
   }
@@ -759,14 +1006,24 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       js_conn_close: (conn) => {
         conn >>>= 0;
         conns.delete(conn);
+        for (const key of stale) if (key.startsWith(`${conn}:`)) stale.delete(key);
+        for (const key of placed.keys()) if (key.startsWith(`${conn}:`)) placed.delete(key);
         if (pending && pending.conn === conn) pending = null;
         closeHandles((h) => h.conn === conn);
         emit({ type: 'disconnect', conn });
       },
       js_surface_event: (conn, surface, value) => {
         conn >>>= 0;
-        if (value >>> 0 === SURFACE_DESTROYED) emit({ type: 'destroy', conn, surface });
-        else emit({ type: 'surface', conn, surface, role: value as Role, root: ex.wland_surface_root(conn, surface) });
+        if (value >>> 0 === SURFACE_DESTROYED) {
+          stale.delete(`${conn}:${surface}`);
+          placed.delete(`${conn}:${surface}`);
+          emit({ type: 'destroy', conn, surface });
+        } else {
+          if (value !== ROLE_SUBSURFACE && value !== ROLE_POPUP) placed.delete(`${conn}:${surface}`);
+          const root = ex.wland_surface_root(conn, surface);
+          emit({ type: 'surface', conn, surface, role: value as Role, root,
+                 parent: ex.wland_surface_parent(conn, surface) >>> 0, z: ex.wland_surface_z(conn, surface) });
+        }
       },
       js_cursor_shape: (conn, shape) =>
         emit({ type: 'cursor', conn: conn >>> 0, cursor: CURSORS[shape] ?? 'default', surface: 0, hotspotX: 0, hotspotY: 0 }),
@@ -792,6 +1049,20 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
           case 8: emit({ type: 'minimize', conn, surface, minimized: true }); break;
           case 9: emit({ type: 'minimize', conn, surface, minimized: false }); break;
         }
+      },
+      js_selection: (conn, ptr, len) => {
+        conn >>>= 0;
+        const mimes = len ? str(ptr, len).split('\0') : [];
+        if (conn !== 0 || !mimes.length) ownSelection = null; // an app's now, or cleared
+        selection = { conn, mimes };
+        emit({ type: 'selection', conn, mimes: [...mimes] });
+      },
+      js_selection_data: (id, status, ptr, len) => {
+        const rd = selectionReads.get(id >>> 0);
+        if (!rd) return; // timed out, or a read of an earlier link
+        selectionReads.delete(id >>> 0);
+        clearTimeout(rd.timer);
+        rd.resolve(status === 0 ? new Uint8Array(ex.memory.buffer, ptr, len).slice() : null);
       },
       js_handle_open: (conn, handle, kind, a, b, offset, size) =>
         handleOpen(conn >>> 0, handle >>> 0, kind, a >>> 0, b >>> 0, offset, size),
@@ -843,16 +1114,27 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       logicalHeight = height / s;
     }
     stats.commits++;
+    // a GPU commit with no image leaves the consumers' content stale: the
+    // next COMMIT is whole; any other brings the content up to date
+    if (format === 'gpu' && (!extra || extra.image == null)) stale.add(`${conn}:${surface}`);
+    else stale.delete(`${conn}:${surface}`);
     const root = ex.wland_surface_root(conn, surface);
     const state = ex.wland_toplevel_state(conn, root); // bits: maximized, fullscreen, minimized
     const g = new Int32Array(ex.memory.buffer, ex.wland_window_geometry(conn, root), 4);
+    const role = ex.wland_surface_role(conn, surface) as Role;
+    const x = ex.wland_surface_abs_x(conn, surface), y = ex.wland_surface_abs_y(conn, surface);
+    const z = ex.wland_surface_z(conn, surface);
+    if (role === ROLE_SUBSURFACE || role === ROLE_POPUP) placed.set(`${conn}:${surface}`, { conn, surface, x, y, z });
+    else placed.delete(`${conn}:${surface}`);
     emit({
       type: 'commit', conn, surface,
-      role: ex.wland_surface_role(conn, surface) as Role,
+      role,
       root,
+      parent: ex.wland_surface_parent(conn, surface) >>> 0,
+      z,
       geometry: { x: g[0], y: g[1], width: g[2], height: g[3] },
-      x: ex.wland_surface_abs_x(conn, surface),
-      y: ex.wland_surface_abs_y(conn, surface),
+      x,
+      y,
       maximized: (state & 1) !== 0,
       fullscreen: (state & 2) !== 0,
       minimized: (state & 4) !== 0,
@@ -860,6 +1142,25 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       format, stride, damage, pixels,
       ...extra,
     });
+  }
+
+  // the subsurfaces and popups whose position or place among their
+  // siblings changed since they were last placed (another surface's commit
+  // moved or restacked them): 'position' events. Only when the core says
+  // something they hang on changed since it last asked.
+  function reposition() {
+    if (!ex.wland_take_positions_dirty()) return;
+    let place: Int32Array | null = null; // x, y, z at a fixed address
+    for (const p of placed.values()) {
+      const at = ex.wland_surface_place(p.conn, p.surface);
+      if (!place || place.buffer !== ex.memory.buffer) place = new Int32Array(ex.memory.buffer, at, 3);
+      const x = place[0], y = place[1], z = place[2];
+      if (x === p.x && y === p.y && z === p.z) continue;
+      p.x = x;
+      p.y = y;
+      p.z = z;
+      emit({ type: 'position', conn: p.conn, surface: p.surface, x, y, z });
+    }
   }
 
   // BUFFER (0x02) at `base` of a DataView: canvas-ready RGBA packed per rect
@@ -894,8 +1195,8 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   }
 
   // COMMIT (0x0a): decode in the core, read the damaged bytes through the
-  // buffer source, present, ACK. Exactly one ACK per notice; a notice that
-  // cannot be presented is ACKed right away.
+  // buffer source (view, else readv, else read), present, ACK. Exactly one
+  // ACK per notice; a notice that cannot be presented is ACKed right away.
   let stage = new Uint8Array(0); // handle reads land here; reused across commits
   let asyncSource = false;       // the source has answered a read with a promise
   let wstage = 0, wstageLen = 0; // wasm region for the rgba swizzle; reused
@@ -908,9 +1209,10 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     if (!p) { log(`bad COMMIT frame (${len} bytes): not acked`); return; }
     const w = new Uint32Array(ex.memory.buffer, p, NOTICE_WORDS);
     const conn = w[0], surface = w[1], serial = w[2], kind = w[3], n = w[4];
-    if (kind !== 1 && kind !== 2) return ack(conn, serial); // unknown kind / invalid: core logged why
-    const damage = new Int32Array(n * 4);
-    damage.set(new Int32Array(ex.memory.buffer, p + NOTICE_WORDS * 4, n * 4));
+    if (kind !== 1 && kind !== 2) return missed(conn, surface, serial); // unknown kind / invalid: core logged why
+    let damage: Int32Array;
+    if (stale.has(`${conn}:${surface}`)) damage = kind === 2 ? Int32Array.of(0, 0, w[6], w[7]) : Int32Array.of(0, 0, w[7], w[8]);
+    else damage = new Int32Array(ex.memory.buffer, p + NOTICE_WORDS * 4, n * 4).slice();
     if (kind === 2) {
       const ref: GpuRef = {
         kind: 'virtgpu', resource: w[5], width: w[6], height: w[7], format: w[8], flags: w[9],
@@ -922,23 +1224,91 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     const h = handles.get(handle);
     if (!h || h.conn !== conn || !h.ok) {
       log(`COMMIT c${conn} serial ${serial}: handle ${handle} ${h && h.conn === conn ? 'broken' : 'not open'}, not presented`);
-      return ack(conn, serial);
+      return missed(conn, surface, serial);
     }
     if (offset + stride * height > h.size) {
       log(`COMMIT c${conn} serial ${serial}: buffer past the end of handle ${handle}, not presented`);
-      return ack(conn, serial);
+      return missed(conn, surface, serial);
     }
     const size = (height - 1) * stride + width * 4; // what pixel (x,y) indexing needs
-    if (stage.length < size) {
-      try {
-        stage = new Uint8Array(Math.max(size, Math.ceil(stage.length * 1.5)));
-      } catch (e) {
-        log(`COMMIT c${conn} serial ${serial}: no memory for ${size} bytes, not presented`);
-        return ack(conn, serial);
+    const c: PendingCommit = { conn, surface, serial, width, height, stride, format, damage, size };
+    const src = buffers!;
+    if (src.view && viewCommit(c, h.token, offset)) return;
+    if (!growStage(c)) return;
+    if (src.readv) readBatch(c, h.token, offset);
+    else readSpans(c, h.token, offset, spansOf(damage, stride, asyncSource), 0);
+  }
+
+  // the staging buffer holds at least the commit's extent; false (and the
+  // commit ACKed) when that much memory can't be had
+  function growStage(c: PendingCommit): boolean {
+    if (stage.length >= c.size) return true;
+    try {
+      stage = new Uint8Array(Math.max(c.size, Math.ceil(stage.length * 1.5)));
+      return true;
+    } catch {
+      log(`COMMIT c${c.conn} serial ${c.serial}: no memory for ${c.size} bytes, not presented`);
+      missed(c.conn, c.surface, c.serial);
+      return false;
+    }
+  }
+
+  // HandleSource.view: the memory in place, synchronously. One view is the
+  // commit's pixels as is; several (page runs) have the damaged spans
+  // gathered into the staging buffer. Returns false when the source
+  // declined (null): read it instead.
+  function viewCommit(c: PendingCommit, token: unknown, base: number): boolean {
+    let v: Uint8Array | readonly Uint8Array[] | null | undefined;
+    try {
+      v = buffers!.view!(token, base, c.size);
+    } catch (e) {
+      readFailed(c, e);
+      return true;
+    }
+    if (v == null) return false;
+    const views: readonly Uint8Array[] = ArrayBuffer.isView(v) ? [v] : v;
+    let total = 0;
+    for (const part of views) total += part.length;
+    if (total !== c.size) {
+      readFailed(c, `view: ${total} bytes for a ${c.size}-byte buffer`);
+      return true;
+    }
+    if (views.length === 1) {
+      present(c, views[0]);
+      return true;
+    }
+    if (!growStage(c)) return true;
+    const spans = spansOf(c.damage, c.stride, false);
+    let k = 0, at = 0; // views[k] holds buffer bytes at … at + views[k].length
+    for (let i = 0; i < spans.length; i += 2) {
+      let pos = spans[i];
+      const end = spans[i + 1];
+      while (pos < end) {
+        while (pos >= at + views[k].length) at += views[k++].length;
+        const n = Math.min(end, at + views[k].length) - pos;
+        stage.set(views[k].subarray(pos - at, pos - at + n), pos);
+        pos += n;
       }
     }
-    const c: PendingCommit = { conn, surface, serial, width, height, stride, format, damage, size };
-    readSpans(c, h.token, offset, spansOf(damage, stride, asyncSource), 0);
+    present(c, stage);
+    return true;
+  }
+
+  // HandleSource.readv: every span in one call, at most one promise
+  function readBatch(c: PendingCommit, token: unknown, base: number) {
+    const spans = spansOf(c.damage, c.stride, false);
+    const reads: HandleRead[] = [];
+    for (let i = 0; i < spans.length; i += 2) {
+      reads.push({ offset: base + spans[i], dst: stage.subarray(spans[i], spans[i + 1]) });
+    }
+    let r: void | Promise<void>;
+    try {
+      r = buffers!.readv!(token, reads);
+    } catch (e) {
+      return readFailed(c, e);
+    }
+    if (!thenable(r)) return present(c, stage);
+    pendingRead(c, token, r, () => { present(c, stage); return true; });
   }
 
   // Read spans[i…] into the staging buffer, then present. Returns true when
@@ -955,47 +1325,65 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       }
       if (thenable(r)) {
         asyncSource = true;
-        const g = gen, next = i + 2;
-        stall = true;
-        const rd = reading = { token, close: false };
-        // true if the token was closed meanwhile (closed now, for good)
-        const settled = () => {
-          reading = null;
-          if (rd.close) closeToken(token);
-          return rd.close;
-        };
-        r.then(() => {
-          const closed = settled();
-          if (g !== gen) return; // link closed: nothing to present or ACK
-          if (closed) readFailed(c, 'handle closed');
-          else if (!readSpans(c, token, base, spans, next)) return;
-          resume();
-        }, (e) => {
-          settled();
-          if (g !== gen) return;
-          readFailed(c, e);
-          resume();
-        });
+        const next = i + 2;
+        pendingRead(c, token, r, () => readSpans(c, token, base, spans, next));
         return false;
       }
     }
-    present(c);
+    present(c, stage);
     return true;
+  }
+
+  // A read's promise is pending: frames stall until it settles, and its
+  // token is not closed under it. Then `more` carries on (true when the
+  // commit is done, false when it is waiting on another promise).
+  function pendingRead(c: PendingCommit, token: unknown, r: PromiseLike<void>, more: () => boolean) {
+    const g = gen;
+    stall = true;
+    const rd = { token, close: false };
+    reading.add(rd);
+    // true if the token was closed meanwhile (closed now, for good)
+    const settled = () => {
+      reading.delete(rd); // only this read's record: another link's may be pending
+      if (rd.close) closeToken(token);
+      return rd.close;
+    };
+    r.then(() => {
+      const closed = settled();
+      if (g !== gen) return; // link closed: nothing to present or ACK
+      if (closed) readFailed(c, 'handle closed');
+      else if (!more()) return;
+      resume();
+    }, (e) => {
+      settled();
+      if (g !== gen) return;
+      readFailed(c, e);
+      resume();
+    });
   }
 
   function readFailed(c: PendingCommit, e: unknown) {
     log(`COMMIT c${c.conn} serial ${c.serial}: read failed (${e}), not presented`);
-    ack(c.conn, c.serial);
+    missed(c.conn, c.surface, c.serial);
   }
 
-  function present(c: PendingCommit) {
+  // a COMMIT ACKed with nothing dispatched: the surface's next one is whole
+  function missed(conn: number, surface: number, serial: number) {
+    stale.add(`${conn}:${surface}`);
+    ack(conn, serial);
+  }
+
+  // `src` holds the buffer's bytes from its first: the staging buffer, or
+  // the source's own memory (one view)
+  function present(c: PendingCommit, src: Uint8Array) {
     const { conn, surface, serial, width, height, damage } = c;
     if (!wantRgba) {
       commit(conn, surface, width, height, c.format === WL_SHM_ARGB8888 ? 'bgra' : 'bgrx', c.stride,
-        damage, stage.subarray(0, c.size));
+        damage, src.subarray(0, c.size));
     } else {
-      const pixels = swizzle(c);
+      const pixels = swizzle(c, src);
       if (pixels) commit(conn, surface, width, height, 'rgba', 0, damage, pixels);
+      else stale.add(`${conn}:${surface}`);
     }
     // the commit event's dispatch has returned: the pixels are consumed
     ack(conn, serial);
@@ -1024,7 +1412,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     const g = gen;
     stall = true;
     r.then((image) => {
-      if (g !== gen) return; // link closed: nothing to present or ACK
+      // link closed: nothing to present or ACK, but the image is still the
+      // embedder's to release (resolve's contract: every image is released)
+      if (g !== gen) { if (image != null) gpuRelease(image); return; }
       gpuPresent(conn, surface, serial, ref, damage, image ?? null);
       resume();
     }, (e) => {
@@ -1038,16 +1428,19 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   function gpuPresent(conn: number, surface: number, serial: number, ref: GpuRef, damage: Int32Array, image: unknown) {
     commit(conn, surface, ref.width, ref.height, 'gpu', 0, damage, EMPTY, { gpu: ref, image });
     // the dispatch returned: the image is drawn, the resource no longer read
-    if (image !== null && gpu && gpu.release) {
-      try { gpu.release(image); } catch (e) { emit({ type: 'error', detail: `gpu source release: ${e}` }); }
-    }
+    if (image !== null) gpuRelease(image);
     ack(conn, serial);
+  }
+
+  function gpuRelease(image: unknown) {
+    if (!gpu || !gpu.release) return;
+    try { gpu.release(image); } catch (e) { emit({ type: 'error', detail: `gpu source release: ${e}` }); }
   }
 
   // options.rgba: each damage rect's rows go packed into wasm memory, then
   // wland_swizzle converts them in place to canvas-ready RGBA (alpha forced
   // for XRGB) — the BUFFER layout, so a 2D presenter paints it directly.
-  function swizzle(c: PendingCommit): Uint8Array | null {
+  function swizzle(c: PendingCommit, src: Uint8Array): Uint8Array | null {
     const { damage, stride } = c;
     let total = 0;
     for (let i = 0; i < damage.length; i += 4) total += damage[i + 2] * damage[i + 3] * 4;
@@ -1062,9 +1455,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     let out = wstage;
     for (let i = 0; i < damage.length; i += 4) {
       const x = damage[i], y = damage[i + 1], w = damage[i + 2], h = damage[i + 3];
-      const row = w * 4, src = y * stride + x * 4;
-      if (row === stride) mem.set(stage.subarray(src, src + row * h), out);
-      else for (let r = 0; r < h; r++) mem.set(stage.subarray(src + r * stride, src + r * stride + row), out + r * row);
+      const row = w * 4, at = y * stride + x * 4;
+      if (row === stride) mem.set(src.subarray(at, at + row * h), out);
+      else for (let r = 0; r < h; r++) mem.set(src.subarray(at + r * stride, at + r * stride + row), out + r * row);
       ex.wland_swizzle(out, row, out, w, h, opaque);
       out += row * h;
     }
@@ -1116,8 +1509,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     const g = gen;
     let off = pos, span = -1;
     const toCore = (end: number) => {
-      const p = toWasm(bytes, span, end);
-      if (p) run(ex.wland_on_frame, p, end - span);
+      const p = toWasm(bytes, span, end), n = end - span;
+      // (the bridge is known before this run's events go out)
+      if (p) run(() => { ex.wland_on_frame(p, n); if (bridge === null) noteBridge(); });
       span = -1;
     };
     while (off < total) {
@@ -1145,7 +1539,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       if (stall) { pos = off; return off >= total; }
     }
     if (span >= 0) toCore(off);
-    return g === gen;
+    if (g !== gen) return false;
+    if (placed.size) reposition();
+    return true;
   }
 
   // --- pointer motion: coalesced here, next to the link -------------------
@@ -1186,11 +1582,22 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   const callbacks: LinkCallbacks = {
     onOpen() {
       if (disposed) return;
+      if (live) saveLocks(); // a link that opens again without closing first
       live = true;
+      selection = { conn: 0, mimes: [] }; // wland_init: a fresh compositor
+      ownSelection = null;
+      bridge = null; // (its relay's FEATURE frames decide again)
+      noBridgeLogged = false;
       gpuWarned = false;
+      stale.clear();
+      placed.clear();
+      // no GPU source: a relay whose dmabufs are GPU resources gets no
+      // linux-dmabuf (its FEATURE frames come next), so GPU clients use wl_shm
+      run(ex.wland_set_gpu_source, gpu ? 1 : 0);
       run(ex.wland_init, output.scale, output.scale120);
       if (output.width > 0 && output.height > 0) run(ex.wland_desktop_size, output.width, output.height);
       if (output.suspended) run(ex.wland_set_suspended, 1);
+      if (locks >= 0) run(ex.wland_keyboard_locks, locks);
       emit({ type: 'open' });
     },
     onMessage(data) {
@@ -1201,6 +1608,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     },
     onClose(info) {
       if (disposed) return;
+      if (live) saveLocks();
       halt();
       // the relay dropped every app of this link: close them in the core
       // as its CONN_CLOSE would (drags, selections and focus end there;
@@ -1214,19 +1622,43 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       }
       conns.clear();
       closeHandles(() => true);
+      // the next link's compositor starts with an empty clipboard
+      if (selection.conn || selection.mimes.length) {
+        selection = { conn: 0, mimes: [] };
+        emit({ type: 'selection', conn: 0, mimes: [] });
+      }
       emit({ type: 'close', takenOver: !!(info && info.takenOver) });
     },
   };
+
+  function noteBridge() {
+    const s = ex.wland_selection_bridged() >>> 0; // a getter: emits nothing
+    if (s !== 2) bridge = s === 1;
+  }
+  // (no engine call: safe while a commit's pixels are being read)
+  const bridged = (): boolean | null => (live ? bridge : null);
+
+  // the closing link's compositor's lock state (keyboardLocks, then any
+  // Caps Lock / NumLock presses) is what the next one starts from
+  function saveLocks() {
+    locks = ex.wland_keyboard_locks_state() & 3; // a getter: emits nothing
+  }
 
   // the link is gone: nothing reaches it from here on, pending promises and
   // unprocessed frames are void
   function halt() {
     live = false;
     pending = null;
+    for (const rd of selectionReads.values()) { clearTimeout(rd.timer); rd.resolve(null); }
+    selectionReads.clear();
+    ownSelection = null;
     gen++;
     stall = false;
     inbox.length = 0;
     pos = 0;
+    // a pending read keeps writing into the staging buffer it was given:
+    // the next link's reads get their own
+    if (reading.size) stage = new Uint8Array(0);
   }
 
   const engine: Engine = {
@@ -1308,6 +1740,10 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     keyboardEnter: call((conn, surface) => ex.wland_keyboard_enter(conn, surface)),
     keyboardLeave: call((conn) => ex.wland_keyboard_leave(conn)),
     key: call((conn, time, code, pressed) => ex.wland_key(conn, time >>> 0, code, pressed ? 1 : 0)),
+    keyboardLocks(capsLock, numLock) {
+      locks = (capsLock ? 1 : 0) | (numLock ? 2 : 0);
+      if (live) run(ex.wland_keyboard_locks, locks);
+    },
     textInputPreedit: call((conn, text) => withUtf8(text, (ptr, len) =>
       ex.wland_text_input_preedit(conn, ptr, len, len, len))),
     textInputCommit: call((conn, text) => withUtf8(text, (ptr, len) =>
@@ -1325,6 +1761,80 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       ex.wland_drag_motion(conn, surface, time >>> 0, fixed(x), fixed(y)), true),
     dragDrop: call(() => ex.wland_drag_drop(), true),
     dragCancel: call(() => ex.wland_drag_cancel(), true),
+
+    // clipboard
+    selection: () => ({ conn: selection.conn, mimes: [...selection.mimes] }),
+    selectionBridged: () => bridged(),
+    setSelection(data) {
+      if (!live) return false;
+      const b = bridged();
+      if (b !== true) {
+        if (b === false && !noBridgeLogged) { noBridgeLogged = true; log(`setSelection: ${NO_SELECTION_BRIDGE}; not set`); }
+        return false;
+      }
+      if (data == null) {
+        if (selection.conn !== 0 || !ownSelection) return true;
+        run(ex.wland_set_selection, 0, 0);
+        return true;
+      }
+      // packed entries (wasm.zig wland_set_selection): { u32 mime_len, mime,
+      // u32 data_len | 0xffffffff (the previous entry's data again), data }
+      const groups = new Map<string | Uint8Array, string[]>();
+      for (const [mime, value] of Object.entries(data)) {
+        if (typeof value !== 'string' && !(value instanceof Uint8Array)) return false;
+        const list = groups.get(value);
+        if (list) list.push(mime); else groups.set(value, [mime]);
+      }
+      const parts: Uint8Array[] = [];
+      const own = new Map<string, Uint8Array>();
+      let total = 0;
+      const u32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+      for (const [value, mimes] of groups) {
+        const bytes = typeof value === 'string' ? enc.encode(value) : value;
+        mimes.forEach((mime, i) => {
+          const m = enc.encode(mime);
+          parts.push(u32(m.length), m);
+          if (i === 0) parts.push(u32(bytes.length), bytes); else parts.push(u32(0xffffffff));
+          own.set(mime, bytes.slice());
+        });
+      }
+      for (const p of parts) total += p.length;
+      if (!total) return false;
+      const ptr = ex.wland_alloc(total);
+      if (!ptr) return false;
+      const mem = new Uint8Array(ex.memory.buffer, ptr, total);
+      let off = 0;
+      for (const p of parts) { mem.set(p, off); off += p.length; }
+      // in place before the call: its 'selection' event may be answered
+      // with a readSelection
+      const prev = ownSelection;
+      ownSelection = own;
+      let ok = 0;
+      run(() => { ok = ex.wland_set_selection(ptr, total); });
+      ex.wland_free(ptr, total);
+      if (ok !== 1) ownSelection = prev;
+      return ok === 1;
+    },
+    readSelection(mime, options) {
+      if (!live) return Promise.resolve(null);
+      if (bridged() === false) return Promise.reject(new Error(NO_SELECTION_BRIDGE));
+      if (selection.conn === 0) {
+        const bytes = ownSelection?.get(mime);
+        return Promise.resolve(bytes ? bytes.slice() : null);
+      }
+      const max = Math.max(0, Math.min(0xffffffff, Math.floor(options?.maxBytes ?? 16 * 1024 * 1024)));
+      const timeout = options?.timeout ?? 5000;
+      const id = nextRead++ >>> 0 || (nextRead = 2, 1);
+      return new Promise<Uint8Array | null>((resolve) => {
+        let asked = 0;
+        withUtf8(mime, (ptr, len) => run(() => { asked = ex.wland_read_selection(ptr, len, id, max); }));
+        if (!asked) return resolve(null);
+        const timer = setTimeout(() => {
+          if (selectionReads.delete(id)) resolve(null);
+        }, timeout);
+        selectionReads.set(id, { resolve, timer });
+      });
+    },
   };
   return engine;
 }
@@ -1353,8 +1863,9 @@ async function instantiate(src: NonNullable<EngineOptions['wasm']>, imports: Cor
 // from pixel (0, 0): each damage rect's span (its first to its last byte —
 // the rows in between whole), sorted, merged where spans overlap or lie
 // within MERGE_GAP of each other (a page: copying it costs about what another
-// call does). An async source gets one span over everything: each of its
-// reads is a round trip. Bytes outside the spans stay undefined.
+// call does). An async read()-only source gets one span over everything:
+// each of its reads is a round trip (readv() takes all spans in one call
+// instead). Bytes outside the spans stay undefined.
 const MERGE_GAP = 4096;
 function spansOf(damage: Int32Array, stride: number, single: boolean): number[] {
   const n = damage.length / 4;
