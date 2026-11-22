@@ -7,6 +7,10 @@
 # Arguments pick the apps, one command line each (default: chromium pcmanfm):
 #   docker run --rm -p 8080:8080 wland "chromium https://example.org"
 #
+# The relay runs the compositor (wlandr --profile session), so the apps keep
+# running across page reloads. -e WLAND_PROFILE=passthrough: the page does,
+# and a reload starts the apps again.
+#
 # Multi-arch: the builder runs on the build machine and zig cross-compiles
 # wlandr for every target; TARGETARCH picks which binary the image gets.
 
@@ -114,6 +118,8 @@ EOF
 
 # UTF-8 file names; built into glibc, no locales package
 ENV LANG=C.UTF-8
+# who runs the compositor (docker/entrypoint.sh): session | passthrough
+ENV WLAND_PROFILE=session
 
 COPY --from=build /out/wlandr /usr/local/bin/wlandr
 COPY --from=build /out/web /usr/local/share/wland/web

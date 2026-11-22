@@ -127,5 +127,7 @@ import lib/ source, never dist/.
 - `docker/` — the demo image (`Dockerfile`: a node+zig builder runs
   `npm run build`; debian:trixie-slim with chromium + pcmanfm + l3afpad, dpkg
   path-excludes for what they never load) and `entrypoint.sh` (wlandr
-  `--host 0.0.0.0`, apps run via `tools/wland-run`, the ones not running
-  relaunched at each engine detach). Context: the repo root, `.dockerignore`.
+  `--host 0.0.0.0 --profile $WLAND_PROFILE` — session by default, the
+  image's ENV — apps run via `tools/wland-run`, the ones not running
+  relaunched at each page load (session: a viewer's init; passthrough: each
+  engine detach)). Context: the repo root, `.dockerignore`.

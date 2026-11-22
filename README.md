@@ -93,8 +93,11 @@ Pass the apps to run, one command line per argument (the default is
 docker run -it --rm -p 8080:8080 ghcr.io/pithings/wland "chromium https://example.org"
 ```
 
-A page reload disconnects every app, so the apps are started again after
-one. An app you close stays closed until the next reload.
+The apps keep running across a page reload or a closed tab: the image
+runs the server with `--profile session`, where the compositor lives in the
+server and the page shows it. An app you close stays closed until the next
+page load. `-e WLAND_PROFILE=passthrough` puts the compositor in the page
+instead; a reload then disconnects every app and they are started again.
 
 There is no authentication, and `-p 8080:8080` publishes the desktop on
 every address of your machine. On a network you don't trust, publish it on
