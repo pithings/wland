@@ -18,7 +18,8 @@
 # this needs only chromium and bun besides the build; WLAND_E2E_APPS=real
 # runs the real apps named below instead (test/support/apps.ts). Groups:
 #   foot         typing, pointer sweep + implicit grab, CSD layout, border resize,
-#                a click through an input region's hole (fixture: term)
+#                a click through an input region's hole, the clipboard bridge
+#                both ways (fixture: term)
 #   gtk          nautilus: popup, navigation, CSD move/maximize, resize
 #                (fixture: files, which also checks drag and drop)
 #   cursor       weston-flower: a cursor surface as the pointer image (fixture: cursor)
@@ -73,9 +74,31 @@ fi
 FIXTURE=zig-out/bin/wland-fixture
 if [[ "${WLAND_E2E_APPS:-fixture}" == "real" ]]; then
   REAL=1
-  TERM_APP=(foot)
-  FILES_APP=(tools/wland-run nautilus)   # + a session bus and GTK's cairo renderer
-  CURSOR_APP=(weston-flower)
+  # real apps run in a throwaway home (apps.ts appHome; the bun driver's
+  # apps share it through WLAND_E2E_HOME): no dotfile of the developer's is
+  # read or written — shell history and readline bindings, nautilus's saved
+  # window state, GSettings, tracker. And not on the developer's session
+  # bus: with DBUS_SESSION_BUS_ADDRESS unset tools/wland-run gives nautilus
+  # a bus of its own (dbus-run-session), and GSettings is a keyfile in that
+  # home (GSETTINGS_BACKEND=keyfile) — never dconf, which would write
+  # ~/.config/dconf/user through the developer's dconf-service, nor their
+  # running apps. The keyfile shows minimize + maximize (GNOME's default is
+  # appmenu:close; the csd phase clicks maximize), as headless-e2e's.
+  # Not the human demo's apps.
+  if [[ $DEMO == 0 ]]; then
+    export WLAND_E2E_HOME="$(mktemp -d /tmp/wland-e2e-home.XXXXXX)"
+    mkdir -p "$WLAND_E2E_HOME"/.config/glib-2.0/settings "$WLAND_E2E_HOME"/.local/share "$WLAND_E2E_HOME"/.cache "$WLAND_E2E_HOME"/.local/state
+    printf "[org/gnome/desktop/wm/preferences]\nbutton-layout='appmenu:minimize,maximize,close'\n" > "$WLAND_E2E_HOME"/.config/glib-2.0/settings/keyfile
+    APP_ENV=(env -u DBUS_SESSION_BUS_ADDRESS GSETTINGS_BACKEND=keyfile)
+  else
+    APP_ENV=(env)
+  fi
+  APP_ENV+=(HOME="${WLAND_E2E_HOME:-$HOME}" XDG_CONFIG_HOME="${WLAND_E2E_HOME:-$HOME}/.config"
+    XDG_DATA_HOME="${WLAND_E2E_HOME:-$HOME}/.local/share" XDG_CACHE_HOME="${WLAND_E2E_HOME:-$HOME}/.cache"
+    XDG_STATE_HOME="${WLAND_E2E_HOME:-$HOME}/.local/state" HISTFILE=/dev/null INPUTRC=/dev/null)
+  TERM_APP=("${APP_ENV[@]}" foot bash --norc --noprofile)   # a plain shell, as apps.ts's
+  FILES_APP=("${APP_ENV[@]}" tools/wland-run nautilus)      # + a session bus and GTK's cairo renderer
+  CURSOR_APP=("${APP_ENV[@]}" weston-flower)
 else
   REAL=0
   TERM_APP=("$FIXTURE" term)
@@ -108,6 +131,7 @@ cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
   pkill -f "wland-chromium-[p]rofile-$PORT" 2>/dev/null || true
   [[ -n "${WEB_ROOT:-}" ]] && rm -rf "$WEB_ROOT" || true
+  [[ -n "${WLAND_E2E_HOME:-}" && "$WLAND_E2E_HOME" == /tmp/wland-e2e-home.* ]] && rm -rf "$WLAND_E2E_HOME" || true
 }
 [[ $DEMO == 0 ]] && trap cleanup EXIT
 
@@ -205,16 +229,18 @@ $E2E resize $CDP
 
 echo "== input region hole: a click through it reaches the window behind =="
 $E2E hole $CDP
+
+echo "== clipboard bridge: page clipboard ⇄ foot (paste event, writeText) =="
+$E2E clipboard $CDP
 kill "$FOOT_PID" 2>/dev/null || true
 FOOT_PID=""
 fi
 
 if want gtk; then
 echo "== nautilus: render, menu popup, navigation (M6): ${FILES_APP[*]} =="
-# nautilus persists window state (maximized!) via the GSettings KEYFILE
-# backend (no dconf service under dbus-run-session); a maximized start
-# breaks the fixed click offsets in the gtk phase. Fresh state every run.
-[[ $REAL == 1 ]] && rm -f "$HOME/.config/glib-2.0/settings/keyfile" 2>/dev/null || true
+# (nautilus persists window state — maximized! — through GSettings, which
+# would break the gtk phase's fixed click offsets: real apps get a fresh
+# home every run, WLAND_E2E_HOME above)
 # the gtk phase double-clicks the FIRST icon and expects a folder; $HOME's
 # first entry can be a file (nautilus does not sort folders first by
 # default), so open a fixture directory whose only entry is a folder.

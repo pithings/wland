@@ -53,31 +53,45 @@
 //     xeyes installed): the relay claimed an X display; an X client
 //     connecting to it starts satellite and gets a window.
 //  7. output scale 2: foot attaches buffers at 2× its logical size.
+//  8. a GPU client (fixtures only): a second relay with the test-only
+//     `--dmabuf virtgpu:@fake` names the `dmabuf` fixture's buffers as
+//     resources; COMMITs of kind virtgpu reach a headless client with a
+//     gpu resolver, with the client's size, format and implicit modifier,
+//     a resource per buffer; it keeps drawing (each release
+//     came after its ACK); every resolved image released, no errors. Then
+//     a page with no gpu source on the same relay: the core leaves
+//     linux-dmabuf off (FEATURE dmabuf_kind), the GPU client exits for
+//     want of the global (as weston-simple-dmabuf-egl does), a wl_shm
+//     client draws.
 //
 // Needs `zig build` (wlandr, wland-fixture, lib/wland.wasm). Own
 // XDG_RUNTIME_DIR, display name and port: it never touches a demo's session.
 // Run: node tools/headless-e2e-test.ts   (V=1 shows the apps' stderr;
-// WLAND_E2E_APPS=real for the real apps)
+// WLAND_E2E_APPS=real for the real apps; WLAND_E2E_RELAY overrides the relay
+// command, split on spaces — an older wlandr checks version skew: what it
+// can't do, it skips with a message)
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createHeadless, type Headless, type HeadlessWindow, type RgbaImage } from '../lib/headless.ts';
+import type { GpuRef } from '../lib/engine.ts';
+import { createHeadless, NO_SELECTION_BRIDGE, type Headless, type HeadlessWindow, type RgbaImage } from '../lib/headless.ts';
 import { xDisplayOf } from '../lib/index.ts';
-import { app, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
+import { app, appHome, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
 import { parsePresentationShm, presentationChecks } from '../test/support/presentation-shm.ts';
 
-const RELAY = fileURLToPath(new URL('../zig-out/bin/wlandr', import.meta.url));
+const RELAY = (process.env.WLAND_E2E_RELAY || fileURLToPath(new URL('../zig-out/bin/wlandr', import.meta.url))).split(' ');
 const PORT = Number(process.env.PORT || 8937);
 const dir = mkdtempSync('/tmp/wl-hl-');
 const env: NodeJS.ProcessEnv = {
   ...process.env, XDG_RUNTIME_DIR: dir, WAYLAND_DISPLAY: 'wland-hl',
   // GTK: no GPU path here → the cairo renderer; pin the backend (tools/wland-run)
   GDK_BACKEND: 'wayland', GSK_RENDERER: 'cairo', XDG_SESSION_TYPE: 'wayland',
-  // nautilus restores a maximized window from its saved state; the click
-  // offsets below assume a floating start, so it gets a config of its own
-  XDG_CONFIG_HOME: `${dir}/config`,
+  // real apps: a home of their own (the developer's dotfiles stay out of
+  // it, both ways: nautilus's saved maximized state, bash's history); the
+  // session bus below and the services it activates share it
+  ...(realApps ? appHome() : {}),
 };
 delete env.DISPLAY; // nothing here may fall back to X11
 
@@ -152,10 +166,11 @@ function colours(img: RgbaImage): number {
 // (an empty web root of its own: nothing is served, and sweep() must not
 // find the relay by the runtime dir's name)
 const webRoot = mkdtempSync('/tmp/wl-hlroot-');
-const relay = run(RELAY, ['--port', String(PORT), '--web-root', webRoot, '--display', env.WAYLAND_DISPLAY!]);
+const relay = run(RELAY[0], [...RELAY.slice(1), '--port', String(PORT), '--web-root', webRoot, '--display', env.WAYLAND_DISPLAY!]);
 let commits = 0, opened = false;
 const errors: string[] = [];
 const titles: string[] = [];
+const grabs: string[] = []; // 'move' / 'resize' events: the grabs the core started
 let hl!: Headless;
 
 /** Commits stopped arriving for `quiet` ms. */
@@ -336,6 +351,20 @@ async function foot() {
   await settle();
   check(hash(hl.screenshot()) !== hash(shot0), 'typing changed the pixels');
 
+  // the keypad: NumLock is on (Mod2 locked) so its digits are digits; off, they
+  // navigate (KP_Home…) and type nothing
+  hl.type(`printf '\\033]2;KP-`);
+  hl.press('Numpad1');
+  hl.press('Numpad2');
+  hl.press('NumpadDecimal');
+  hl.press('Numpad7');
+  hl.press('NumLock'); // off
+  hl.press('Numpad9');
+  hl.press('NumLock'); // on again
+  hl.type(`\\007'\n`);
+  await until(() => titles.some((t) => t.startsWith('KP-')), 5000, 'foot to be retitled by keypad digits');
+  check(titles.includes('KP-12.7'), `keypad digits typed with NumLock on, none with it off (title ${titles.filter((t) => t.startsWith('KP-'))})`);
+
   // CSD: subsurfaces around the grid, the titlebar above it — placed by the
   // positions commits carry, relative to the toplevel
   const subs = hl.surfaces().filter((s) => s.role === ROLE_SUBSURFACE && s.conn === win.conn && s.root === win.surface);
@@ -366,6 +395,30 @@ async function foot() {
   const moves = s1.motions - s0.motions, sent = s1.sentMotions - s0.sentMotions;
   check(moves >= 100 && sent >= 1 && sent < moves / 4, `pointer sweep: ${moves} moves → ${sent} shipped motions`);
   check(alive(app) && hl.focused()?.key === win.key, 'foot survived the sweep, clicks and wheel, still focused');
+
+  // its left border (outside the box, foot's 5 px CSD border): a quick
+  // click — the app's xdg_toplevel.resize comes after the release, and
+  // the core starts no grab for it — then a press held while the pointer
+  // drags, which does resize
+  await settle();
+  const w0 = hl.windows()[0]!;
+  const bx = w0.x - 3, by = w0.y + Math.round(w0.height / 2);
+  const g0 = grabs.length;
+  hl.click(bx, by);
+  await sleep(500);
+  hl.pointerMove(bx + 280, by + 50);
+  await settle();
+  const w1 = hl.windows()[0]!;
+  check(grabs.length === g0 && w1.x === w0.x && w1.width === w0.width,
+    `a quick click on the border: no grab (${grabs.slice(g0)}), the window stays ${w1.width} wide at x=${w1.x}`);
+  hl.pointerMove(bx, by);
+  hl.pointerDown();
+  await until(() => grabs.length > g0, 5000, 'the resize request of a held press');
+  hl.pointerMove(bx - 60, by);
+  hl.pointerUp();
+  await until(() => hl.windows()[0]!.width > w0.width + 30, 5000, 'foot to resize from its border');
+  check(grabs.slice(g0).join() === 'resize', `held on the border: a resize grab, ${w0.width} → ${hl.windows()[0]!.width} px`);
+  await settle();
 
   hl.resize(win, 900, 600);
   await until(() => Math.abs(hl.windows()[0]!.width - 900) < 40, 5000, 'foot to resize');
@@ -447,7 +500,90 @@ async function clipboard() {
   await sleep(500);
   const r = await exec(paste, 10000);
   check(r.stdout === 'wland-headless-clip', `wl-paste returned "${r.stdout}"`);
+  if (hl.engine.selectionBridged() === false) return clipboardUnbridged(copy, paste);
+  check(hl.engine.selectionBridged() === true, 'the relay bridges the clipboard (FEATURE selection_cache)');
+  // the page bridge's halves, headless: the embedder reads the app's
+  // selection through the relay (pipe_read), and sets its own, which the
+  // next focused app pastes (the relay writes the core's bytes)
+  const read = await hl.readClipboard();
+  check(read === 'wland-headless-clip', `readClipboard() returned "${read}" (owner conn ${hl.engine.selection().conn})`);
   await stop(copy);
+  await until(() => hl.engine.selection().mimes.length === 0, 5000, 'the selection to go with wl-copy');
+  const text = 'from the embedder: héllo ✓';
+  check(hl.writeClipboard(text) && hl.engine.selection().conn === 0, 'writeClipboard() made the embedder\'s own selection');
+  const r2 = await exec(paste, 10000);
+  check(r2.stdout === text, `wl-paste of the embedder's selection returned "${r2.stdout}"`);
+  check(await hl.readClipboard() === text, 'readClipboard() of its own selection');
+  // wl-copy --paste-once: the read is its one paste, and it hands the
+  // write to a child and exits, so its conn is gone before the read's EOF
+  // — EOF alone completes a read (STREAM.md pipe_read)
+  const onceSpec = need('copy', ['--paste-once', 'wland-paste-once']);
+  if (onceSpec) {
+    const once = runApp(onceSpec);
+    await until(() => hl.engine.selection().conn !== 0 && hl.engine.selection().mimes.length > 0, 5000, 'wl-copy --paste-once to own the clipboard');
+    const got = await hl.readClipboard();
+    check(got === 'wland-paste-once', `readClipboard() of wl-copy --paste-once returned "${got}"`);
+    await until(() => hl.engine.selection().mimes.length === 0, 5000, 'wl-copy --paste-once to go after its paste');
+    await stop(once);
+  }
+
+  // foot's keys: Ctrl+Shift+V pastes the selection into the shell (a
+  // printf that retitles it); a word double-clicked and Ctrl+Shift+C copies
+  // it (the fixture copies its last output line: the same word)
+  const termSpec = need('term');
+  if (!termSpec) return;
+  const term = runApp(termSpec);
+  await oneWindow(termSpec.name);
+  await settle();
+  hl.writeClipboard(`printf '\\033]2;PASTED-INTO-FOOT\\007'`);
+  hl.press('ControlLeft', 'ShiftLeft', 'KeyV');
+  hl.press('Enter');
+  await until(() => titles.includes('PASTED-INTO-FOOT'), 5000, 'foot to run the pasted printf');
+  check(true, 'Ctrl+Shift+V pasted the embedder\'s selection into foot');
+  {
+    hl.type('clear; echo wland-copied-from-foot\n'); // the word alone on the first row
+    await sleep(500);
+    const w = hl.focused()!;
+    hl.click(w.originX + 40, w.originY + 8);
+    hl.click(w.originX + 40, w.originY + 8);
+    await sleep(300);
+    hl.press('ControlLeft', 'ShiftLeft', 'KeyC');
+    await until(() => hl.engine.selection().conn !== 0, 5000, 'foot to own the clipboard');
+    const copied = await hl.readClipboard();
+    check(copied === 'wland-copied-from-foot', `Ctrl+Shift+C in foot: readClipboard() returned "${copied}"`);
+  }
+  await stop(term);
+  await noWindows();
+}
+
+/** The clipboard phase against a relay without FEATURE selection_cache (an
+ *  older wlandr, WLAND_E2E_RELAY): the embedder's halves are refused at once
+ *  and no app's paste blocks; apps still copy and paste among themselves. */
+async function clipboardUnbridged(copy: ChildProcess, paste: AppSpec) {
+  console.log('  skipped: readClipboard / writeClipboard (the relay sent no FEATURE selection_cache); checking they are refused');
+  const t0 = Date.now();
+  const err = await hl.readClipboard().then(() => null, (e: Error) => e.message);
+  check(err === NO_SELECTION_BRIDGE && Date.now() - t0 < 1000, `readClipboard() rejected at once: "${err}"`);
+  check(!hl.writeClipboard('from the embedder'), 'writeClipboard() refused');
+  check(hl.engine.selection().conn !== 0, 'the app\'s selection stays');
+  await stop(copy);
+  await until(() => hl.engine.selection().mimes.length === 0, 5000, 'the selection to go with wl-copy');
+  check(!hl.writeClipboard('from the embedder'), 'writeClipboard() refused with the clipboard empty');
+  const p0 = Date.now();
+  const r = await exec(paste, 10000);
+  check(r.status !== null && r.stdout === '' && Date.now() - p0 < 3000, `wl-paste found nothing and exited at once (${r.status}), not blocked`);
+  const termSpec = need('term');
+  if (!termSpec) return;
+  const term = runApp(termSpec);
+  await oneWindow(termSpec.name);
+  await settle();
+  // foot's paste: no selection offered, nothing pasted, foot still takes keys
+  hl.press('ControlLeft', 'ShiftLeft', 'KeyV');
+  hl.type(`printf '\\033]2;STILL-TYPING\\007'\n`);
+  await until(() => titles.includes('STILL-TYPING'), 5000, 'foot to take keys after its paste');
+  check(true, 'Ctrl+Shift+V in foot pasted nothing and did not block it');
+  await stop(term);
+  await noWindows();
 }
 
 async function nautilus() {
@@ -461,11 +597,12 @@ async function nautilus() {
   if (spec.bus) {
     if (!have('dbus-daemon')) return console.log('  skipped: dbus-daemon not installed');
     // GNOME's default button layout is "appmenu:close"; a keyfile GSettings
-    // backend of its own (XDG_CONFIG_HOME is per run) shows minimize + maximize
-    // — for the bus too: GTK reads the layout through the settings portal it
-    // activates
-    mkdirSync(`${dir}/config/glib-2.0/settings`, { recursive: true });
-    writeFileSync(`${dir}/config/glib-2.0/settings/keyfile`,
+    // backend of its own (in appHome's XDG_CONFIG_HOME, fresh per run) shows
+    // minimize + maximize — for the bus too: GTK reads the layout through
+    // the settings portal it activates
+    const settings = `${appHome().XDG_CONFIG_HOME}/glib-2.0/settings`;
+    mkdirSync(settings, { recursive: true });
+    writeFileSync(`${settings}/keyfile`,
       "[org/gnome/desktop/wm/preferences]\nbutton-layout='appmenu:minimize,maximize,close'\n");
     // GTK apps refuse to start without a session bus. Not dbus-run-session: a
     // signal to it leaves its bus up, and every service the bus activated
@@ -500,14 +637,67 @@ async function nautilus() {
 
   // offsets from the toplevel's origin, nautilus's default floating layout
   const ox = win.originX, oy = win.originY;
-  const popups = () => hl.surfaces().filter((s) => s.role === ROLE_POPUP && s.conn === win.conn).length;
+  const popupList = () => hl.surfaces().filter((s) => s.role === ROLE_POPUP && s.conn === win.conn);
+  const popups = () => popupList().length;
   hl.click(ox + 184, oy + 48); // the hamburger button
   await until(() => popups() > 0, 5000, 'the menu popup');
   check(true, 'hamburger menu opened as an xdg_popup');
   await settle();
+  // placed below the button: positioners count from the window geometry
+  // (inside the shadow), the menu's own shadow hangs outside its geometry
+  // (GTK4's popover: a wide one, the arrow inside it — only the fixture's
+  // geometry is known here, checked exactly below)
+  const pop = popupList()[0]!;
+  const px = win.originX + pop.x, py = win.originY + pop.y;
+  check(px <= ox + 184 && px + pop.logicalWidth > ox + 184 && py > oy + 8 && py < oy + 48 + 24 && py + pop.logicalHeight > oy + 48 + 24,
+    `the menu hangs below the button (its surface at ${px - ox},${py - oy} of the window's, ${pop.logicalWidth}x${pop.logicalHeight})`);
+  // the fixture's menus: a 6 px shadow around their geometry, which
+  // `POPUP at X,Y` (the configure) places from the window's box
+  const PM = 6;
+  const configured = (n: number) => {
+    const all = [...app.text().matchAll(/POPUP at (-?\d+),(-?\d+)/g)];
+    return all.length >= n ? [Number(all[n - 1]![1]), Number(all[n - 1]![2])] as const : null;
+  };
+  if (!realApps) {
+    await until(() => configured(1), 3000, 'the menu\'s configure');
+    const [cx, cy] = configured(1)!;
+    check(px === win.x + cx - PM && py === win.y + cy - PM,
+      `its geometry lands at the configured ${cx},${cy} of the window geometry (surface at ${px - win.x},${py - win.y})`);
+    // maximized under the open menu: the window drops its shadow (geometry
+    // 24,24 → 0,0) and the menu, which does not commit again, follows the
+    // frame (a 'position' event): still at the configured offset of the box
+    const menuCommits = hl.surfaces().find((s) => s.surface === pop.surface)!.commits;
+    hl.setMaximized(win, true);
+    await until(() => hl.windows()[0]?.maximized && hl.windows()[0]!.originX === hl.windows()[0]!.x, 5000, 'the maximized frame');
+    await settle();
+    const mw = hl.windows()[0]!, mp = popupList()[0];
+    check(mp && mp.commits === menuCommits && mw.originX + mp.x === mw.x + cx - PM && mw.originY + mp.y === mw.y + cy - PM,
+      `the open menu followed the frame to ${mp && mw.originX + mp.x - mw.x},${mp && mw.originY + mp.y - mw.y} of the maximized box without committing`);
+    hl.setMaximized(mw, false);
+    await until(() => !hl.windows()[0]?.maximized && hl.windows()[0]!.originX < hl.windows()[0]!.x, 5000, 'the floating frame');
+    await settle();
+    win = hl.windows()[0]!;
+  }
   hl.click(ox + 500, oy + 450);
   await until(() => popups() === 0, 5000, 'the popup to be dismissed');
   check(true, 'an outside press dismissed it (popup_done → unmap)');
+
+  if (!realApps) {
+    // l3afpad's case: a right-click menu at the pointer; its frame's corner
+    // is just past the click, and a click on an item hits that item
+    await settle();
+    const rx = ox + 600, ry = oy + 400;
+    hl.click(rx, ry, 'right');
+    await until(() => popups() > 0 && configured(2), 5000, 'the context menu');
+    await settle();
+    const ctxPop = popupList()[0]!;
+    const qx = win.originX + ctxPop.x + PM, qy = win.originY + ctxPop.y + PM;
+    check(qx === rx + 1 && qy === ry + 1, `right-click at ${rx},${ry}: the menu's corner at ${qx},${qy}`);
+    hl.click(qx + 100, qy + 8 + 36 + 18); // its second item
+    await until(() => /MENU /.test(app.text()) && popups() === 0, 3000, 'the item to be chosen');
+    const item = /MENU (.+)/.exec(app.text())![1];
+    check(item === 'Paste', `a click on the second item chose "${item}" and closed the menu`);
+  }
 
   // the header bar's minimize button: right of the path bar, left of
   // maximize and close (box-relative, the floating layout)
@@ -607,6 +797,107 @@ async function scale2() {
   hl.setOutput(hl.output.width, hl.output.height, 1);
 }
 
+async function gpu() {
+  console.log('== a GPU client: dmabufs named as resources (--dmabuf virtgpu, test-only device) ==');
+  if (realApps) return console.log('  skipped: fixtures only (virtgpu:@fake takes memfds, not a real GPU\'s dmabufs)');
+  const spec = need('dmabuf');
+  if (!spec) return;
+  // a relay of its own: the main one takes no dmabufs
+  const display = 'wland-hl-gpu', port = PORT + 1;
+  if (!/virtgpu/.test(spawnSync(RELAY[0], [...RELAY.slice(1), '--help'], { encoding: 'utf8' }).stderr ?? '')) {
+    return console.log('  skipped: this relay has no --dmabuf virtgpu (WLAND_E2E_RELAY: an older build)');
+  }
+  const relay2 = run(RELAY[0], [...RELAY.slice(1), '--port', String(port), '--web-root', webRoot, '--display', display, '--xwayland', 'off', '--dmabuf', 'virtgpu:@fake']);
+  let hl2: Headless | null = null;
+  const refs: GpuRef[] = [];
+  const errs: string[] = [];
+  let released = 0, open2 = false;
+  try {
+    for (let up = false; !up;) {
+      if (!alive(relay2)) throw new Error('FAIL: the virtgpu relay exited at startup');
+      up = await fetch(`http://127.0.0.1:${port}/`).then(() => true, () => false);
+      if (!up) await sleep(50);
+    }
+    hl2 = await createHeadless({
+      link: `ws://127.0.0.1:${port}/ws`, width: 800, height: 600,
+      // a stand-in renderer: each resource a colour of its own
+      gpu: {
+        resolve(ref) {
+          refs.push(ref);
+          const data = new Uint8Array(ref.width * ref.height * 4);
+          const c = [0x40 * (ref.resource % 4), 0x80, 0xff - 0x30 * (ref.resource % 4), 0xff];
+          for (let i = 0; i < data.length; i += 4) data.set(c, i);
+          return { width: ref.width, height: ref.height, data };
+        },
+        release() { released++; },
+      },
+      onEvent(ev) {
+        if (ev.type === 'open') open2 = true;
+        else if (ev.type === 'error') errs.push(ev.detail);
+      },
+    });
+    await until(() => open2, 5000, 'the virtgpu link to open');
+    const app2 = run(spec.cmd, spec.args, { ...spec.env, WAYLAND_DISPLAY: display });
+    let out = '';
+    app2.stdout!.on('data', (c) => { out += c; });
+    await until(() => refs.length > 40 || !alive(app2), 10000, 'GPU commits');
+    check(alive(app2) && refs.length > 40, `${refs.length} COMMITs of kind virtgpu, the client still drawing (its two buffers came back after their ACKs)`);
+    check(/dmabuf: format XR24 modifier 0x00ffffffffffffff/.test(out), 'the client picked XRGB8888 with the implicit modifier from the feedback');
+    const resources = new Set(refs.map((r) => r.resource));
+    // (a buffer released before the next frame is drawn again: one or both)
+    check(resources.size >= 1 && resources.size <= 2 && [...resources].every((r) => r >= 1), `a resource per buffer drawn (${[...resources].join(', ')} for its two)`);
+    const bad = refs.filter((r) => r.width !== 256 || r.height !== 192 || r.format !== 0x34325258 || r.flags !== 0
+      || r.offset !== 0 || r.stride !== 1024 || r.modifier !== 0x00ffffffffffffffn);
+    check(bad.length === 0, 'every ref: 256x192 XR24, stride 1024, modifier MOD_INVALID, flags 0');
+    const win = hl2.windows()[0]!;
+    const surf = hl2.surfaces().find((s) => s.conn === win.conn && s.surface === win.surface)!;
+    check(win.title === 'simple-dmabuf-egl' && surf.gpu?.kind === 'virtgpu', `its window ("${win.title}") shows a GPU buffer (resource ${surf.gpu?.resource})`);
+    check(colours(hl2.screenshot({ window: win })) >= 1 && released > 0, `resolved images drawn and released (${released})`);
+    await stop(app2);
+    await until(() => hl2!.windows().length === 0, 5000, 'the window to go');
+    check(released === refs.length, `every resolved image released (${released}/${refs.length})`);
+    check(errs.length === 0, `no engine error events ${errs.join('; ')}`);
+
+    // the same relay, a page with no gpu source: the relay's FEATURE
+    // dmabuf_kind (virtgpu) makes the core leave linux-dmabuf off, so a GPU
+    // client can't take a path nothing would show
+    hl2.dispose();
+    hl2 = null;
+    const logs: string[] = [];
+    let open3 = false;
+    hl2 = await createHeadless({
+      link: `ws://127.0.0.1:${port}/ws`, width: 800, height: 600,
+      onEvent(ev) {
+        if (ev.type === 'open') open3 = true;
+        else if (ev.type === 'log') logs.push(ev.line);
+        else if (ev.type === 'error') errs.push(ev.detail);
+      },
+    });
+    await until(() => open3, 5000, 'the gpu-less link to open');
+    await until(() => logs.some((l) => /linux-dmabuf not offered/.test(l)), 3000, 'the core to refuse linux-dmabuf');
+    check(true, 'no gpu source: the core logged that linux-dmabuf is not offered');
+    // weston-simple-dmabuf-egl exits without the global; so does its fixture
+    const app3 = run(spec.cmd, spec.args, { ...spec.env, WAYLAND_DISPLAY: display });
+    let err3 = '';
+    app3.stderr!.on('data', (c) => { err3 += c; });
+    await until(() => !alive(app3), 5000, 'the GPU client to give up');
+    check(app3.exitCode !== 0 && /zwp_linux_dmabuf_v1 is not advertised/.test(err3), `the GPU client finds no zwp_linux_dmabuf_v1 and exits (${err3.trim()})`);
+    const soft = need('shm');
+    if (soft) {
+      const app4 = run(soft.cmd, soft.args, { ...soft.env, WAYLAND_DISPLAY: display });
+      await until(() => hl2!.windows().length > 0, 5000, 'a wl_shm window on the gpu-less link');
+      await sleep(300);
+      check(colours(hl2.screenshot({ window: hl2.windows()[0]! })) > 4, 'a wl_shm client still draws there');
+      await stop(app4);
+    }
+    check(errs.length === 0, `no engine error events ${errs.join('; ')}`);
+  } finally {
+    hl2?.dispose();
+    relay2.kill('SIGTERM');
+    await until(() => !alive(relay2), 3000, 'the virtgpu relay to exit').catch(() => {});
+  }
+}
+
 let code = 0;
 try {
   // the WS link connects once: the relay must be listening first
@@ -622,6 +913,7 @@ try {
       else if (ev.type === 'open') opened = true;
       else if (ev.type === 'error') errors.push(ev.detail);
       else if (ev.type === 'title') titles.push(ev.title);
+      else if (ev.type === 'move' || ev.type === 'resize') grabs.push(ev.type);
     },
   });
   await until(() => opened || !alive(relay), 10000, 'the link to open');
@@ -637,6 +929,7 @@ try {
   await nautilus();
   await x11();
   await scale2();
+  await gpu();
   check(errors.length === 0, `no engine error events ${errors.join('; ')}`);
   console.log('HEADLESS-E2E PASS');
 } catch (e) {

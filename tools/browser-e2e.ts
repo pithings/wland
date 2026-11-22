@@ -22,7 +22,9 @@
 //   sweep        any toplevel: pointer sweep, clicks, wheel; motion coalescing;
 //                a drag out of the window keeps the pressed surface (implicit grab)
 //   layout       foot: CSD subsurfaces assembled around the grid
-//   resize       any toplevel: drag the app's own resize border
+//   resize       any toplevel: a quick click on the app's own resize border
+//                starts no grab (its request comes after the release); a
+//                drag on it resizes
 //   hole         foot + a second term over it (Alt+dragged: the box captures)
 //                with a border-only input region: a click in the hole reaches
 //                the term behind (focus, raise); the border and the
@@ -37,7 +39,9 @@
 //                exit the page didn't ask for reaches the app as unlocked
 //   dnd          fixture `files` only: its file dragged onto its folder (the
 //                browser's pointer → wm dnd → wl_data_device) arrives
-//   gtk          nautilus: popup opens, outside click dismisses, navigation
+//   gtk          nautilus: popup opens below its button, outside click
+//                dismisses, navigation; the fixture's right-click menu
+//                lands at the pointer (positioners from the window geometry)
 //   csd          nautilus: headerbar drag moves, maximize and restore buttons
 //   states       ?browserfs=1, spawns foot: Alt+F11 fills the desktop and
 //                takes the browser's fullscreen, leaving that ends foot's;
@@ -45,12 +49,22 @@
 //   retina       dpr 2 → 2x buffers shown at logical size (spawns foot)
 //   takeover     the first tab after a second connected: notice, no reload
 //   webgl        forced GL present path, software GL at dpr 1 (spawns foot)
+//   clipboard    foot: the clipboard bridge (lib/clipboard.ts) in a real
+//                browser — the page clipboard's text (writeText; only write
+//                access granted, so it must come in the paste event) pasted
+//                into foot by Ctrl+Shift+V runs as a printf (retitle); a
+//                word double-clicked in foot and Ctrl+Shift+C (the fixture
+//                copies its last output line, the same word) reaches the
+//                page clipboard (read back with clipboard-read); Ctrl+C and
+//                the copy command in the desktop leave it as it was (no
+//                page selection copied)
 //   handle-demo [origin]   /handle-demo.html: link v2 handle path in one page
 // Drivers, for exploring by hand (tools/dnd-test.sh uses `drag`):
 //   drag x1 y1 x2 y2   slow drag, px relative to nautilus's main canvas
 //   shot <file.png>    page screenshot      log [grep]   window.wlandLog tail
 
-import { app as appFor, type AppRole } from "../test/support/apps.ts";
+import { app as appFor, realApps, type AppRole } from "../test/support/apps.ts";
+import { isolatedMirror } from "../test/support/isolated.ts";
 
 const [phase = "", cdpPort = "9222", ...args] = process.argv.slice(2);
 
@@ -141,6 +155,28 @@ async function drag(from: [number, number], to: [number, number], steps: number,
 async function key(k: string, code: string, text?: string) {
   await call("Input.dispatchKeyEvent", { type: "keyDown", key: k, code, text });
   await call("Input.dispatchKeyEvent", { type: "keyUp", key: k, code });
+}
+
+/** Ctrl+Shift+<letter>, as a keyboard sends it (the browser maps it to its
+ *  editing commands: Ctrl+Shift+V is a paste). */
+async function ctrlShift(letter: string) {
+  const L = letter.toUpperCase();
+  const steps: [string, string, number, number][] = [
+    ["Control", "ControlLeft", 17, 2], ["Shift", "ShiftLeft", 16, 10], [L, `Key${L}`, L.charCodeAt(0), 10],
+  ];
+  for (const [k, code, vk, modifiers] of steps)
+    await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
+  for (const [k, code, vk, modifiers] of steps.reverse())
+    await call("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, modifiers: k === "Control" ? 0 : modifiers & ~(k === "Shift" ? 8 : 0) });
+}
+
+/** Type plain text: lowercase letters, digits, space, '-', '=', ';'. */
+async function typeText(text: string) {
+  for (const ch of text) {
+    const code = ch === " " ? "Space" : ch === "-" ? "Minus" : ch === "=" ? "Equal" : ch === ";" ? "Semicolon" : /[0-9]/.test(ch) ? `Digit${ch}` : `Key${ch.toUpperCase()}`;
+    await key(ch, code, ch);
+    await sleep(30);
+  }
 }
 
 // --- page-side probes ------------------------------------------------------
@@ -236,6 +272,85 @@ const phases: Record<string, () => Promise<void>> = {
     if (typed.sum === before.sum) fail("typing did not change the terminal");
     if (after.sum === typed.sum) fail("enter did not change the terminal");
     console.log("terminal ok: typing renders");
+  },
+
+  async clipboard() {
+    const s = await waitMain();
+    // headless: the page counts as focused (the bridge writes only then)
+    await call("Emulation.setFocusEmulationEnabled", { enabled: true });
+    const origin: string = await evalJs("location.origin");
+    const grant = async (permissions: string[]) => {
+      const r = await call("Browser.grantPermissions", { origin, permissions });
+      if (r.error) fail(`Browser.grantPermissions(${permissions}): ${JSON.stringify(r.error)}`);
+    };
+    // page → foot. Write access only: no readText on focus, the text has
+    // to come in the browser's paste event
+    await grant(["clipboardSanitizedWrite"]);
+    const readState = await evalJs("navigator.permissions.query({ name: 'clipboard-read' }).then((p) => p.state)");
+    if (readState === "granted") fail("clipboard-read is granted already: this half would not test the paste event");
+    const title = "PASTED-FROM-PAGE";
+    const wrote = await evalJs(`navigator.clipboard.writeText("printf '\\\\033]2;${title}\\\\007'").then(() => true, (e) => String(e))`);
+    if (wrote !== true) fail(`the page's writeText: ${wrote}`);
+    await click(s.x + s.cw / 2, s.y + s.ch / 2, 100); // focus foot
+    await sleep(300);
+    await ctrlShift("v");
+    await sleep(300);
+    await key("Enter", "Enter", "\r");
+    // (real foot's shell may retitle at its next prompt: the page's log
+    // keeps the app's set_title requests)
+    const retitled = `document.title.includes(${JSON.stringify(title)}) || window.wlandLog.some((l) => l.includes('set_title') && l.includes(${JSON.stringify(title)}))`;
+    for (let i = 0; i < 50 && !(await evalJs(retitled)); i++) await sleep(100);
+    const got: string = await evalJs("document.title");
+    if (!(await evalJs(retitled))) fail(`Ctrl+Shift+V did not paste the page clipboard into foot (title "${got}"; log: ${await evalJs("window.wlandLog.slice(-5).join(' | ')")})`);
+    console.log(`page → foot ok: the pasted printf retitled it (title now "${got}")`);
+
+    // foot → page: `clear; echo` leaves the word alone on the first row; a
+    // double click on it selects it in real foot (the fixture copies its
+    // last output line, the same word), Ctrl+Shift+C copies
+    await typeText("clear; echo wland-from-foot");
+    await key("Enter", "Enter", "\r");
+    await sleep(500);
+    const [wx, wy] = [s.x + 40, s.y + 8]; // inside the 15-cell word for any cell over 3 px
+    await mouse("mouseMoved", wx, wy);
+    for (const n of [1, 2]) {
+      await mouse("mousePressed", wx, wy, { button: "left", buttons: 1, clickCount: n });
+      await mouse("mouseReleased", wx, wy, { button: "left", buttons: 0, clickCount: n });
+    }
+    await sleep(300);
+    await ctrlShift("c"); // the gesture the write rides on
+    await grant(["clipboardReadWrite", "clipboardSanitizedWrite"]);
+    let page = "";
+    for (let i = 0; i < 50; i++) {
+      page = await evalJs("navigator.clipboard.readText().catch((e) => 'ERR ' + e)");
+      if (page === "wland-from-foot") break;
+      await sleep(100);
+    }
+    if (page !== "wland-from-foot") fail(`foot's Ctrl+Shift+C did not reach the page clipboard ("${page}"; log: ${await evalJs("window.wlandLog.filter((l) => l.includes('clipboard')).join(' | ')")})`);
+    console.log("foot → page ok: the page clipboard holds foot's copy");
+
+    // the page's selection is never copied from the desktop: Ctrl+C there
+    // (an interrupt; nothing owed: a plain key) and the browser's copy
+    // command (its copy event cancelled with nothing set) leave the page
+    // clipboard as it was
+    await evalJs(`(() => {
+      const p = document.createElement('p');
+      p.textContent = 'STALE PAGE TEXT';
+      Object.assign(p.style, { position: 'fixed', left: '10px', bottom: '10px', margin: '0', zIndex: '10000', background: '#fff' });
+      document.body.appendChild(p);
+      getSelection().selectAllChildren(p);
+      return true;
+    })()`);
+    await click(s.x + s.cw / 2, s.y + s.ch / 2, 100);
+    await sleep(200);
+    await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, modifiers: 2 });
+    await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "c", code: "KeyC", windowsVirtualKeyCode: 67, modifiers: 2 });
+    await call("Input.dispatchKeyEvent", { type: "keyUp", key: "c", code: "KeyC", windowsVirtualKeyCode: 67, modifiers: 2 });
+    await call("Input.dispatchKeyEvent", { type: "keyUp", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, modifiers: 0 });
+    await call("Runtime.evaluate", { expression: "document.execCommand('copy')", userGesture: true, returnByValue: true });
+    await sleep(200);
+    page = await evalJs("navigator.clipboard.readText().catch((e) => 'ERR ' + e)");
+    if (page !== "wland-from-foot") fail(`Ctrl+C / the copy command in the desktop changed the page clipboard ("${page}")`);
+    console.log("desktop copy chord ok: no page selection copied, a cancelled empty copy event keeps the clipboard");
   },
 
   // M7.4, and the check for input changes: many fast moves, left/right
@@ -621,9 +736,30 @@ const phases: Record<string, () => Promise<void>> = {
       fail(`corner off-viewport at ${corner.right},${corner.bottom}`);
     }
     const DX = 140, DY = 90;
+    const OFFSETS = [[2, 2], [-3, -3], [-8, -8], [-14, -14]] as const;
+    // a quick click on the border first: the app asks for the resize after
+    // the release, and nothing may follow the pointer then (a grab started
+    // anyway kept resizing until the next click)
+    const boxNow = (): Promise<string> => evalJs(`(() => {
+      const r = ${MAIN}.closest('.wland-window').getBoundingClientRect();
+      return [r.left, r.top, r.width, r.height].join();
+    })()`);
+    const box0 = await boxNow();
+    for (const [ox, oy] of OFFSETS) {
+      const sx = corner.right + ox, sy = corner.bottom + oy;
+      await click(sx, sy, 100);
+      await sleep(300);
+      await mouse("mouseMoved", sx + DX, sy + DY, { buttons: 0 });
+      await sleep(300);
+      await mouse("mouseMoved", sx + DX + 20, sy + DY + 10, { buttons: 0 });
+      await sleep(500);
+      const box1 = await boxNow();
+      if (box1 !== box0) fail(`a quick click at the border (${ox},${oy}) moved or resized the window: ${box0} → ${box1}`);
+    }
+    console.log(`quick clicks on the border: the window stays ${box0}`);
     let after = before;
     const grew = () => after.w > before.w + 40;
-    for (const [ox, oy] of [[2, 2], [-3, -3], [-8, -8], [-14, -14]] as const) {
+    for (const [ox, oy] of OFFSETS) {
       const sx = corner.right + ox, sy = corner.bottom + oy;
       await mouse("mouseMoved", sx, sy);
       await sleep(100);
@@ -657,7 +793,7 @@ const phases: Record<string, () => Promise<void>> = {
       return { l: r.left, t: r.top };
     })()`);
     const popupVisible = (): Promise<boolean> => evalJs(
-      `[...document.querySelectorAll('#desktop canvas')].some(c => c.style.zIndex === '20' && c.style.display !== 'none')`);
+      `[...document.querySelectorAll('#desktop canvas')].some(c => wland.view.surfaceOf(c)?.role === 4 && c.style.display !== 'none')`);
     const plainClick = async (x: number, y: number) => {
       await mouse("mouseMoved", x, y);
       await mouse("mousePressed", x, y, { button: "left", clickCount: 1 });
@@ -679,17 +815,50 @@ const phases: Record<string, () => Promise<void>> = {
     console.log(`input region: ${JSON.stringify(region)}`);
     if (!region.hit || !region.inert || region.shadow || !region.margin || !region.inside) fail("nautilus's input region is not applied");
 
+    const popupRect = (): Promise<{ l: number; t: number; w: number; h: number } | null> => evalJs(`(() => {
+      const c = [...document.querySelectorAll('#desktop canvas')].find(c => wland.view.surfaceOf(c)?.role === 4 && c.style.display !== 'none');
+      if (!c) return null;
+      const r = c.getBoundingClientRect();
+      return { l: r.left, t: r.top, w: r.width, h: r.height };
+    })()`);
     let cr = await origin();
     await plainClick(cr.l + 184, cr.t + 48);
     await sleep(1500);
     if (!(await popupVisible())) fail("hamburger menu popup did not open");
-    console.log("menu popup opened");
+    // below the button: positioners count from the window geometry, inside
+    // the shadow (GTK4's popover has a wide shadow: its surface may start a
+    // little above the button's bottom)
+    const pr = (await popupRect())!;
+    if (!(pr.l <= cr.l + 184 && pr.l + pr.w > cr.l + 184 && pr.t > cr.t + 8 && pr.t < cr.t + 72 && pr.t + pr.h > cr.t + 72)) {
+      fail(`the menu is not below its button: surface at ${pr.l - cr.l},${pr.t - cr.t} of the window's`);
+    }
+    console.log(`menu popup opened below its button (surface at ${pr.l - cr.l},${pr.t - cr.t})`);
 
     cr = await origin();
     await plainClick(cr.l + 500, cr.t + 450);
     await sleep(1500);
     if (await popupVisible()) fail("popup did not dismiss on outside click");
     console.log("menu popup dismissed");
+
+    if (!realApps) {
+      // the fixture's right-click menu (l3afpad's shape): anchored at the
+      // pointer in window-geometry px, its frame 6 px inside its shadow —
+      // the frame's corner lands just past the pointer
+      cr = await origin();
+      const rx = Math.round(cr.l + 600), ry = Math.round(cr.t + 400);
+      await mouse("mouseMoved", rx, ry);
+      await mouse("mousePressed", rx, ry, { button: "right", buttons: 2, clickCount: 1 });
+      await mouse("mouseReleased", rx, ry, { button: "right", buttons: 0, clickCount: 1 });
+      await sleep(1500);
+      const q = await popupRect();
+      if (!q) fail("the right-click menu did not open");
+      const qx = q.l + 6, qy = q.t + 6;
+      if (Math.abs(qx - (rx + 1)) > 0.5 || Math.abs(qy - (ry + 1)) > 0.5) fail(`right-click at ${rx},${ry}: the menu's corner at ${qx},${qy}`);
+      console.log(`right-click menu at the pointer: corner ${qx},${qy} for a click at ${rx},${ry}`);
+      await plainClick(qx + 100, qy + 8 + 36 + 18); // an item: the fixture closes it
+      await sleep(1000);
+      if (await popupVisible()) fail("a click on a menu item left the menu open");
+    }
 
     // the first icon, ~(307,145) in nautilus's default view (run-poc opens
     // a fixture directory whose only entry is a folder)
@@ -1038,8 +1207,8 @@ const phases: Record<string, () => Promise<void>> = {
 // the rAF clock (vsync, the measured interval; each time checked by the
 // client against the relay's clock), and a click and typed keys reach the
 // client under the pointer. Modes: 2D (core-swizzled rgba) and WebGL (bgra/bgrx
-// rows, shader swizzle), sync and async HandleSource, stream and memory
-// links. args[0]: the origin serving the built pages (default: the tab's).
+// rows, shader swizzle), sync and async HandleSource (also its readv and
+// view shapes), stream and memory links. args[0]: the origin serving the built pages (default: the tab's).
 async function handleDemo() {
   await call("Page.enable");
   await call("Emulation.clearDeviceMetricsOverride");
@@ -1116,9 +1285,9 @@ async function handleDemo() {
     console.log(`  close ok; grip resize ${before.w}x${before.h} → ${resized.w}x${resized.h}; maximize → ${max.w}x${max.h}; handles ${s.handles}`);
   }
 
-  async function runMode(mode: string, ops: boolean) {
+  async function runMode(mode: string, ops: boolean, from = origin) {
     const bad = (msg: string): never => fail(`[${mode}] ${msg}`);
-    await call("Page.navigate", { url: `${origin}/handle-demo.html?${mode}` });
+    await call("Page.navigate", { url: `${from}/handle-demo.html?${mode}` });
     let ready = false;
     for (let i = 0; i < 60 && !ready; i++) {
       await sleep(250);
@@ -1149,6 +1318,9 @@ async function handleDemo() {
     }
     if (s1.acks < s1.commits - 4) bad(`ACKs lag COMMITs: ${s1.acks} vs ${s1.commits}`);
     if (s1.tokens !== s1.handles || s1.exports !== s1.handles) bad(`handle accounting: ${JSON.stringify(s1)}`);
+    if (mode.includes("sab=1") && !(s1.isolated && (!mode.includes("shape=view") || s1.sharedViews > s0.sharedViews))) {
+      bad(`sab mode: isolated ${s1.isolated}, shared views ${s0.sharedViews} → ${s1.sharedViews} (pixels straight from SharedArrayBuffer memory)`);
+    }
     if (mode.includes("gpu=1") && !(s1.resolves > s0.resolves && s1.gpuReleased === s1.resolves && s1.reads === 0)) {
       bad(`gpu mode: resolves/releases/reads ${JSON.stringify(s1)} (every resolve released, no handle reads)`);
     }
@@ -1179,12 +1351,27 @@ async function handleDemo() {
       `feedback ${fb.map(([n, r]) => `${n}@${(r / 1e6).toFixed(1)}ms`).join(' ')} vsync, click+keys ok, 0 violations`);
   }
 
-  for (const mode of ["webgl=never", "webgl=never&async=1&link=memory", "webgl=always", "webgl=always&async=1", "gpu=1&webgl=never", "gpu=1&webgl=always"]) {
+  for (const mode of ["webgl=never", "webgl=never&async=1&link=memory", "webgl=always", "webgl=always&async=1",
+    "webgl=always&shape=view", "webgl=never&async=1&shape=readv", "gpu=1&webgl=never", "gpu=1&webgl=always"]) {
     console.log(`handle demo: ${mode}`);
     await runMode(mode, mode === "webgl=never");
   }
+  // SharedArrayBuffer pools: the page must be cross-origin isolated, which
+  // wlandr's server isn't — a mirror of it that adds COOP/COEP is. With
+  // shape=view the commit's pixels ARE shared memory: GL uploads them with
+  // texSubImage2D (or its copy fallback), 2D has the core swizzle from them.
+  const mirror = await isolatedMirror(origin);
+  try {
+    for (const mode of ["sab=1&shape=view&webgl=always", "sab=1&shape=view&webgl=never", "sab=1&async=1&shape=readv&webgl=always",
+      "sab=1&gpu=1&webgl=never"]) {
+      console.log(`handle demo (cross-origin isolated): ${mode}`);
+      await runMode(mode, false, mirror.origin);
+    }
+  } finally {
+    await mirror.close();
+  }
   await call("Page.navigate", { url: "about:blank" });
-  console.log("handle-demo ok: 2D + WebGL, sync + async source, stream + memory link, virtgpu COMMITs through a gpu source");
+  console.log("handle-demo ok: 2D + WebGL, sync + async source (read, readv, view), stream + memory link, virtgpu COMMITs through a gpu source, SharedArrayBuffer pools");
 }
 
 // --- main ------------------------------------------------------------------

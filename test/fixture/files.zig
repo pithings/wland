@@ -9,6 +9,13 @@
 //! Positions, from the surface's top-left (floating), match nautilus's
 //! default layout so tests click the same spots on either:
 //!   (184, 48)      the hamburger button: an xdg_popup menu with a grab
+//!   right button   on the content: a context menu at the pointer (GTK3's
+//!                  l3afpad has the same: anchor rect = the pointer)
+//! Menus are GTK's shape too: a shadow of their own around the window
+//! geometry (PM px), input region = the geometry; positioners count from
+//! the parent's geometry. Each prints `POPUP at X,Y` (its configure: the
+//! menu's geometry from the window's), and a click on an item prints
+//! `MENU <item>` and closes it. Items are ROW px tall from 8 px down.
 //!   (w-121, 47)    minimize (set_minimized; nautilus with the button layout
 //!                  appmenu:minimize,maximize,close — box-relative (w-97, 23))
 //!   (w-86, 48)     maximize (maximized: restore at (w-60, 22))
@@ -33,6 +40,16 @@ const RESIZE = 10;
 const HEADER = 48;
 const BTN_LEFT = 0x110;
 const ICON = 64;
+const BTN_RIGHT = 0x111;
+const PM = 6; // a menu's shadow margin
+const MENU_W = 200;
+const MENU_H = 160;
+const ROW = 36;
+const Menu = enum { hamburger, context };
+const menu_items = [2][4][]const u8{
+    .{ "New Window", "Show Hidden", "Preferences", "About" },
+    .{ "New Folder", "Paste", "Select All", "Properties" },
+};
 
 const Hit = enum { none, shadow, resize, header, hamburger, minimize, maximize, close, folder, file, content };
 
@@ -69,6 +86,7 @@ const Ctx = struct {
     popup_xdg: u32 = 0,
     popup: u32 = 0,
     popup_plane: Plane = undefined,
+    menu: Menu = .hamburger,
     // drag and drop
     ddm: u32 = 0,
     data_device: u32 = 0,
@@ -103,12 +121,13 @@ const Ctx = struct {
         } else if (ev.is("wl_pointer", "motion")) {
             ctx.motion(ev.num(1), ev.num(2));
         } else if (ev.is("wl_pointer", "button")) {
+            if (ev.uint(2) == BTN_RIGHT and ev.uint(3) == 1) return ctx.contextMenu(ev.uint(0));
             if (ev.uint(2) != BTN_LEFT) return;
             if (ev.uint(3) == 1) ctx.press(ev.uint(0)) else ctx.pressed = .none;
         } else if (ev.is("wl_pointer", "axis")) {
             // nothing scrolls
         } else if (ev.id == ctx.popup and ev.is("xdg_popup", "configure")) {
-            // size as asked
+            wl.print("POPUP at {d},{d}", .{ ev.int(0), ev.int(1) }); // size as asked
         } else if (ev.id == ctx.popup and ev.is("xdg_popup", "popup_done")) {
             ctx.closePopup();
         } else if (ev.id == ctx.popup_xdg and ev.is("xdg_surface", "configure")) {
@@ -225,7 +244,8 @@ const Ctx = struct {
 
     fn press(ctx: *Ctx, serial: u32) void {
         const c = ctx.app.c;
-        if (ctx.over != ctx.win.surface) return; // the popup: its items do nothing
+        if (ctx.popup != 0 and ctx.over == ctx.popup_surface) return ctx.menuClick();
+        if (ctx.over != ctx.win.surface) return;
         const h = ctx.hit(ctx.x, ctx.y);
         ctx.pressed = h;
         ctx.press_serial = serial;
@@ -238,7 +258,7 @@ const Ctx = struct {
         switch (h) {
             .resize => c.send(ctx.win.toplevel, "xdg_toplevel", "resize", &.{ .{ .object = ctx.app.seat }, .{ .uint = serial }, .{ .uint = ctx.edges(ctx.x, ctx.y) } }),
             .header => c.send(ctx.win.toplevel, "xdg_toplevel", "move", &.{ .{ .object = ctx.app.seat }, .{ .uint = serial } }),
-            .hamburger => if (ctx.popup != 0) ctx.closePopup() else ctx.openPopup(serial),
+            .hamburger => if (ctx.popup != 0) ctx.closePopup() else ctx.openPopup(serial, .hamburger, .{ 144, 8, 32, 32 }, 2),
             .minimize => c.send(ctx.win.toplevel, "xdg_toplevel", "set_minimized", &.{}),
             .maximize => if (ctx.win.maximized) c.send(ctx.win.toplevel, "xdg_toplevel", "unset_maximized", &.{}) else c.send(ctx.win.toplevel, "xdg_toplevel", "set_maximized", &.{}),
             .close => ctx.done = true,
@@ -264,14 +284,17 @@ const Ctx = struct {
 
     // --- popup menu ---------------------------------------------------------------
 
-    fn openPopup(ctx: *Ctx, serial: u32) void {
+    /// A menu off `anchor` (x, y, w, h of the window geometry, as GTK
+    /// gives it), anchor = gravity = `edge` (2 bottom, 8 bottom_right).
+    fn openPopup(ctx: *Ctx, serial: u32, menu: Menu, anchor: [4]i32, edge: u32) void {
         const c = ctx.app.c;
+        ctx.menu = menu;
         const pos = c.new("xdg_positioner");
         c.send(ctx.app.wm_base, "xdg_wm_base", "create_positioner", &.{.{ .new_id = pos }});
-        c.send(pos, "xdg_positioner", "set_size", &.{ .{ .int = 200 }, .{ .int = 160 } });
-        c.send(pos, "xdg_positioner", "set_anchor_rect", &.{ .{ .int = 144 }, .{ .int = 8 }, .{ .int = 32 }, .{ .int = 32 } });
-        c.send(pos, "xdg_positioner", "set_anchor", &.{.{ .uint = 2 }}); // bottom
-        c.send(pos, "xdg_positioner", "set_gravity", &.{.{ .uint = 2 }});
+        c.send(pos, "xdg_positioner", "set_size", &.{ .{ .int = MENU_W }, .{ .int = MENU_H } });
+        c.send(pos, "xdg_positioner", "set_anchor_rect", &.{ .{ .int = anchor[0] }, .{ .int = anchor[1] }, .{ .int = anchor[2] }, .{ .int = anchor[3] } });
+        c.send(pos, "xdg_positioner", "set_anchor", &.{.{ .uint = edge }});
+        c.send(pos, "xdg_positioner", "set_gravity", &.{.{ .uint = edge }});
         c.send(pos, "xdg_positioner", "set_constraint_adjustment", &.{.{ .uint = 3 }});
         ctx.popup_surface = ctx.app.surface();
         ctx.popup_xdg = c.new("xdg_surface");
@@ -281,20 +304,47 @@ const Ctx = struct {
         c.send(ctx.popup, "xdg_popup", "grab", &.{ .{ .object = ctx.app.seat }, .{ .uint = serial } });
         c.destroy(pos, "xdg_positioner");
         c.send(ctx.popup_surface, "wl_surface", "commit", &.{});
-        ctx.popup_plane = .{ .surface = ctx.popup_surface };
+        ctx.popup_plane = .{ .surface = ctx.popup_surface, .format = wl.ARGB8888 };
         wl.print("POPUP open", .{});
     }
 
+    /// The right button on the content: a menu at the pointer (geometry px).
+    fn contextMenu(ctx: *Ctx, serial: u32) void {
+        if (ctx.over != ctx.win.surface or ctx.hit(ctx.x, ctx.y) != .content) return;
+        if (ctx.popup != 0) ctx.closePopup();
+        const m: f64 = @floatFromInt(ctx.margin);
+        ctx.openPopup(serial, .context, .{ @intFromFloat(@floor(ctx.x - m)), @intFromFloat(@floor(ctx.y - m)), 1, 1 }, 8);
+    }
+
+    /// A press on the menu: its item (menu-local px, the shadow outside).
+    fn menuClick(ctx: *Ctx) void {
+        const x = ctx.x - PM;
+        const y = ctx.y - PM - 8;
+        if (x < 0 or x >= MENU_W or y < 0) return;
+        const row: usize = @intFromFloat(@floor(y / ROW));
+        if (row >= 4) return;
+        wl.print("MENU {s}", .{menu_items[@intFromEnum(ctx.menu)][row]});
+        ctx.closePopup();
+    }
+
     fn drawPopup(ctx: *Ctx) void {
+        const c = ctx.app.c;
         ctx.popup_plane.scale = ctx.win.scale;
-        const b = ctx.popup_plane.buffer(&ctx.app, 200, 160) orelse return;
+        const b = ctx.popup_plane.buffer(&ctx.app, MENU_W + 2 * PM, MENU_H + 2 * PM) orelse return;
         var cv = Plane.canvas(b);
         const s: i32 = @intCast(ctx.win.scale);
-        cv.rect(0, 0, @intCast(b.width), @intCast(b.height), 0xfff4f4f4);
-        cv.rect(0, 0, @intCast(b.width), s, 0xffc0c0c0);
-        for ([_][]const u8{ "New Window", "Show Hidden", "Preferences", "About" }, 0..) |item, i| {
-            cv.text(16 * s, @as(i32, @intCast(16 + i * 36)) * s, 2 * s, 0xff303030, item);
+        @memset(cv.px, 0);
+        var k: i32 = 0;
+        while (k < PM) : (k += 1) cv.rect((PM - k) * s, (PM - k) * s, (MENU_W + 2 * k) * s, (MENU_H + 2 * k) * s, @as(u32, @intCast(10 * k)) << 24);
+        cv.rect(PM * s, PM * s, MENU_W * s, MENU_H * s, 0xfff4f4f4);
+        cv.rect(PM * s, PM * s, MENU_W * s, s, 0xffc0c0c0);
+        for (menu_items[@intFromEnum(ctx.menu)], 0..) |item, i| {
+            cv.text((PM + 16) * s, (PM + @as(i32, @intCast(16 + i * ROW))) * s, 2 * s, 0xff303030, item);
         }
+        c.send(ctx.popup_xdg, "xdg_surface", "set_window_geometry", &.{ .{ .int = PM }, .{ .int = PM }, .{ .int = MENU_W }, .{ .int = MENU_H } });
+        const r = ctx.app.region(&.{.{ PM, PM, MENU_W, MENU_H }});
+        c.send(ctx.popup_surface, "wl_surface", "set_input_region", &.{.{ .object = r }});
+        c.destroy(r, "wl_region");
         ctx.popup_plane.commit(&ctx.app, b);
     }
 

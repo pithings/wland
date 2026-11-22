@@ -8,5 +8,5 @@
     "isolatedDeclarations": false,
     "allowJs": true
   },
-  "include": [".", "../tools/relay-e2e-test.ts", "../tools/headless-e2e-test.ts", "../build.config.ts"]
+  "include": [".", "../tools/relay-e2e-test.ts", "../tools/headless-e2e-test.ts", "../tools/firefox-smoke.ts", "../build.config.ts"]
 }

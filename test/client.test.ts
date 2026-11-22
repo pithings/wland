@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { installFakeDom } from './fake-dom.ts';
-import { createView } from '../lib/view.ts';
+import { createView, watchOutput } from '../lib/view.ts';
 import { createInput } from '../lib/input.ts';
 import { createWindowManager } from '../lib/wm.ts';
 import { createWland, type Wland } from '../lib/client.ts';
@@ -182,7 +182,7 @@ test('view: an input region makes the canvas inert and a hit element clipped to 
     commit(6, 4, 30, 20, 20, 20);
     const popCanvas = view.canvas(1, 6) as any;
     const popHit = popCanvas.parentElement.children[popCanvas.parentElement.children.indexOf(popCanvas) + 1];
-    assert.equal(popHit.style.zIndex, '20');
+    assert.ok(Number(popHit.style.zIndex) > 0 && popHit.style.zIndex === popCanvas.style.zIndex, 'stacked above the toplevel, with its canvas');
     calls.length = 0;
     dom.document.dispatch('pointerdown', { target: popHit, button: 0 });
     assert.ok(!calls.some((c) => c[0] === 'popupDismiss'));
@@ -601,6 +601,190 @@ test('createWland dispose(): unmounts everything and leaves no listener, observe
   }
 });
 
+test('watchOutput: follows the container (a hidden one keeps the last size) and devicePixelRatio; setSize / setScale pin either, null follows again', () => {
+  const dom = installFakeDom();
+  try {
+    const container = dom.container();
+    const calls: unknown[][] = [];
+    const engine = new Proxy({} as Engine, { get: (_, name) => (...args: unknown[]) => { if (name !== 'setSuspended') calls.push([name, ...args]); } });
+    const before = dom.leftovers();
+    const out = watchOutput(engine, container);
+    const take = () => calls.splice(0);
+    assert.deepEqual(take(), [['setOutput', 800, 600], ['setScale', 1, 120]]);
+    assert.deepEqual(out.state(), { width: 800, height: 600, scale: 1, sizePinned: false, scalePinned: false });
+
+    // the page's layout: a container resize is the output's
+    dom.resize(container, 1024, 700);
+    dom.resize(container, 1024, 700); // unchanged: nothing new
+    assert.deepEqual(take(), [['setOutput', 1024, 700]]);
+    dom.resize(container, 0, 0); // display: none — not an output size
+    dom.resize(container, 0, 500);
+    assert.deepEqual(take(), []);
+    assert.equal(out.state().width, 1024);
+    dom.resize(container, 1000, 640);
+    assert.deepEqual(take(), [['setOutput', 1000, 640]]);
+    // zoom / another display, fractional too
+    dom.setDpr(1.5);
+    dom.setDpr(2);
+    assert.deepEqual(take(), [['setScale', 1.5, 180], ['setScale', 2, 240]]);
+
+    // pinned: the page's changes no longer reach the engine
+    out.setScale(1.25);
+    out.setSize({ width: 1280, height: 720 });
+    assert.deepEqual(take(), [['setScale', 1.25, 150], ['setOutput', 1280, 720]]);
+    dom.setDpr(3);
+    dom.resize(container, 900, 600);
+    assert.deepEqual(take(), []);
+    assert.deepEqual(out.state(), { width: 1280, height: 720, scale: 1.25, sizePinned: true, scalePinned: true });
+    out.setScale(2); // re-pinned
+    assert.deepEqual(take(), [['setScale', 2, 240]]);
+    // unpinned: back to what the page says now
+    out.setScale(null);
+    out.setSize(null);
+    assert.deepEqual(take(), [['setScale', 3, 360], ['setOutput', 900, 600]]);
+    dom.setDpr(1);
+    assert.deepEqual(take(), [['setScale', 1, 120]]);
+    assert.throws(() => out.setSize({ width: 0, height: 10 }), RangeError);
+    assert.throws(() => out.setScale(NaN), RangeError);
+    assert.throws(() => out.setScale(-1), RangeError);
+    assert.deepEqual(take(), []);
+
+    out();
+    assert.deepEqual(dom.leftovers(), before);
+    dom.resize(container, 640, 480);
+    dom.setDpr(2);
+    assert.deepEqual(take(), []);
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('createWland output: a fractional scale pinned at start; output.setSize / setScale after start reach the engine and survive resizes', async () => {
+  const dom = installFakeDom();
+  try {
+    const container = dom.container();
+    const link = scriptedLink();
+    const wl = await createWland({ container, wasm, link, webgl: 'never', scale: 1.5 });
+    link.cb!.onOpen();
+    assert.deepEqual(wl.output.state(), { width: 800, height: 600, scale: 1.5, sizePinned: false, scalePinned: true });
+    const calls: unknown[][] = [];
+    const engine = wl.engine as any;
+    for (const name of ['setOutput', 'setScale']) {
+      const real = engine[name];
+      engine[name] = (...args: unknown[]) => { calls.push([name, ...args]); real(...args); };
+    }
+    dom.setDpr(2); // pinned: ignored
+    dom.resize(container, 1200, 800);
+    wl.output.setSize({ width: 1920, height: 1080 });
+    dom.resize(container, 1300, 800); // pinned now
+    wl.output.setScale(null);
+    wl.output.setSize(null);
+    assert.deepEqual(calls, [['setOutput', 1200, 800], ['setOutput', 1920, 1080], ['setScale', 2, 240], ['setOutput', 1300, 800]]);
+    wl.dispose();
+    calls.length = 0;
+    dom.resize(container, 10, 10);
+    assert.deepEqual(calls, []);
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('output: invalid values throw and change nothing (a scale before anything is set up, a size rounding below 1 px, NaN / Infinity)', () => {
+  const dom = installFakeDom();
+  try {
+    const container = dom.container();
+    const calls: unknown[][] = [];
+    const engine = new Proxy({} as Engine, { get: (_, name) => (...args: unknown[]) => { if (name !== 'setSuspended') calls.push([name, ...args]); } });
+    const before = dom.leftovers();
+    for (const bad of [-1, 0, NaN, Infinity]) {
+      assert.throws(() => watchOutput(engine, container, bad), RangeError);
+      assert.deepEqual(dom.leftovers(), before, `scale ${bad}: no observer or listener left`);
+    }
+    assert.deepEqual(calls, []);
+    const out = watchOutput(engine, container);
+    calls.length = 0;
+    for (const bad of [{ width: 0.4, height: 0.4 }, { width: 800, height: 0.49 }, { width: NaN, height: 10 },
+      { width: Infinity, height: 10 }, { width: 10, height: -3 }]) {
+      assert.throws(() => out.setSize(bad), RangeError, `${bad.width} × ${bad.height}`);
+    }
+    assert.throws(() => out.setScale(Infinity), RangeError);
+    assert.throws(() => out.setScale(0), RangeError);
+    assert.deepEqual(calls, []);
+    assert.equal(out.state().sizePinned, false);
+    out.setSize({ width: 0.5, height: 99.6 }); // rounds to 1 × 100: a real size
+    assert.deepEqual(calls, [['setOutput', 1, 100]]);
+    out();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('createWland: an invalid scale or a failed start rejects and leaves nothing behind (no listener, observer, element)', async () => {
+  const dom = installFakeDom();
+  try {
+    const before = dom.leftovers();
+    const container = dom.container();
+    let closed = 0;
+    for (const scale of [-1, 0, NaN]) {
+      const link = scriptedLink();
+      link.close = () => { closed++; };
+      await assert.rejects(createWland({ container, wasm, link, webgl: 'never', scale }), RangeError);
+      assert.deepEqual(dom.leftovers(), before);
+      assert.equal(container.children.length, 0);
+    }
+    assert.equal(closed, 0, 'the link was never started');
+    // a wasm that doesn't load: the view existed already, and is undone
+    await assert.rejects(createWland({ container, wasm: new Uint8Array([0, 1, 2, 3]), link: scriptedLink(), webgl: 'never' }));
+    assert.deepEqual(dom.leftovers(), before);
+    assert.equal(container.children.length, 0);
+    // a later failure (here: the output watch, the last part), after the
+    // engine, input and window manager exist: all of it is undone and the
+    // engine disposed (its link closed)
+    const link = scriptedLink();
+    link.close = () => { closed++; };
+    const g = globalThis as any;
+    const RO = g.ResizeObserver;
+    g.ResizeObserver = class { constructor() { throw new Error('no ResizeObserver'); } };
+    try {
+      await assert.rejects(createWland({ container, wasm, link, webgl: 'never' }), /no ResizeObserver/);
+    } finally {
+      g.ResizeObserver = RO;
+    }
+    assert.equal(closed, 1, 'the engine was disposed: its link closed');
+    assert.deepEqual(dom.leftovers(), before);
+    assert.equal(container.children.length, 0);
+    // and the container is free for a working createWland
+    const wl = await createWland({ container, wasm, link: scriptedLink(), webgl: 'never' });
+    wl.dispose();
+    assert.deepEqual(dom.leftovers(), before);
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('createWland output: inert after dispose (no engine call, no media watch re-armed)', async () => {
+  const dom = installFakeDom();
+  try {
+    const before = dom.leftovers();
+    const container = dom.container();
+    const wl = await createWland({ container, wasm, link: scriptedLink(), webgl: 'never', scale: 2 });
+    const calls: unknown[][] = [];
+    const engine = wl.engine as any;
+    for (const name of ['setOutput', 'setScale']) engine[name] = (...args: unknown[]) => { calls.push([name, ...args]); };
+    wl.dispose();
+    const state = wl.output.state();
+    wl.output.setScale(null);
+    wl.output.setScale(3);
+    wl.output.setSize({ width: 100, height: 100 });
+    wl.output.setSize(null);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(dom.leftovers(), before);
+    assert.deepEqual(wl.output.state(), state);
+  } finally {
+    dom.uninstall();
+  }
+});
+
 test('createWland onWindowsChange: a window whose subsurface commits first is announced at the toplevel commit', async () => {
   const dom = installFakeDom();
   try {
@@ -723,6 +907,86 @@ test('view + wm: fullscreen fills the container, the geometry centred on black, 
     assert.deepEqual([st.left, st.top], ['24px', '48px']);
     r.dispose();
     await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('input: KeyboardEvent.code → evdev, the keypad and the rest of a full keyboard included', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom);
+    r.commit(1, 5);
+    const sink = r.container.children.find((c: any) => c.contentEditable === 'true');
+    r.calls.length = 0;
+    const codes: Record<string, number> = { KeyA: 30, Enter: 28, NumpadEnter: 96, Numpad0: 82, Numpad7: 71, NumpadDecimal: 83,
+      NumpadAdd: 78, NumpadSubtract: 74, NumpadMultiply: 55, NumpadDivide: 98, NumLock: 69, IntlBackslash: 86, ContextMenu: 127, PrintScreen: 99 };
+    for (const code of Object.keys(codes)) {
+      sink.dispatch('keydown', { code, isComposing: false, keyCode: 0 });
+      sink.dispatch('keyup', { code, isComposing: false, keyCode: 0 });
+    }
+    sink.dispatch('keydown', { code: 'Unidentified', isComposing: false, keyCode: 0 });
+    assert.deepEqual(r.calls.filter((c) => c[0] === 'key').map((c) => [c[3], c[4]]),
+      Object.values(codes).flatMap((k) => [[k, true], [k, false]]));
+    r.dispose();
+    await new Promise((res) => setTimeout(res, 0));
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('input: the browser\'s Caps Lock / NumLock state reaches the core before each key and at enter (a keypad digit means NumLock; macOS reports none)', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom);
+    r.commit(1, 5);
+    const sink = r.container.children.find((c: any) => c.contentEditable === 'true');
+    // an event as a browser makes it: getModifierState answers from `on`
+    const press = (code: string, key: string, on: string[] = [], shiftKey = false) => {
+      const ev = { code, key, shiftKey, isComposing: false, keyCode: 0, getModifierState: (m: string) => on.includes(m) };
+      sink.dispatch('keydown', ev);
+      sink.dispatch('keyup', ev);
+    };
+    const seen = () => r.calls.splice(0).filter((c) => c[0] === 'key' || c[0] === 'keyboardLocks')
+      .map((c) => c[0] === 'key' ? `key ${c[3]}${c[4] ? '' : ' up'}` : `locks caps=${c[1]} num=${c[2]}`);
+    r.calls.length = 0;
+    // events without getModifierState (old fakes, synthetic): the core's state stays
+    sink.dispatch('keydown', { code: 'KeyA', isComposing: false, keyCode: 0 });
+    assert.deepEqual(seen(), ['key 30']);
+    // Linux / Windows, NumLock on: Numpad7 types '7'; the locks go first, every time
+    press('Numpad7', '7', ['NumLock']);
+    assert.deepEqual(seen(), ['locks caps=false num=true', 'key 71', 'locks caps=false num=true', 'key 71 up']);
+    // NumLock off: the keypad navigates (Home), and the core is told before the key
+    press('Numpad7', 'Home');
+    assert.deepEqual(seen()[0], 'locks caps=false num=false');
+    // with Shift held the keymap navigates whatever NumLock is: no word on it
+    // from the key (here the NumLock modifier state says on)
+    press('Numpad7', 'Home', ['NumLock'], true);
+    assert.deepEqual(seen()[0], 'locks caps=false num=true');
+    press('Numpad7', 'Home', [], true); // (a false keeps it, as on any key)
+    assert.deepEqual(seen()[0], 'locks caps=false num=true');
+    // macOS: getModifierState('NumLock') is always false, the keypad types digits
+    press('KeyB', 'b'); // a false NumLock on another key keeps what was known
+    assert.deepEqual(seen()[0], 'locks caps=false num=true');
+    press('NumpadDecimal', '.', ['CapsLock']);
+    assert.deepEqual(seen()[0], 'locks caps=true num=true');
+    // the lock keys' own events don't sync (the core toggles on the press;
+    // what their events report differs between browsers) …
+    press('CapsLock', 'CapsLock', []);
+    press('NumLock', 'NumLock', []);
+    assert.deepEqual(seen(), ['key 58', 'key 58 up', 'key 69', 'key 69 up']);
+    // … and the next key brings the browser's word again (both toggled off
+    // here, as the core has them: no change to tell)
+    press('KeyC', 'c', []);
+    assert.deepEqual(seen()[0], 'locks caps=false num=false');
+    // a click focusing another window: its enter is preceded by the click's state
+    r.commit(2, 5);
+    r.calls.length = 0;
+    r.input.focus(1, 5);
+    assert.deepEqual(r.calls.filter((c) => c[0] !== 'pointerButton').map((c) => c[0]),
+      ['keyboardLeave', 'keyboardLocks', 'keyboardEnter']);
+    r.dispose();
+    await new Promise((res) => setTimeout(res, 0));
   } finally {
     dom.uninstall();
   }
@@ -874,6 +1138,269 @@ test('createWland windows(): the states per entry; raise() on a minimized window
     w.raise();
     assert.deepEqual(asked, [[1, 5, false]]);
     wl.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('wm: a move/resize or drag asked for after the release starts nothing; a grab ends at a release it never saw (a move with no button down), a pointercancel or the window blur; Alt+drag ends with its capture', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom);
+    r.commit(1, 5);
+    const canvas = r.view.canvas(1, 5) as any;
+    const el = r.el(1, 5);
+    const doc = dom.document;
+    const down = (x = 10, y = 10) => doc.dispatch('pointerdown', { target: canvas, button: 0, buttons: 1, pointerId: 1, clientX: x, clientY: y });
+    const up = (x = 10, y = 10) => doc.dispatch('pointerup', { target: canvas, button: 0, buttons: 0, pointerId: 1, clientX: x, clientY: y });
+    const move = (x: number, y: number, buttons: number) => doc.dispatch('pointermove', { target: canvas, pointerId: 1, clientX: x, clientY: y, buttons });
+    const names = () => r.calls.map((c) => c[0]);
+
+    // foot at x=24: a quick click on its left border, the resize request
+    // after the release (a slow guest) — no grab, the window stays put
+    const left = el.style.left;
+    down(21, 300);
+    up(21, 300);
+    r.calls.length = 0;
+    r.feed({ type: 'resize', conn: 1, surface: 5, edges: 4 });
+    move(300, 350, 0);
+    assert.equal(el.style.left, left, 'not following the pointer');
+    assert.deepEqual(names(), ['pointerMotion'], 'no leave, no resize: the app keeps the pointer');
+    assert.ok(!doc.body.style.cursor);
+
+    // held: a grab; a move that shows no button down is its release
+    down(10, 10);
+    r.calls.length = 0;
+    r.feed({ type: 'move', conn: 1, surface: 5 });
+    assert.ok(names().includes('pointerLeave'), 'the grab took the pointer');
+    move(30, 10, 1);
+    assert.equal(el.style.left, '20px');
+    move(300, 350, 0);
+    assert.equal(el.style.left, '20px', 'ended where the button was last seen down');
+    assert.ok(!doc.body.style.cursor);
+    r.calls.length = 0;
+    move(400, 400, 0);
+    assert.equal(el.style.left, '20px', 'and over');
+    assert.deepEqual(names(), ['pointerMotion'], 'the app gets the pointer again');
+
+    // a resize grab: the window's blur ends it, with the size so far
+    down(10, 10);
+    r.feed({ type: 'resize', conn: 1, surface: 5, edges: 8 });
+    move(200, 10, 1);
+    r.calls.length = 0;
+    (globalThis as any).window.dispatch('blur');
+    assert.deepEqual(r.calls.filter((c) => c[0] === 'requestResize'), [['requestResize', 1, 5, 190, 60]]);
+    r.calls.length = 0;
+    move(500, 10, 1);
+    assert.ok(!names().includes('requestResize'), 'over');
+
+    // a pointercancel ends one too
+    down(10, 10);
+    r.feed({ type: 'move', conn: 1, surface: 5 });
+    doc.dispatch('pointercancel', { target: canvas, pointerId: 1 });
+    const at = el.style.left;
+    move(600, 10, 1);
+    assert.equal(el.style.left, at);
+    up();
+
+    // a drag asked for after the release is cancelled at once (it would
+    // wedge the seat)
+    down();
+    up();
+    r.calls.length = 0;
+    r.feed({ type: 'drag-start', conn: 1, surface: 5, icon: 0 });
+    assert.deepEqual(r.calls, [['dragCancel']]);
+
+    // Alt+drag ends at the release, or when its capture goes another way
+    doc.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 2, clientX: 0, clientY: 0 });
+    assert.equal(el.captured, 2);
+    el.dispatch('pointermove', { pointerId: 2, clientX: 50, clientY: 40, buttons: 1 });
+    assert.deepEqual([el.style.left, el.style.top], ['50px', '40px']);
+    el.captured = null;
+    el.dispatch('lostpointercapture', { pointerId: 2 });
+    el.dispatch('pointermove', { pointerId: 2, clientX: 90, clientY: 90, buttons: 0 });
+    assert.deepEqual([el.style.left, el.style.top], ['50px', '40px'], 'hovering moves it no more');
+    doc.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 3, clientX: 0, clientY: 0 });
+    el.dispatch('pointermove', { pointerId: 3, clientX: 10, clientY: 10, buttons: 0 });
+    el.dispatch('pointermove', { pointerId: 3, clientX: 70, clientY: 70, buttons: 1 });
+    assert.deepEqual([el.style.left, el.style.top], ['50px', '40px'], 'a move with no button down ends it');
+    assert.equal(el.captured, null);
+
+    r.dispose();
+    assert.equal(dom.leftovers().windowListeners, 0, 'the blur listener is removed');
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('wm: a grab or drag follows the pointer that pressed — another pointer\'s buttonless move, release or cancel (a hovering pen, a mouse beside a touch) neither moves nor ends it', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom);
+    r.commit(1, 5);
+    const canvas = r.view.canvas(1, 5) as any;
+    const el = r.el(1, 5);
+    const doc = dom.document;
+    const ev = (type: string, pointerId: number, x: number, y: number, buttons: number) =>
+      doc.dispatch(type, { target: canvas, button: 0, buttons, pointerId, clientX: x, clientY: y });
+    const names = () => r.calls.map((c) => c[0]);
+
+    // a touch (id 7) presses the titlebar; the app asks for a move
+    ev('pointerdown', 7, 10, 10, 1);
+    r.feed({ type: 'move', conn: 1, surface: 5 });
+    ev('pointermove', 7, 30, 10, 1);
+    assert.equal(el.style.left, '20px');
+    // the mouse (id 1) hovers: no button down, but not the grab's pointer
+    ev('pointermove', 1, 400, 400, 0);
+    assert.equal(el.style.left, '20px', 'not moved by the mouse');
+    ev('pointermove', 7, 50, 10, 1);
+    assert.equal(el.style.left, '40px', 'still the touch\'s grab');
+    // a pen (id 3) taps and lifts, then is cancelled: the grab goes on
+    ev('pointerdown', 3, 300, 300, 1);
+    ev('pointerup', 3, 300, 300, 0);
+    ev('pointercancel', 3, 300, 300, 0);
+    ev('pointermove', 7, 60, 10, 1);
+    assert.equal(el.style.left, '50px');
+    // the touch lifts: the grab ends there
+    ev('pointerup', 7, 60, 10, 0);
+    assert.ok(!doc.body.style.cursor, 'ended');
+    ev('pointermove', 7, 90, 10, 1);
+    assert.equal(el.style.left, '50px');
+
+    // a drag from the touch: the mouse's buttonless move doesn't cancel it,
+    // the touch's cancel does
+    ev('pointerdown', 8, 10, 10, 1);
+    r.feed({ type: 'drag-start', conn: 1, surface: 5, icon: 0 });
+    r.calls.length = 0;
+    ev('pointermove', 1, 200, 200, 0);
+    ev('pointerup', 1, 200, 200, 0);
+    assert.deepEqual(names().filter((n) => n === 'dragCancel' || n === 'dragDrop'), [], 'the mouse ends nothing');
+    ev('pointercancel', 8, 10, 10, 0);
+    assert.deepEqual(names().filter((n) => n === 'dragCancel'), ['dragCancel']);
+    r.feed({ type: 'drag-end' } as Ev);
+
+    // and a resize from the mouse: another pointer's cancel ends nothing,
+    // the mouse's own buttonless move (its release unseen) ends it
+    ev('pointerdown', 1, 10, 10, 1);
+    r.feed({ type: 'resize', conn: 1, surface: 5, edges: 8 });
+    ev('pointercancel', 9, 0, 0, 0);
+    ev('pointermove', 1, 110, 10, 1);
+    r.calls.length = 0;
+    ev('pointermove', 1, 300, 10, 0);
+    assert.deepEqual(r.calls.filter((c) => c[0] === 'requestResize'), [['requestResize', 1, 5, 100, 60]], 'ended with the size so far');
+    r.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('view: the container is made touch-ready (touch-action none, no selection or callout, its own stacking context) and put back on dispose; the IME sink stays selectable', () => {
+  const dom = installFakeDom();
+  try {
+    const container = dom.container();
+    container.style.touchAction = 'pan-y';
+    const view = createView({ container, webgl: 'never' });
+    assert.deepEqual([container.style.touchAction, container.style.userSelect, container.style.webkitUserSelect,
+      container.style.webkitTouchCallout, container.style.isolation], ['none', 'none', 'none', 'none', 'isolate']);
+    const engine = new Proxy({} as Engine, { get: () => () => {} });
+    const input = createInput({ engine, view, container });
+    const sink = container.children.find((c: any) => c.contentEditable === 'true');
+    assert.deepEqual([sink.style.userSelect, sink.style.webkitUserSelect], ['text', 'text']);
+    input.dispose();
+    view.dispose();
+    assert.deepEqual([container.style.touchAction, container.style.userSelect, container.style.isolation], ['pan-y', '', '']);
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('view: popups and subsurfaces follow a \'position\' event (a parent\'s geometry changed under an open menu); a popup\'s subsurfaces stack above it, its child popup above both', () => {
+  const dom = installFakeDom();
+  try {
+    const container = dom.container();
+    const view = createView({ container, webgl: 'never' });
+    const commit = (surface: number, role: Role, x: number, y: number, parent?: number) => view.handle({
+      type: 'commit', conn: 1, surface, role, root: 5, ...(parent === undefined ? {} : { parent }), x, y,
+      maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 23, y: 21, width: 60, height: 40 },
+      width: 20, height: 20, logicalWidth: 20, logicalHeight: 20, format: 'rgba', stride: 0,
+      damage: new Int32Array(0), pixels: new Uint8Array(0),
+    });
+    commit(5, 1, 0, 0, 0);
+    commit(6, 2, 0, -10, 5);   // the toplevel's titlebar subsurface
+    commit(7, 4, 40, 30, 5);   // a menu
+    view.handle({ type: 'input-region', conn: 1, surface: 7, region: new Int32Array([0, 0, 10, 10]) });
+    commit(8, 2, 42, 32, 7);   // the menu's subsurface (committed after the menu)
+    commit(9, 4, 60, 30, 7);   // a submenu
+    commit(10, 2, 2, 2, 5);    // a toplevel subsurface mapped while the menu is open
+    const z = (s: number) => Number(view.canvas(1, s)!.style.zIndex || 0);
+    assert.ok(z(5) < z(6) && z(6) < z(10) && z(10) < z(7), 'toplevel < its subsurfaces < its popup');
+    assert.ok(z(7) < z(8) && z(8) < z(9), 'popup < its subsurface < its child popup');
+    // the hit element stacks with its canvas
+    const pop = view.canvas(1, 7) as any;
+    const hit = pop.parentElement.children[pop.parentElement.children.indexOf(pop) + 1];
+    assert.equal(hit.style.zIndex, pop.style.zIndex);
+
+    // the window maximizes: its geometry goes to 0,0 and the core moves the
+    // popups by that much without a commit of theirs
+    view.handle({ type: 'position', conn: 1, surface: 7, x: 17, y: 9 });
+    view.handle({ type: 'position', conn: 1, surface: 8, x: 19, y: 11 });
+    assert.deepEqual([pop.style.left, pop.style.top], ['17px', '9px']);
+    assert.deepEqual([hit.style.left, hit.style.top], ['17px', '9px'], 'the hit element follows');
+    const sub = view.canvas(1, 8) as any;
+    assert.deepEqual([sub.style.left, sub.style.top], ['19px', '11px']);
+    // not for a toplevel (it sits at its window's origin)
+    view.handle({ type: 'position', conn: 1, surface: 5, x: 50, y: 50 });
+    assert.equal(view.canvas(1, 5)!.style.left, '0px');
+
+    // the submenu closes (destroyed): the rest keep their order
+    view.handle({ type: 'destroy', conn: 1, surface: 9 });
+    assert.ok(z(10) < z(7) && z(7) < z(8));
+    view.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('view: subsurfaces stack by their z (place_above / place_below) — one placed below the toplevel goes under its canvas — and restack on a \'position\' event carrying a new z, hit elements with them', () => {
+  const dom = installFakeDom();
+  try {
+    const container = dom.container();
+    const view = createView({ container, webgl: 'never' });
+    const commit = (surface: number, role: Role, parent: number, z: number) => view.handle({
+      type: 'commit', conn: 1, surface, role, root: 5, parent, z, x: 0, y: 0,
+      maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 60, height: 40 },
+      width: 20, height: 20, logicalWidth: 20, logicalHeight: 20, format: 'rgba', stride: 0,
+      damage: new Int32Array(0), pixels: new Uint8Array(0),
+    });
+    commit(5, 1, 0, 0);
+    commit(6, 2, 5, 2);   // above the toplevel, second
+    commit(7, 2, 5, 1);   // above it, first: under 6 although newer
+    commit(8, 4, 5, 0);   // a popup
+    const z = (s: number) => Number(view.canvas(1, s)!.style.zIndex || 0);
+    assert.ok(z(5) < z(7) && z(7) < z(6) && z(6) < z(8), 'toplevel < 7 < 6 < popup');
+    assert.equal(view.canvas(1, 5)!.style.zIndex, '', 'the toplevel at the bottom: no z-index of its own');
+    view.handle({ type: 'input-region', conn: 1, surface: 7, region: new Int32Array([0, 0, 10, 10]) });
+    const c7 = view.canvas(1, 7) as any;
+    const hit7 = c7.parentElement.children[c7.parentElement.children.indexOf(c7) + 1];
+    assert.equal(hit7.style.zIndex, c7.style.zIndex);
+
+    // the parent's commit restacked them: 7 below the toplevel (a video
+    // under its frame), 6 just above it
+    view.handle({ type: 'position', conn: 1, surface: 7, x: 0, y: 0, z: -1 });
+    view.handle({ type: 'position', conn: 1, surface: 6, x: 0, y: 0, z: 1 });
+    assert.ok(z(7) < z(5) && z(5) < z(6) && z(6) < z(8), '7 < toplevel < 6 < popup');
+    assert.notEqual(view.canvas(1, 5)!.style.zIndex, '', 'the toplevel now has one, above 7');
+    assert.equal(hit7.style.zIndex, c7.style.zIndex, 'the hit element restacks with its canvas');
+    // a 'position' without z (an embedder's) leaves the order alone
+    view.handle({ type: 'position', conn: 1, surface: 7, x: 3, y: 3 });
+    assert.ok(z(7) < z(5));
+    // a subsurface of the one below: still under the toplevel
+    commit(9, 2, 7, 1);
+    assert.ok(z(7) < z(9) && z(9) < z(5));
+    view.dispose();
   } finally {
     dom.uninstall();
   }

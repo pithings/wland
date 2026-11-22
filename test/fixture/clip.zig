@@ -4,7 +4,10 @@
 //! `copy` / `paste`: wl-copy and wl-paste's command lines, over
 //! wl_data_device (or zwp_primary_selection with --primary). copy forks
 //! into the background unless --foreground, and serves the selection until
-//! it is replaced (cancelled); --clear unsets it. paste prints the
+//! it is replaced (cancelled); --clear unsets it; --paste-once (-o) serves
+//! one paste the way wl-copy does: a forked child writes the data and the
+//! source exits at once — its connection is gone before the receiver's
+//! EOF (the child waits a moment to make that certain). paste prints the
 //! selection (a newline added unless --no-newline) or exits 1 without one.
 
 const std = @import("std");
@@ -18,6 +21,7 @@ const Opts = struct {
     primary: bool = false,
     foreground: bool = false,
     clear: bool = false,
+    paste_once: bool = false,
     no_newline: bool = false,
     text: []const u8 = "",
 };
@@ -29,6 +33,7 @@ fn parse(gpa: std.mem.Allocator, args: []const []const u8) Opts {
         if (std.mem.eql(u8, a, "--primary") or std.mem.eql(u8, a, "-p")) o.primary = true
         else if (std.mem.eql(u8, a, "--foreground")) o.foreground = true
         else if (std.mem.eql(u8, a, "--clear") or std.mem.eql(u8, a, "-c")) o.clear = true
+        else if (std.mem.eql(u8, a, "--paste-once") or std.mem.eql(u8, a, "-o")) o.paste_once = true
         else if (std.mem.eql(u8, a, "--no-newline") or std.mem.eql(u8, a, "-n")) o.no_newline = true
         else {
             if (words.items.len > 0) words.append(gpa, ' ') catch {};
@@ -49,21 +54,39 @@ const Ctx = struct {
     selection: ?u32 = null,
     got_selection: bool = false,
     focused: bool = false,
-    /// paste: the 1×1 window that takes keyboard focus (selections go to
-    /// the focused client only; wl-paste does the same)
+    /// copy: the serial of the keyboard enter, what set_selection names
+    enter_serial: ?u32 = null,
+    /// the 1×1 window that takes keyboard focus (paste: selections are
+    /// offered to the focused client only; copy: set by it only — wl-paste
+    /// and wl-copy do the same)
     app: ?*app_mod.App = null,
     win: app_mod.Window = undefined,
     gpa: std.mem.Allocator,
 
     pub fn onEvent(ctx: *Ctx, ev: wl.Event) void {
         if (ctx.app) |app| {
-            if (ev.is("wl_keyboard", "enter")) ctx.focused = true;
+            if (ev.is("wl_keyboard", "enter")) {
+                ctx.focused = true;
+                if (ctx.enter_serial == null) ctx.enter_serial = ev.uint(0);
+            }
             if (ev.is("wl_keyboard", "enter") or ev.is("wl_keyboard", "leave") or ev.iface == (comptime wl.iface("wl_pointer"))) return;
             if (app.handle(ev)) return;
             if (ev.is("wl_buffer", "release")) return;
             _ = ctx.win.handle(app, ev);
         }
         if (ev.is("wl_data_source", "send") or ev.is("zwp_primary_selection_source_v1", "send")) {
+            if (ctx.opts.paste_once) {
+                // wl-copy -o: a child writes, the source leaves at once
+                const pid = linux.fork();
+                if (pid == 0) {
+                    _ = linux.close(ctx.c.fd); // only the parent is the client
+                    var ts: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+                    _ = linux.nanosleep(&ts, null); // the conn is gone first
+                    wl.writeFd(ev.fd, ctx.opts.text);
+                    linux.exit_group(0);
+                }
+                std.process.exit(0); // the fd's last holder is the child
+            }
             wl.writeFd(ev.fd, ctx.opts.text);
             _ = linux.close(ev.fd);
         } else if (ev.is("wl_data_source", "cancelled") or ev.is("zwp_primary_selection_source_v1", "cancelled")) {
@@ -113,10 +136,15 @@ pub fn runCopy(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, args
         }
     }
     var ctx: Ctx = .{ .opts = opts, .gpa = gpa };
-    ctx.c = try wl.Client.connect(gpa, env);
+    // wl-copy with no data-control protocol (wland offers none): a 1×1
+    // window takes keyboard focus — compositors honour selection requests
+    // from the focused client only — the selection is set with its enter's
+    // serial, and the window goes again; the source lives on
+    var app = app_mod.App.init(gpa, env, &ctx);
+    ctx.app = &app;
+    ctx.c = app.c;
     const c = ctx.c;
-    c.start(&ctx);
-    const dev = device(c, opts.primary);
+    const dev = deviceOn(c, app.seat, opts.primary);
     var src: u32 = 0;
     if (!opts.clear) {
         if (opts.primary) {
@@ -131,11 +159,30 @@ pub fn runCopy(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, args
             for (mimes) |m| c.send(src, "wl_data_source", "offer", &.{.{ .string = m }});
         }
     }
-    if (opts.primary) {
-        c.send(dev, "zwp_primary_selection_device_v1", "set_selection", &.{ .{ .object = src }, .{ .uint = 0 } });
-    } else {
-        c.send(dev, "wl_data_device", "set_selection", &.{ .{ .object = src }, .{ .uint = 0 } });
+    c.roundtrip(&ctx);
+    var pool = wl.Pool.create(c, app.shm, 1, 1, 1, wl.ARGB8888, 0);
+    pool.buffers[0].pixels[0] = 0;
+    ctx.win = app_mod.Window.create(&app, "wland-fixture copy", "wland-fixture", 1, 1);
+    const deadline = wl.nowMs() + 5000;
+    var attached = false;
+    while (ctx.enter_serial == null) {
+        if (wl.nowMs() > deadline) wl.fail("no keyboard focus: the selection can't be set", .{});
+        if (ctx.win.configured and !attached) {
+            c.send(ctx.win.surface, "wl_surface", "attach", &.{ .{ .object = pool.buffers[0].id }, .{ .int = 0 }, .{ .int = 0 } });
+            c.send(ctx.win.surface, "wl_surface", "commit", &.{});
+            attached = true;
+        }
+        if (!c.dispatch(&ctx, 100)) std.process.exit(1);
     }
+    const serial = ctx.enter_serial.?;
+    if (opts.primary) {
+        c.send(dev, "zwp_primary_selection_device_v1", "set_selection", &.{ .{ .object = src }, .{ .uint = serial } });
+    } else {
+        c.send(dev, "wl_data_device", "set_selection", &.{ .{ .object = src }, .{ .uint = serial } });
+    }
+    c.destroy(ctx.win.toplevel, "xdg_toplevel");
+    c.destroy(ctx.win.xdg_surface, "xdg_surface");
+    c.destroy(ctx.win.surface, "wl_surface");
     c.roundtrip(&ctx);
     if (opts.clear) return;
     while (!ctx.cancelled) {

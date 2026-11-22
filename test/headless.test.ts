@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { crc32, inflateSync } from 'node:zlib';
 import { createHeadless, encodePNG, type Headless, type HeadlessOptions } from '../lib/headless.ts';
-import type { BufferHandle, Engine, Event, HandleSource, Link, LinkCallbacks } from '../lib/engine.ts';
+import { stackOrder, type BufferHandle, type Engine, type Event, type HandleSource, type Link, type LinkCallbacks } from '../lib/engine.ts';
 
 // --- STREAM frames + wayland wire ------------------------------------------
 const u32s = (...v: number[]) => new Uint8Array(new Uint32Array(v).buffer);
@@ -69,6 +69,47 @@ function globals(link: ScriptedLink, conn: number) {
           const iface = new TextDecoder().decode(bytes.subarray(m + 16, m + 16 + slen - 1));
           found[iface] = { name, version: dv.getUint32(m + 16 + ((slen + 3) & ~3), true) };
         }
+        m += word >>> 16;
+      }
+      off += 9 + len;
+    }
+  }
+  return found;
+}
+
+// the serial of the last wl_pointer.button the engine sent to `conn` (object
+// PTR, opcode 3): what a move/resize request must name to be honoured
+function pressSerial(link: ScriptedLink, conn: number) {
+  let serial = 0;
+  for (const bytes of link.sent) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let off = 0; off < bytes.length;) {
+      if (bytes[off] === 0x0b) { off += 9; continue; } // ACK
+      if (bytes[off] !== 0x01) break;
+      const c = dv.getUint32(off + 1, true), len = dv.getUint32(off + 5, true);
+      for (let m = off + 9; c === conn && m < off + 9 + len;) {
+        const word = dv.getUint32(m + 4, true);
+        if (dv.getUint32(m, true) === PTR && (word & 0xffff) === 3) serial = dv.getUint32(m + 8, true);
+        m += word >>> 16;
+      }
+      off += 9 + len;
+    }
+  }
+  return serial;
+}
+
+// [object, code] of each wl_display.error the engine sent to `conn`
+function displayErrors(link: ScriptedLink, conn: number) {
+  const found: number[][] = [];
+  for (const bytes of link.sent) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let off = 0; off < bytes.length;) {
+      if (bytes[off] === 0x0b) { off += 9; continue; } // ACK
+      if (bytes[off] !== 0x01) break;
+      const c = dv.getUint32(off + 1, true), len = dv.getUint32(off + 5, true);
+      for (let m = off + 9; c === conn && m < off + 9 + len;) {
+        const word = dv.getUint32(m + 4, true);
+        if (dv.getUint32(m, true) === 1 && (word & 0xffff) === 0) found.push([dv.getUint32(m + 8, true), dv.getUint32(m + 12, true)]);
         m += word >>> 16;
       }
       off += 9 + len;
@@ -326,6 +367,27 @@ test('gpu: a resolver\'s RgbaImage lands in the scene; the ref is on the surface
   bare.hl.dispose();
 });
 
+test('gpu: after a commit that resolved to nothing, the next image lands whole (not just its damage over the stale content)', async () => {
+  const W = 4, H = 2;
+  const solid = (v: number) => ({ width: W, height: H, data: new Uint8Array(W * H * 4).map((_, i) => (i % 4 === 3 ? 255 : v)) });
+  const images: Record<number, ReturnType<typeof solid> | null> = { 1: solid(10), 2: null, 3: solid(30) };
+  const ctx = await setup({ gpu: { resolve: (ref) => images[ref.resource] } });
+  const t = client(ctx, 1).toplevel('gpu');
+  const commit = (serial: number, resource: number, rect: number[]) =>
+    ctx.deliver(wire(1, cat(msg(t.surface, 9, ...rect), msg(t.surface, 6))), virtgpuCommit(1, t.surface, serial, resource, W, H, [rect]));
+  const at = (x: number, y: number) => [...ctx.hl.surfacePixels(1, t.surface)!.data.subarray((y * W + x) * 4, (y * W + x) * 4 + 4)];
+  commit(1, 1, [0, 0, W, H]);
+  assert.deepEqual([at(0, 0), at(3, 1)], [[10, 10, 10, 255], [10, 10, 10, 255]]);
+  commit(2, 2, [0, 0, 2, 2]); // nothing resolved: the scene keeps resource 1's
+  assert.deepEqual(at(0, 0), [10, 10, 10, 255]);
+  commit(3, 3, [3, 1, 1, 1]);
+  assert.deepEqual([at(0, 0), at(3, 1)], [[30, 30, 30, 255], [30, 30, 30, 255]], 'resource 2\'s changes were never shown: the whole image');
+  images[3] = solid(50);
+  commit(4, 3, [3, 1, 1, 1]);
+  assert.deepEqual([at(0, 0), at(3, 1)], [[30, 30, 30, 255], [50, 50, 50, 255]], 'then just the damage again');
+  ctx.hl.dispose();
+});
+
 test('screenshot at scale 2: buffers at 2× copy 1:1, a 1× buffer is upscaled; per-window shots crop to the window', async () => {
   const ctx = await setup({ scale: 2, width: 100, height: 80 });
   const { hl } = ctx;
@@ -537,16 +599,17 @@ test('popup dismiss: a press on the popup keeps it, a press anywhere else dismis
   hl.dispose();
 });
 
-test('drag-start: cancelled at once with no button held (the core would wedge the seat); driven by the pointer while one is', async () => {
+test('drag-start: the core ignores one whose serial is no press held (nothing starts); driven by the pointer while one is', async () => {
   const ctx = await setup();
   const { hl, calls, events } = ctx;
   const { a, ta, tb } = desk(ctx, { popup: false });
   const DS = a.id(), DD = a.id();
   a.send(msg(DDM, 0, DS), msg(DDM, 1, DD, SEAT), msg(DS, 0, 'text/plain'));
   calls.length = 0;
-  a.send(msg(DD, 0, DS, ta.surface, 0, 0)); // start_drag, nothing held
-  assert.deepEqual(calls, [['dragCancel']]);
-  assert.deepEqual(events.slice(-2).map((e) => e.type), ['drag-start', 'drag-end']);
+  const seen = events.length;
+  a.send(msg(DD, 0, DS, ta.surface, 0, 0)); // start_drag, nothing held: ignored
+  assert.deepEqual(calls, []);
+  assert.deepEqual(events.slice(seen).filter((e) => e.type.startsWith('drag')), []);
 
   // with the button held: the drag owns the pointer until release; the icon
   // (committed before start_drag) follows the pointer
@@ -555,7 +618,7 @@ test('drag-start: cancelled at once with no button held (the core would wedge th
   hl.pointerMove(30, 60);
   hl.pointerDown();
   calls.length = 0;
-  a.send(msg(DD, 0, DS, ta.surface, icon, 0));
+  a.send(msg(DD, 0, DS, ta.surface, icon, pressSerial(ctx.link, 1)));
   assert.deepEqual(calls, [['pointerLeave', 1]]);
   hl.pointerMove(70, 90);
   assert.deepEqual(calls.at(-1), ['dragMotion', 2, tb.surface, 6, 6]);
@@ -570,7 +633,7 @@ test('drag-start: cancelled at once with no button held (the core would wedge th
   // Escape cancels a drag in progress
   hl.pointerMove(30, 60);
   hl.pointerDown();
-  a.send(msg(DD, 0, DS, ta.surface, 0, 0));
+  a.send(msg(DD, 0, DS, ta.surface, 0, pressSerial(ctx.link, 1)));
   calls.length = 0;
   hl.keyDown('Escape');
   assert.deepEqual(calls, [['dragCancel']]);
@@ -590,7 +653,7 @@ test('move/resize requests: a scripted grab while the button is held, nothing on
   hl.pointerMove(30, 60);
   hl.pointerDown();
   calls.length = 0;
-  a.send(msg(ta.toplevel, 5, SEAT, 0));
+  a.send(msg(ta.toplevel, 5, SEAT, pressSerial(ctx.link, 1)));
   assert.deepEqual(calls, [['pointerLeave', 1]]);
   hl.pointerMove(50, 70);
   assert.deepEqual([hl.window(key)!.x, hl.window(key)!.y], [44, 48]);
@@ -598,7 +661,7 @@ test('move/resize requests: a scripted grab while the button is held, nothing on
   assert.deepEqual(calls.slice(1), [['pointerEnter', 1, ta.surface, 6, 12]], 'the release belongs to the grab');
 
   hl.pointerDown();
-  a.send(msg(ta.toplevel, 6, SEAT, 0, 10)); // resize bottom-right
+  a.send(msg(ta.toplevel, 6, SEAT, pressSerial(ctx.link, 1), 10)); // resize bottom-right
   calls.length = 0;
   hl.pointerMove(100, 110);
   hl.pointerUp();
@@ -645,7 +708,7 @@ test('fullscreen: the box fills the output, the geometry centred on black, raise
   hl.pointerMove(85, 65);
   hl.pointerDown();
   calls.length = 0;
-  a.send(msg(ta.toplevel, 5, SEAT, 0));
+  a.send(msg(ta.toplevel, 5, SEAT, pressSerial(ctx.link, 1)));
   assert.deepEqual(calls, []);
   hl.pointerUp();
 
@@ -781,7 +844,7 @@ test('window geometry: the box is what set_window_geometry names; shadows hang o
   // a resize grab starts from the frame's size, not the buffer's
   hl.pointerMove(60, 75);
   hl.pointerDown();
-  a.send(msg(t.toplevel, 6, SEAT, 0, 10)); // resize bottom-right
+  a.send(msg(t.toplevel, 6, SEAT, pressSerial(ctx.link, 1), 10)); // resize bottom-right
   calls.length = 0;
   hl.pointerMove(70, 80);
   hl.pointerUp();
@@ -1086,4 +1149,132 @@ test('encodePNG: signature, IHDR, CRCs and IDAT rows', async () => {
   assert.deepEqual(Object.keys(chunks), ['IHDR', 'IDAT', 'IEND']);
   assert.deepEqual([...chunks.IHDR], [0, 0, 0, 3, 0, 0, 0, 2, 8, 6, 0, 0, 0]);
   assert.deepEqual([...inflateSync(chunks.IDAT)], [0, ...img.data.subarray(0, 12), 0, ...img.data.subarray(12)]);
+});
+
+test('stackOrder: each surface, then its subsurfaces, then its popups, oldest first; a parent not in the window is the root', () => {
+  const n = (surface: number, parent: number, role: number, seq: number) => ({ surface, parent, role, seq });
+  const order = stackOrder([
+    n(1, 0, 1, 0),   // the toplevel
+    n(7, 1, 4, 3),   // its popup
+    n(2, 1, 2, 1),   // its subsurface
+    n(8, 7, 2, 4),   // the popup's subsurface
+    n(9, 7, 4, 6),   // the popup's child popup
+    n(3, 2, 2, 2),   // the subsurface's subsurface
+    n(10, 1, 2, 5),  // a later toplevel subsurface: still under the popup
+    n(11, 99, 2, 7), // its parent is not here: hangs from the root
+  ], 1).map((x) => x.surface);
+  assert.deepEqual(order, [1, 2, 3, 10, 11, 7, 8, 9]);
+});
+
+test('a popup follows its parent\'s window geometry without a commit of its own (a CSD window maximizing under an open menu): a \'position\' event, the scene moves it', async () => {
+  const ctx = await setup();
+  const { hl, events } = ctx;
+  const a = client(ctx, 1);
+  const t = a.toplevel('csd');
+  // a frame with 10 px of shadow; a menu at (10, 10) of the frame
+  a.send(msg(t.xdg, 3, 10, 10, 140, 90), msg(t.surface, 6));
+  a.paint(t.surface, 160, 110, [255, 0, 0, 255]);
+  const pop = a.popup(t.xdg, 10, 10, 20, 20);
+  a.paint(pop.surface, 20, 20, [255, 255, 0, 255]);
+  const sub = a.subsurface(pop.surface, 2, 3);
+  a.paint(sub, 4, 4, [0, 255, 0, 255]);
+  const where = (s: number) => { const x = hl.surfaces().find((o) => o.surface === s)!; return [x.x, x.y]; };
+  assert.deepEqual(where(pop.surface), [20, 20], 'the frame\'s offset + the menu\'s');
+  assert.deepEqual(where(sub), [22, 23]);
+  // the app drops its shadow (geometry at 0,0): the menu, which did not
+  // commit, moves with the frame
+  events.length = 0;
+  a.send(msg(t.xdg, 3, 0, 0, 160, 110), msg(t.surface, 6));
+  a.paint(t.surface, 160, 110, [255, 0, 0, 255]);
+  assert.deepEqual(events.filter((e) => e.type === 'position'), [
+    { type: 'position', conn: 1, surface: pop.surface, x: 10, y: 10, z: 0 },
+    { type: 'position', conn: 1, surface: sub, x: 12, y: 13, z: 1 },
+  ]);
+  assert.deepEqual(where(pop.surface), [10, 10]);
+  assert.deepEqual(where(sub), [12, 13]);
+  const w = hl.window(`c1s${t.surface}`)!;
+  const hit = hl.surfaceAt(w.originX + 11, w.originY + 11)!;
+  assert.equal(hit.surface, pop.surface, 'hit-tested where it now is');
+  assert.equal(hl.surfaceAt(w.originX + 15, w.originY + 15)!.surface, sub, 'its subsurface above it');
+  // nothing moved: no event
+  events.length = 0;
+  a.paint(t.surface, 160, 110, [255, 0, 0, 255]);
+  assert.equal(events.filter((e) => e.type === 'position').length, 0);
+  hl.dispose();
+});
+
+test('a popup\'s subsurface stacks above the popup (drawn over it, hit first), a toplevel subsurface mapped later stays under the popup', async () => {
+  const ctx = await setup();
+  const { hl } = ctx;
+  const a = client(ctx, 1);
+  const t = a.toplevel('menu');
+  a.paint(t.surface, 100, 80, [255, 0, 0, 255]);
+  const pop = a.popup(t.xdg, 10, 10, 30, 30);
+  a.paint(pop.surface, 30, 30, [255, 255, 0, 255]);
+  const sub = a.subsurface(pop.surface, 5, 5);
+  a.paint(sub, 10, 10, [0, 255, 0, 255]);
+  const late = a.subsurface(t.surface, 0, 0);
+  a.paint(late, 100, 80, [0, 0, 255, 255]);
+  const w = hl.window(`c1s${t.surface}`)!;
+  assert.equal(hl.surfaceAt(w.originX + 20, w.originY + 20)!.surface, sub);
+  assert.deepEqual(px(hl.screenshot(), w.originX + 20, w.originY + 20), [0, 255, 0, 255]);
+  assert.equal(hl.surfaceAt(w.originX + 12, w.originY + 12)!.surface, pop.surface);
+  hl.dispose();
+});
+
+test('stackOrder: subsurfaces by z — placed below their parent (z < 0) under it, with their own subtree; above it by z, then seq', () => {
+  const n = (surface: number, parent: number, role: number, seq: number, z?: number) => ({ surface, parent, role, seq, z });
+  const order = stackOrder([
+    n(1, 0, 1, 0),        // the toplevel
+    n(2, 1, 2, 1, 2),     // above it, second
+    n(3, 1, 2, 2, 1),     // above it, first (restacked under 2)
+    n(4, 1, 2, 3, -1),    // just below it
+    n(5, 1, 2, 4, -2),    // below that
+    n(6, 4, 2, 5, 1),     // 4's own subsurface: above 4, still under the toplevel
+    n(7, 4, 2, 6, -1),    // under 4
+    n(8, 1, 4, 7),        // a popup: above all of them
+    n(9, 8, 2, 8, -1),    // the popup's subsurface placed below it: above the toplevel's subtree
+    n(10, 1, 2, 9),       // no z (an embedder's event): 0, just above the parent
+  ], 1).map((x) => x.surface);
+  assert.deepEqual(order, [5, 7, 4, 6, 1, 10, 3, 2, 9, 8]);
+});
+
+test('place_above / place_below: applied at the parent\'s commit (\'position\' events carry z), drawn and hit in that order; a subsurface placed below its parent draws under it', async () => {
+  const ctx = await setup();
+  const { hl, events } = ctx;
+  const a = client(ctx, 1);
+  const t = a.toplevel('video');
+  a.paint(t.surface, 60, 40, [255, 0, 0, 255]);
+  // two overlapping subsurfaces: b (newer) on top
+  const sa = a.subsurface(t.surface, 10, 10), sb = a.subsurface(t.surface, 20, 10);
+  a.paint(sa, 20, 20, [0, 255, 0, 255]);
+  a.paint(sb, 20, 20, [0, 0, 255, 255]);
+  const w = hl.window(`c1s${t.surface}`)!;
+  const at = (x: number, y: number) => [hl.surfaceAt(w.originX + x, w.originY + y)?.surface, px(hl.screenshot(), w.originX + x, w.originY + y)];
+  assert.deepEqual(at(25, 15), [sb, [0, 0, 255, 255]], 'the newer one on top');
+  // a above b: nothing until the parent commits
+  events.length = 0;
+  a.send(msg(sa + 1, 2, sb));
+  a.send(msg(sa, 6));
+  assert.deepEqual(at(25, 15), [sb, [0, 0, 255, 255]], 'pending: a child\'s own commit does not apply it');
+  assert.equal(events.filter((e) => e.type === 'position').length, 0);
+  a.send(msg(t.surface, 6));
+  assert.deepEqual(events.filter((e) => e.type === 'position'), [
+    { type: 'position', conn: 1, surface: sa, x: 10, y: 10, z: 2 },
+    { type: 'position', conn: 1, surface: sb, x: 20, y: 10, z: 1 },
+  ]);
+  assert.deepEqual(at(25, 15), [sa, [0, 255, 0, 255]], 'a on top now');
+  // b below the parent: under the toplevel, showing only where it sticks out
+  a.send(msg(sb + 1, 3, t.surface), msg(t.surface, 6));
+  assert.deepEqual(at(35, 15), [t.surface, [255, 0, 0, 255]], 'the toplevel covers it');
+  a.paint(sb, 20, 40, [0, 0, 255, 255]); // now reaching past the toplevel's bottom edge (y 10…50)
+  assert.deepEqual(at(35, 45), [sb, [0, 0, 255, 255]], 'past the toplevel: it shows and takes the pointer');
+  assert.deepEqual(at(25, 15), [sa, [0, 255, 0, 255]]);
+  // a reference that is not the parent or a sibling: wl_display.error
+  // bad_surface on the wl_subsurface
+  const other = a.bare();
+  ctx.link.sent.length = 0;
+  a.send(msg(sa + 1, 2, other));
+  assert.deepEqual(displayErrors(ctx.link, 1), [[sa + 1, 0]]);
+  hl.dispose();
 });

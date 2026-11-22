@@ -6,8 +6,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createEngine, type BufferHandle, type GpuRef, type GpuSource, type HandleSource, type LinkCallbacks } from '../lib/engine.ts';
+import { createEngine, type BufferHandle, type CommitEvent, type GpuRef, type GpuSource, type HandleRead, type HandleSource, type LinkCallbacks } from '../lib/engine.ts';
 import { swizzleRect } from '../lib/present.ts';
+import { createView } from '../lib/view.ts';
+import { installFakeDom } from './fake-dom.ts';
 import {
   wlMessage as msg, wlEach, eachEngineFrame, pack, T, FD, HANDLE, SHM,
   connOpen, connClose, wireFrame, fdmsg, handleOpen, handleClose, kwshmBytes, procfdBytes, shmCommit, virtgpuCommit,
@@ -83,7 +85,9 @@ function pixelBytes(size: number) {
 }
 
 // engine + a mapped toplevel on `conn` with an 8x4 buffer, ready for COMMITs
-async function setup({ conn = 1, source, rgba = false, gpu }: { conn?: number; source?: HandleSource; rgba?: boolean; gpu?: GpuSource } = {}) {
+// `peek` sees each commit event as dispatched (its pixels still the engine's view)
+async function setup({ conn = 1, source, rgba = false, gpu, peek }:
+  { conn?: number; source?: HandleSource; rgba?: boolean; gpu?: GpuSource; peek?: (ev: CommitEvent) => void } = {}) {
   const link = scriptedLink();
   const events: any[] = [];
   const engine = await createEngine({
@@ -91,6 +95,7 @@ async function setup({ conn = 1, source, rgba = false, gpu }: { conn?: number; s
     onEvent(ev) {
       // pixels are a view valid only during dispatch: copy; and note how
       // many ACKs had been sent when the commit was dispatched
+      if (ev.type === 'commit') peek?.(ev);
       if (ev.type === 'commit') events.push({ ...ev, pixels: ev.pixels.slice(), acksBefore: acks(link).length });
       else events.push(ev);
     },
@@ -99,36 +104,42 @@ async function setup({ conn = 1, source, rgba = false, gpu }: { conn?: number; s
   link.cb.onOpen();
   const deliver = (...frames: Uint8Array[]) => link.cb.onMessage(pack(frames));
 
-  deliver(connOpen(conn), wireFrame(conn, msg(1, 1, [REG])));
-  const globals: Record<string, { name: number; version: number }> = {};
-  for (const f of sentFrames(link)) {
-    if (f.type === 'wire') wlEach(f.bytes, (obj: number, op: number, r: any) => {
-      if (obj === REG && op === 0) { const name = r.u32(); globals[r.str()] = { name, version: r.u32() }; }
-    });
-  }
-  const bind = (iface: string, version: number, id: number) => msg(REG, 0, [globals[iface].name, iface, version, id]);
-  deliver(wireFrame(conn, concat(
-    bind('wl_compositor', 4, COMP), bind('wl_shm', 1, SHM_ID), bind('xdg_wm_base', 1, WM),
-    msg(COMP, 0, [SURF]), msg(WM, 2, [XSURF, SURF]), msg(XSURF, 1, [TOP]), msg(TOP, 2, ['handles']),
-    msg(SURF, 6), // initial commit → configure
-  )));
-  let serial = 0;
-  for (const f of sentFrames(link)) {
-    if (f.type === 'wire') wlEach(f.bytes, (obj: number, op: number, r: any) => { if (obj === XSURF && op === 0) serial = r.u32(); });
-  }
-  assert.ok(serial, 'xdg_surface.configure');
-  // ack_configure, then the pool (an FDMSG: the fd stays in the relay, aux
-  // empty) and a buffer in it
-  deliver(
-    wireFrame(conn, msg(XSURF, 4, [serial])),
-    fdmsg(conn, FD.SHM_POOL, msg(SHM_ID, 0, [POOL, 4096])),
-    wireFrame(conn, msg(POOL, 0, [BUF, 0, W, H, STRIDE, SHM.XRGB8888])),
-  );
-  link.sent.length = 0;
-  events.length = 0;
-  // one commit's WIRE: attach + damage + commit
-  const commitWire = () => wireFrame(conn, concat(msg(SURF, 1, [BUF, 0, 0]), msg(SURF, 9, [0, 0, W, H]), msg(SURF, 6)));
-  return { engine, link, events, deliver, commitWire, conn };
+  // a client with a mapped toplevel and its buffer on `conn` (again after
+  // a link reopens); returns its commit WIRE maker
+  const client = (conn: number) => {
+    deliver(connOpen(conn), wireFrame(conn, msg(1, 1, [REG])));
+    const globals: Record<string, { name: number; version: number }> = {};
+    for (const f of sentFrames(link)) {
+      if (f.type === 'wire') wlEach(f.bytes, (obj: number, op: number, r: any) => {
+        if (obj === REG && op === 0) { const name = r.u32(); globals[r.str()] = { name, version: r.u32() }; }
+      });
+    }
+    const bind = (iface: string, version: number, id: number) => msg(REG, 0, [globals[iface].name, iface, version, id]);
+    deliver(wireFrame(conn, concat(
+      bind('wl_compositor', 4, COMP), bind('wl_shm', 1, SHM_ID), bind('xdg_wm_base', 1, WM),
+      msg(COMP, 0, [SURF]), msg(WM, 2, [XSURF, SURF]), msg(XSURF, 1, [TOP]), msg(TOP, 2, ['handles']),
+      msg(SURF, 6), // initial commit → configure
+    )));
+    let serial = 0;
+    for (const f of sentFrames(link)) {
+      if (f.type === 'wire') wlEach(f.bytes, (obj: number, op: number, r: any) => { if (obj === XSURF && op === 0) serial = r.u32(); });
+    }
+    assert.ok(serial, 'xdg_surface.configure');
+    // ack_configure, then the pool (an FDMSG: the fd stays in the relay, aux
+    // empty) and a buffer in it
+    deliver(
+      wireFrame(conn, msg(XSURF, 4, [serial])),
+      fdmsg(conn, FD.SHM_POOL, msg(SHM_ID, 0, [POOL, 4096])),
+      wireFrame(conn, msg(POOL, 0, [BUF, 0, W, H, STRIDE, SHM.XRGB8888])),
+    );
+    link.sent.length = 0;
+    events.length = 0;
+    // one commit's WIRE: attach + damage + commit
+    const commitWire = () => wireFrame(conn, concat(msg(SURF, 1, [BUF, 0, 0]), msg(SURF, 9, [0, 0, W, H]), msg(SURF, 6)));
+    return commitWire;
+  };
+  const commitWire = client(conn);
+  return { engine, link, events, deliver, commitWire, conn, client };
 }
 
 function concat(...parts: Uint8Array[]) {
@@ -453,6 +464,206 @@ test('conn ids ≥ 2^31 (wasm hands u32 over as i32): events carry them unsigned
   assert.deepEqual(events.at(-1), { type: 'disconnect', conn });
 });
 
+// --- HandleSource.readv / view: the batched and the in-place shapes --------
+
+const TALL = { width: W, height: 300, stride: STRIDE }; // 12000 bytes
+// three rects: two near the top (one merged span), one at the bottom
+const SPREAD = [[0, 299, 2, 1], [1, 0, 1, 2], [3, 1, 1, 1]];
+const SPREAD_SPANS = [[4, STRIDE + 16 - 4], [299 * STRIDE, 8]]; // [offset, length], ascending
+const SPREAD_BYTES = [299 * STRIDE, 299 * STRIDE + 4, 4, STRIDE + 4, STRIDE + 12];
+const ticks = async (n = 10) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+function assertSpread(c: any, mem: Uint8Array) {
+  for (const o of SPREAD_BYTES) assert.deepEqual([...c.pixels.subarray(o, o + 4)], [...mem.subarray(o, o + 4)], `byte ${o}`);
+}
+
+test('readv: all spans of a COMMIT in one call (sync or one promise), read() never called', async () => {
+  const mem = pixelBytes(STRIDE * 300);
+  for (const async of [false, true]) {
+    const calls: any[] = [];
+    const waiting: (() => void)[] = [];
+    const source: HandleSource<{ id: number }> = {
+      open: (h) => ({ id: (h as { id: number }).id }),
+      read() { throw new Error('read() called beside readv()'); },
+      readv(token, reads) {
+        calls.push(reads.map((r) => [r.offset, r.dst.length]));
+        const copy = () => { for (const r of reads) r.dst.set(mem.subarray(r.offset, r.offset + r.dst.length)); };
+        if (!async) return copy();
+        return new Promise<void>((res) => waiting.push(() => { copy(); res(); }));
+      },
+      close() {},
+    };
+    const { events, link, deliver, commitWire, conn } = await setup({ source });
+    deliver(commitWire(), handleOpen(conn, 5, HANDLE.KWSHM, kwshmBytes(77, mem.length)),
+      shmCommit(conn, SURF, 1, ref(5, TALL), SPREAD),
+      wireFrame(conn, msg(TOP, 2, ['after-1'])),
+      commitWire(), shmCommit(conn, SURF, 2, ref(5, TALL), [[0, 0, 1, 1]]));
+    const titles = () => events.filter((e) => e.type === 'title').map((e) => e.title);
+    if (async) {
+      // one promise for the commit: the frames after it wait, in order
+      assert.deepEqual(calls, [SPREAD_SPANS]);
+      assert.deepEqual(titles(), []);
+      assert.deepEqual(acks(link), []);
+      waiting.shift()!();
+      await ticks();
+      assert.deepEqual(titles(), ['after-1']);
+      assert.deepEqual(acks(link), [[conn, 1]]);
+      waiting.shift()!();
+      await ticks();
+    }
+    // the far rect is NOT merged into one span over everything (async or not)
+    assert.deepEqual(calls, [SPREAD_SPANS, [[0, 4]]]);
+    const commits = events.filter((e) => e.type === 'commit');
+    assert.equal(commits.length, 2);
+    assertSpread(commits[0], mem);
+    assert.deepEqual(acks(link), [[conn, 1], [conn, 2]], `async ${async}`);
+  }
+});
+
+test('readv: a throw or a rejection skips the commit (ACKed), a close waits for the pending call', async () => {
+  const mem = pixelBytes(STRIDE * H);
+  const calls: string[] = [];
+  let settle!: () => void;
+  const source: HandleSource<{ id: number }> = {
+    open: (h) => ({ id: (h as { id: number }).id }),
+    read() { throw new Error('unused'); },
+    readv(t) {
+      calls.push(`readv ${t.id}`);
+      if (t.id === 1) throw new Error('memory gone');
+      if (t.id === 2) return Promise.reject(new Error('gone too'));
+      return new Promise<void>((res) => { settle = res; });
+    },
+    close(t) { calls.push(`close ${t.id}`); },
+  };
+  const { events, link, deliver, commitWire, conn } = await setup({ source });
+  deliver(commitWire(),
+    handleOpen(conn, 1, HANDLE.KWSHM, kwshmBytes(1, mem.length)),
+    handleOpen(conn, 2, HANDLE.KWSHM, kwshmBytes(2, mem.length)),
+    handleOpen(conn, 3, HANDLE.KWSHM, kwshmBytes(3, mem.length)),
+    shmCommit(conn, SURF, 1, ref(1), [[0, 0, 1, 1]]),
+    shmCommit(conn, SURF, 2, ref(2), [[0, 0, 1, 1]]),
+    shmCommit(conn, SURF, 3, ref(3), [[0, 0, 1, 1]]));
+  await ticks();
+  assert.deepEqual(acks(link), [[conn, 1], [conn, 2]]);
+  assert.deepEqual(calls, ['readv 1', 'readv 2', 'readv 3']);
+  // the link closes with handle 3's readv pending: 1 and 2 close now, 3 once it settles
+  link.cb.onClose({ takenOver: false });
+  assert.deepEqual(calls.slice(3).sort(), ['close 1', 'close 2']);
+  settle();
+  await ticks();
+  assert.deepEqual(calls.slice(5), ['close 3']);
+  assert.equal(events.filter((e) => e.type === 'commit').length, 0);
+  assert.deepEqual(acks(link), [[conn, 1], [conn, 2]]); // nothing ACKed on a closed link
+});
+
+test('view: one view is the commit\'s pixels with no copy (bgrx), the core swizzles from it (rgba); no reads', async () => {
+  const mem = pixelBytes(STRIDE * 300);
+  for (const rgba of [false, true]) {
+    const calls: any[] = [];
+    const source: HandleSource<{ id: number }> = {
+      open: (h) => ({ id: (h as { id: number }).id }),
+      read() { throw new Error('read() called beside view()'); },
+      readv() { throw new Error('readv() called beside view()'); },
+      view(t, offset, length) { calls.push([t.id, offset, length]); return mem.subarray(offset, offset + length); },
+      close() {},
+    };
+    let same = false;
+    const { events, link, deliver, commitWire, conn } = await setup({ source, rgba, peek: (ev) => { same = ev.pixels.buffer === mem.buffer; } });
+    deliver(commitWire(), handleOpen(conn, 5, HANDLE.KWSHM, kwshmBytes(77, mem.length)),
+      shmCommit(conn, SURF, 1, ref(5, { ...TALL, offset: 40, height: 299 }), SPREAD.slice(1)));
+    // the buffer's extent: its first byte to its last pixel's
+    assert.deepEqual(calls, [[77, 40, 298 * STRIDE + W * 4]]);
+    const [c] = events.filter((e) => e.type === 'commit');
+    if (!rgba) {
+      assert.equal(same, true, 'pixels view the source\'s memory');
+      assert.equal(c.format, 'bgrx');
+      assert.equal(c.pixels.length, 298 * STRIDE + W * 4);
+      assert.deepEqual([...c.pixels.subarray(4, 8)], [...mem.subarray(44, 48)]);
+    } else {
+      assert.equal(same, false);
+      assert.equal(c.format, 'rgba');
+      // rects (1,0,1,2) then (3,1,1,1), packed, X forced opaque
+      const px = (x: number, y: number) => { const o = 40 + y * STRIDE + x * 4; return [mem[o + 2], mem[o + 1], mem[o], 255]; };
+      assert.deepEqual([...c.pixels], [...px(1, 0), ...px(1, 1), ...px(3, 1)]);
+    }
+    assert.deepEqual(acks(link), [[conn, 1]]);
+  }
+});
+
+test('view: scattered page runs are gathered (damaged spans only); a SharedArrayBuffer view is passed through', async () => {
+  const mem = pixelBytes(STRIDE * 300);
+  // the export as page runs at odd places of a shared "kernel memory"
+  const kernel = new Uint8Array(new SharedArrayBuffer(20000));
+  const runs: { at: number; off: number; len: number }[] = [
+    { at: 9000, off: 0, len: 4096 }, { at: 100, off: 4096, len: 4096 }, { at: 15000, off: 8192, len: 12000 - 8192 },
+  ];
+  for (const r of runs) kernel.set(mem.subarray(r.off, r.off + r.len), r.at);
+  const pages = (offset: number, length: number) => {
+    const out: Uint8Array[] = [];
+    for (const r of runs) {
+      const s = Math.max(offset, r.off), e = Math.min(offset + length, r.off + r.len);
+      if (s < e) out.push(kernel.subarray(r.at + s - r.off, r.at + e - r.off));
+    }
+    return out;
+  };
+  let whole = false;
+  const source: HandleSource<{ id: number }> = {
+    open: (h) => ({ id: (h as { id: number }).id }),
+    read() { throw new Error('unused'); },
+    view: (t, offset, length) => whole ? new Uint8Array(kernel.buffer, 0, length) : pages(offset, length),
+    close() {},
+  };
+  let shared = false;
+  const { events, link, deliver, commitWire, conn } = await setup({ source, peek: (ev) => { shared = ev.pixels.buffer instanceof SharedArrayBuffer; } });
+  deliver(commitWire(), handleOpen(conn, 5, HANDLE.KWSHM, kwshmBytes(77, mem.length)),
+    // rects that straddle the run boundaries at 4096 and 8192
+    shmCommit(conn, SURF, 1, ref(5, TALL), [...SPREAD, [0, 101, 8, 2], [2, 204, 3, 1]]));
+  const [c] = events.filter((e) => e.type === 'commit');
+  assert.equal(shared, false, 'gathered into the staging buffer');
+  assertSpread(c, mem);
+  for (const [x, y, w, h] of [[0, 101, 8, 2], [2, 204, 3, 1]]) {
+    for (let r = 0; r < h; r++) {
+      const o = (y + r) * STRIDE + x * 4;
+      assert.deepEqual([...c.pixels.subarray(o, o + w * 4)], [...mem.subarray(o, o + w * 4)], `rect at ${x},${y + r}`);
+    }
+  }
+  whole = true;
+  deliver(commitWire(), shmCommit(conn, SURF, 2, ref(5, TALL), [[0, 0, 1, 1]]));
+  assert.equal(shared, true, 'one view: no copy, shared memory and all');
+  const c2 = events.filter((e) => e.type === 'commit')[1];
+  assert.equal(c2.pixels.buffer instanceof SharedArrayBuffer, false, 'slice() of it is an ordinary copy');
+  assert.deepEqual(acks(link), [[conn, 1], [conn, 2]]);
+});
+
+test('view: null falls back to readv/read for that commit; a throw or a short view skips it (ACKed)', async () => {
+  const mem = pixelBytes(STRIDE * H);
+  const calls: string[] = [];
+  let answer: 'null' | 'throw' | 'short' | 'many-short' = 'null';
+  const base = memorySource(new Map([[77, mem]]));
+  const source: HandleSource<MemToken> = {
+    open: base.open,
+    read(t, o, d) { calls.push('read'); return base.read(t, o, d); },
+    view(t, offset, length) {
+      calls.push(`view ${answer}`);
+      if (answer === 'throw') throw new Error('export released');
+      if (answer === 'short') return t.mem.subarray(offset, offset + length - 1);
+      if (answer === 'many-short') return [t.mem.subarray(offset, offset + 4), t.mem.subarray(offset + 8, offset + length)];
+      return null;
+    },
+    close: base.close,
+  };
+  const { events, link, deliver, commitWire, conn } = await setup({ source });
+  deliver(commitWire(), handleOpen(conn, 5, HANDLE.KWSHM, kwshmBytes(77, mem.length)), shmCommit(conn, SURF, 1, ref(5), [[0, 0, 2, 1]]));
+  assert.deepEqual(calls, ['view null', 'read']);
+  assert.deepEqual([...events.filter((e) => e.type === 'commit')[0].pixels.subarray(0, 8)], [...mem.subarray(0, 8)]);
+  for (const a of ['throw', 'short', 'many-short'] as const) {
+    answer = a;
+    deliver(commitWire(), shmCommit(conn, SURF, 2, ref(5), [[0, 0, 1, 1]]));
+  }
+  assert.deepEqual(calls.slice(2), ['view throw', 'view short', 'view many-short']);
+  assert.equal(events.filter((e) => e.type === 'commit').length, 1);
+  assert.deepEqual(acks(link), [[conn, 1], [conn, 2], [conn, 2], [conn, 2]]);
+});
+
 // --- GPU buffers: COMMIT kind virtgpu (STREAM.md), EngineOptions.gpu -------
 
 const XBGR8888 = 0x34324258, MOD_INVALID = 0x00ffffffffffffffn;
@@ -530,4 +741,199 @@ test('virtgpu: a promise stalls later frames until it settles; throwing, rejecti
     [[1, 'late'], [2, null], [3, null], [4, null]]);
   assert.deepEqual(released, ['late'], 'nothing to release for null');
   assert.deepEqual(acks(link).map(([, s]) => s).sort(), [1, 2, 3, 4, 5, 6]);
+});
+
+// --- a link reset while a buffer-source / gpu promise is pending -----------
+
+// a readv/read source whose every call is a promise settled by hand; each
+// read fills its spans with the token's id, and a token must never close
+// under its pending call
+function handSource(kind: 'readv' | 'read') {
+  const pend: { id: number; settle: () => void }[] = [];
+  const violations: string[] = [];
+  const closed: number[] = [];
+  const fill = (t: any, dsts: Uint8Array[], res: () => void) => pend.push({ id: t.id, settle: () => {
+    for (const d of dsts) d.fill(t.id);
+    t.busy--;
+    res();
+  } });
+  const source: HandleSource<{ id: number; busy: number }> = {
+    open: (h) => ({ id: (h as Extract<BufferHandle, { kind: 'kwshm' }>).id, busy: 0 }),
+    read(t, _offset, dst) {
+      if (kind !== 'read') throw new Error('unused');
+      t.busy++;
+      return new Promise<void>((res) => fill(t, [dst], res));
+    },
+    close(t) {
+      closed.push(t.id);
+      if (t.busy) violations.push(`token ${t.id} closed while its read is pending`);
+    },
+  };
+  if (kind === 'readv') source.readv = (t, reads) => {
+    t.busy++;
+    return new Promise<void>((res) => fill(t, reads.map((r) => r.dst), res));
+  };
+  return { source, pend, violations, closed };
+}
+
+for (const kind of ['readv', 'read'] as const) {
+  test(`${kind}: a read pending when the link resets writes nowhere the next link reads; settling never clobbers the next link's read`, async () => {
+    const { source, pend, violations, closed } = handSource(kind);
+    const firstPixel: number[] = []; // each commit's first byte, as dispatched
+    const s = await setup({ source, peek: (ev) => firstPixel.push(ev.pixels[0]) });
+    const size = STRIDE * H;
+    s.deliver(s.commitWire(), handleOpen(s.conn, 1, HANDLE.KWSHM, kwshmBytes(1, size)), shmCommit(s.conn, SURF, 1, ref(1), [[0, 0, 1, 1]]));
+    assert.equal(pend.length, 1, 'link 1: read pending');
+    s.link.cb.onClose({ takenOver: false });
+    s.link.cb.onOpen();
+    const cw = s.client(2);
+    s.deliver(cw(), handleOpen(2, 2, HANDLE.KWSHM, kwshmBytes(2, size)), shmCommit(2, SURF, 1, ref(2), [[0, 0, 1, 1]]));
+    assert.deepEqual(pend.map((p) => p.id), [1, 2], 'link 2: its own read pending too');
+
+    // (a) the new link's read lands, then the dead link's: the new commit
+    // must show the new link's bytes (2), not the dead link's (1)
+    pend[1].settle();
+    pend[0].settle();
+    await ticks();
+    assert.deepEqual(firstPixel, [2]);
+    assert.deepEqual(acks(s.link), [[2, 1]], 'only the live link\'s commit is ACKed');
+    assert.deepEqual(closed, [1], 'the dead link\'s token closed once its read settled');
+
+    // (b) the dead link's read settles first, while the new one's is pending:
+    // dispose must still wait for the new one before closing its token
+    s.deliver(cw(), shmCommit(2, SURF, 2, ref(2), [[0, 0, 1, 1]]));
+    s.link.cb.onClose({ takenOver: false });
+    s.link.cb.onOpen();
+    const cw3 = s.client(3);
+    s.deliver(cw3(), handleOpen(3, 3, HANDLE.KWSHM, kwshmBytes(3, size)), shmCommit(3, SURF, 1, ref(3), [[0, 0, 1, 1]]));
+    assert.deepEqual(pend.slice(2).map((p) => p.id), [2, 3]);
+    pend[2].settle(); // the dead link's (token 2)
+    await ticks();
+    s.engine.dispose(); // token 3's read still pending
+    assert.deepEqual(violations, []);
+    assert.deepEqual(closed, [1, 2], 'token 3 waits for its read');
+    pend[3].settle();
+    await ticks();
+    assert.deepEqual(closed, [1, 2, 3]);
+    assert.deepEqual(violations, []);
+    assert.deepEqual(firstPixel, [2], 'nothing presented after the reset or dispose');
+  });
+}
+
+test('virtgpu: a resolve pending when the link resets is neither dispatched nor ACKed on the next link, and its image is still released', async () => {
+  const waiting: ((img: string) => void)[] = [];
+  const released: unknown[] = [];
+  const gpu: GpuSource<string> = {
+    resolve: () => new Promise((res) => waiting.push(res)),
+    release(img) { released.push(img); },
+  };
+  const s = await setup({ gpu });
+  s.deliver(s.commitWire(), virtgpuCommit(s.conn, SURF, 1, gref(1), [[0, 0, W, H]]));
+  assert.equal(waiting.length, 1);
+  s.link.cb.onClose({ takenOver: false });
+  s.link.cb.onOpen();
+  const cw = s.client(2);
+  s.deliver(cw(), virtgpuCommit(2, SURF, 1, gref(2), [[0, 0, W, H]]), wireFrame(2, msg(TOP, 2, ['after'])));
+  assert.equal(waiting.length, 2);
+  waiting[0]('stale'); // the dead link's settles while the new link waits on its own
+  await ticks();
+  const commits = () => s.events.filter((e) => e.type === 'commit').map((e) => [e.conn, e.image]);
+  assert.deepEqual(commits(), []);
+  assert.deepEqual(acks(s.link), []);
+  assert.deepEqual(released, ['stale']);
+  assert.deepEqual(s.events.filter((e) => e.type === 'title').map((e) => e.title), [], 'the new link still waits');
+  waiting[1]('fresh');
+  await ticks();
+  assert.deepEqual(commits(), [[2, 'fresh']]);
+  assert.deepEqual(acks(s.link), [[2, 1]]);
+  assert.deepEqual(released, ['stale', 'fresh']);
+  assert.deepEqual(s.events.filter((e) => e.type === 'title').map((e) => e.title), ['after']);
+  // dispose with one pending: released when it settles, nothing dispatched
+  s.deliver(cw(), virtgpuCommit(2, SURF, 2, gref(3), [[0, 0, W, H]]));
+  s.engine.dispose();
+  waiting[2]('orphan');
+  await ticks();
+  assert.deepEqual(released, ['stale', 'fresh', 'orphan']);
+  assert.deepEqual(commits(), [[2, 'fresh']]);
+});
+
+// --- a COMMIT that showed nothing: the relay believes it was shown ---------
+
+test('after a COMMIT that showed nothing (null, throw, no resolver; a failed read) the surface\'s next COMMIT is whole, for the resolver and the event; then the relay\'s damage again', async () => {
+  let answer: 'img' | 'null' | 'throw' = 'img';
+  const seen: number[][] = [];
+  const gpu: GpuSource<string> = {
+    resolve(_ref, c) {
+      seen.push([...c.damage]);
+      if (answer === 'throw') throw new Error('lost');
+      return answer === 'img' ? 'img' : null;
+    },
+  };
+  const { events, link, deliver, commitWire, conn } = await setup({ gpu });
+  const damages = () => events.filter((e) => e.type === 'commit').map((e) => [...e.damage]);
+  const send = (serial: number, rect: number[], a: typeof answer = 'img') => {
+    answer = a;
+    deliver(commitWire(), virtgpuCommit(conn, SURF, serial, gref(1 + (serial % 2)), [rect]));
+  };
+  send(1, [0, 0, W, H]);         // the first: whole (the relay's rule)
+  send(2, [1, 1, 2, 2]);         // shown: damage as sent
+  send(3, [2, 0, 1, 1], 'null'); // nothing new shown
+  send(4, [3, 1, 1, 1]);         // → whole
+  send(5, [3, 1, 1, 1]);         // up to date again: as sent
+  send(6, [0, 0, 1, 1], 'throw');
+  send(7, [0, 0, 1, 1]);         // → whole
+  const whole = [0, 0, W, H];
+  const want = [whole, [1, 1, 2, 2], [2, 0, 1, 1], whole, [3, 1, 1, 1], [0, 0, 1, 1], whole];
+  assert.deepEqual(seen, want);
+  assert.deepEqual(damages(), want);
+  assert.deepEqual(acks(link).map(([, s]) => s), [1, 2, 3, 4, 5, 6, 7]);
+});
+
+test('no gpu source: every GPU commit shows nothing, so each one after the first is whole too; a failed shm read makes the next shm COMMIT whole', async () => {
+  const { events, deliver, commitWire, conn } = await setup();
+  deliver(commitWire(), virtgpuCommit(conn, SURF, 1, gref(1), [[0, 0, W, H]]),
+    commitWire(), virtgpuCommit(conn, SURF, 2, gref(1), [[1, 1, 1, 1]]));
+  assert.deepEqual(events.filter((e) => e.type === 'commit').map((e) => [...e.damage]), [[0, 0, W, H], [0, 0, W, H]]);
+
+  const mem = pixelBytes(STRIDE * H);
+  let fail = true;
+  const base = memorySource(new Map([[77, mem]]));
+  const source: HandleSource<MemToken> = {
+    open: base.open, close: base.close,
+    read(t, o, d) { if (fail) throw new Error('export gone'); return base.read(t, o, d); },
+  };
+  const s = await setup({ source });
+  s.deliver(s.commitWire(), handleOpen(s.conn, 5, HANDLE.KWSHM, kwshmBytes(77, mem.length)),
+    shmCommit(s.conn, SURF, 1, ref(5), [[0, 0, W, H]]));
+  fail = false;
+  s.deliver(s.commitWire(), shmCommit(s.conn, SURF, 2, ref(5), [[2, 1, 1, 1]]),
+    s.commitWire(), shmCommit(s.conn, SURF, 3, ref(5), [[2, 1, 1, 1]]));
+  const commits = s.events.filter((e) => e.type === 'commit');
+  assert.deepEqual(commits.map((e) => [...e.damage]), [[0, 0, W, H], [2, 1, 1, 1]], 'serial 1 failed: serial 2 whole, serial 3 as sent');
+  assert.deepEqual([...commits[0].pixels.subarray(0, (H - 1) * STRIDE + W * 4)], [...mem.subarray(0, (H - 1) * STRIDE + W * 4)]);
+  assert.deepEqual(acks(s.link).map(([, n]) => n), [1, 2, 3]);
+});
+
+test('2D view through the engine: the image after one that never came is drawn whole, not just the damaged rect over the stale canvas', async () => {
+  const dom = installFakeDom();
+  try {
+    const view = createView({ container: dom.container(), webgl: 'never' });
+    const images: Record<number, { width: number; height: number } | null> = { 1: { width: W, height: H }, 2: null, 3: { width: W, height: H } };
+    const gpu: GpuSource = { resolve: (ref) => images[ref.resource] };
+    const { deliver, commitWire, conn } = await setup({ gpu, peek: (ev) => view.handle(ev) });
+    deliver(commitWire(), virtgpuCommit(conn, SURF, 1, gref(1), [[0, 0, W, H]]));
+    const canvas = view.canvas(conn, SURF) as any;
+    assert.deepEqual(canvas.draws, [['clear', 0, 0, W, H], ['draw', images[1], 0, 0, W, H, 0, 0, W, H]], 'the first: whole');
+    canvas.draws.length = 0;
+    deliver(commitWire(), virtgpuCommit(conn, SURF, 2, gref(2), [[0, 0, 2, 2]])); // resolves to nothing
+    assert.deepEqual(canvas.draws, [], 'the canvas keeps resource 1\'s content');
+    deliver(commitWire(), virtgpuCommit(conn, SURF, 3, gref(3), [[6, 3, 1, 1]]));
+    assert.deepEqual(canvas.draws, [['clear', 0, 0, W, H], ['draw', images[3], 0, 0, W, H, 0, 0, W, H]],
+      'resource 2\'s changes (0,0 2x2) were never drawn: the whole image, not just (6,3)');
+    canvas.draws.length = 0;
+    deliver(commitWire(), virtgpuCommit(conn, SURF, 4, gref(3), [[6, 3, 1, 1]]));
+    assert.deepEqual(canvas.draws, [['clear', 6, 3, 1, 1], ['draw', images[3], 6, 3, 1, 1, 6, 3, 1, 1]], 'then the damage again');
+  } finally {
+    dom.uninstall();
+  }
 });

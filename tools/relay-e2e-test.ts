@@ -33,6 +33,11 @@
 //     ASYNC (promises, like unkernel's worker mode) and 1 and 2 run again.
 //  6. a new relay run with --buffers copy connects to the same engine: rgba
 //     commits; prints the link's bytes per second.
+//  7. (fixtures only) a new relay run with --buffers procfd and the test-only
+//     --dmabuf virtgpu:@fake: a GPU client (the `dmabuf` fixture) beside a
+//     wl_shm one on the same link — kind-virtgpu COMMITs resolved by the
+//     engine's gpu source next to procfd handles, one ACK per COMMIT, the
+//     GPU client kept drawing (releases after ACKs).
 //
 // The apps are test/support/apps.ts's: wland-fixture modes standing in for
 // weston-simple-shm, foot (`term`), wl-clipboard, wayland-info and
@@ -42,17 +47,17 @@
 // WAYLAND_DISPLAY: it never touches the demo's wayland-0.
 // Run: node tools/relay-e2e-test.ts (run-poc does).
 
-import { spawn, execFile, type ChildProcessByStdio } from 'node:child_process';
+import { spawn, spawnSync, execFile, type ChildProcessByStdio } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, mkdtempSync, openSync, readFileSync, readSync, rmSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { Duplex, type Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
-  createEngine, createStreamLink,
-  type ByteStream, type CommitEvent, type Engine, type HandleSource, type Link, type Role,
+  createEngine, createStreamLink, NO_SELECTION_BRIDGE, readSelectionText, setSelectionText,
+  type ByteStream, type CommitEvent, type Engine, type GpuRef, type HandleSource, type Link, type Role,
 } from '../lib/engine.ts';
-import { app as appFor, appSet, available, type AppRole, type AppSpec } from '../test/support/apps.ts';
+import { app as appFor, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
 import { createProcfdSource, type ProcfdToken } from '../test/support/handles-procfd.ts';
 import { parsePresentationShm, presentationChecks } from '../test/support/presentation-shm.ts';
 
@@ -110,6 +115,8 @@ function eachFrame(bytes: Uint8Array, fn: (t: number, dv: DataView, off: number)
       case 0x08: len = 17 + u32(off + 13); break;                       // HANDLE_OPEN
       case 0x09: case 0x0b: len = 9; break;                             // HANDLE_CLOSE, ACK
       case 0x0a: len = 25 + u32(off + 21) + 16 * u32(off + 13); break;  // COMMIT
+      case 0x0c: len = 9 + u32(off + 5); break;                         // FEATURE
+      case 0x0d: len = 13; break;                                       // DMABUF_CREATED
       case 0x0e: len = 13 + u32(off + 9); break;                        // PRESENTED
       case 0x02: {                                                      // BUFFER (copy backend)
         const n = u32(off + 17);
@@ -150,6 +157,7 @@ interface State {
   handleDesc: Map<string, { pid: number; fd: number; offset: number }>;
   lastRef: Map<string, ShmRef>;
   poolOffsets: Set<number>;
+  gpuRefs: GpuRef[]; gpuReleases: number;
   ready?: Promise<Engine>;
   engine?: Engine;
   clock?: ReturnType<typeof setInterval>;
@@ -167,6 +175,7 @@ function startEngine() {
     handleDesc: new Map(), // `${conn}/${handle}` → procfd handle bytes, from HANDLE_OPEN
     lastRef: new Map(),    // `${conn}/${surface}` → the newest COMMIT's shm ref
     poolOffsets: new Set(), // pool byte offsets of committed buffers (handle base + COMMIT offset)
+    gpuRefs: [], gpuReleases: 0, // COMMITs of kind virtgpu the gpu source resolved
   };
 
   // every connection the relay makes, as a ByteStream
@@ -234,8 +243,15 @@ function startEngine() {
     close(token) { s.tokenCloses++; procfd.close(token); },
   };
 
+  // a stand-in renderer for COMMIT kind virtgpu: what unkernel's page does
+  // with vm.gl.gpu, minus the GPU (a token image; nothing reads pixels)
+  const gpu = {
+    resolve(ref: GpuRef) { s.gpuRefs.push(ref); return { resource: ref.resource }; },
+    release() { s.gpuReleases++; },
+  };
+
   s.ready = createEngine({
-    wasm, link, buffers,
+    wasm, link, buffers, gpu,
     onEvent(ev) {
       const key = `${'conn' in ev ? ev.conn : undefined}/${'surface' in ev ? ev.surface : undefined}`;
       switch (ev.type) {
@@ -314,6 +330,7 @@ function composite(s: State, key: string, ev: CommitEvent) {
   s.commitEvents++;
   s.formats.add(ev.format);
   // record, don't throw: this runs inside the engine's dispatch
+  if (ev.format === 'gpu') return; // a named GPU resource: no pixels (State.gpuRefs)
   const packed = ev.format === 'rgba'; // copy backend: rects' rows packed, in rect order
   if (packed ? ev.stride !== 0 : ev.format !== 'bgrx' && ev.format !== 'bgra') s.badFrame ??= `format ${ev.format}, stride ${ev.stride}`;
   if (!packed && (ev.stride < ev.width * 4 || ev.stride % 4 || ev.stride > ev.width * 4 + 4096)) s.badFrame ??= `${ev.width}px, stride ${ev.stride}`;
@@ -361,8 +378,8 @@ const nextConnection = () => new Promise<Socket | null>((resolve) => {
 });
 
 const relayLog: string[] = [];
-function startRelay(buffers: string) {
-  relay = spawn(RELAY[0], [...RELAY.slice(1), '--link', `unix:${linkPath}`, '--buffers', buffers, '--display', env.WAYLAND_DISPLAY!], { env, stdio: ['ignore', 'inherit', 'pipe'] });
+function startRelay(buffers: string, extra: string[] = []) {
+  relay = spawn(RELAY[0], [...RELAY.slice(1), '--link', `unix:${linkPath}`, '--buffers', buffers, '--display', env.WAYLAND_DISPLAY!, ...extra], { env, stdio: ['ignore', 'inherit', 'pipe'] });
   let partial = '';
   relay.stderr.on('data', (chunk: Buffer) => {
     partial += chunk;
@@ -560,6 +577,31 @@ async function main() {
     const paste = await run('paste', [...flag, '--no-newline'], 5000);
     check(paste.code === 0 && paste.stdout === text, `wl-paste ${flag.join(' ')}returned "${paste.stdout}"`);
   }
+  // the embedder's halves (the page bridge's) over the stream link: it
+  // reads an app's selection (FDMSG pipe_read: the relay's pipe), sets its
+  // own and wl-paste reads that (FDMSG own_pipe: the relay writes its copy)
+  const bridgeCopy = app('copy', ['wland-e2e-bridge']);
+  await bridgeCopy.exited;
+  await sleep(300);
+  if (engine.selectionBridged() === false) {
+    // an older relay (wlandr 0.1.0: no FEATURE selection_cache): the engine
+    // must not try — a prompt refusal, and an app's paste never blocks
+    console.log('  skipped: the engine\'s clipboard halves (the relay sent no FEATURE selection_cache); checking they are refused');
+    const t0 = Date.now();
+    const err = await readSelectionText(engine).then(() => null, (e: Error) => e.message);
+    check(err === NO_SELECTION_BRIDGE && Date.now() - t0 < 1000, `readSelectionText rejected at once: "${err}"`);
+    check(!setSelectionText(engine, 'wland-e2e from the engine'), 'setSelectionText refused (nothing offered to apps)');
+    const p0 = Date.now();
+    const appPaste = await run('paste', ['--no-newline'], 5000);
+    check(appPaste.code === 0 && appPaste.stdout === 'wland-e2e-bridge' && Date.now() - p0 < 3000, `wl-paste got the app's selection at once, not blocked: "${appPaste.stdout}"`);
+  } else {
+    check(engine.selectionBridged() === true, 'the relay bridges the clipboard (FEATURE selection_cache)');
+    const fromApp = await readSelectionText(engine);
+    check(fromApp === 'wland-e2e-bridge', `the engine read the app's selection: "${fromApp}"`);
+    check(setSelectionText(engine, 'wland-e2e from the engine'), 'the engine set its own selection');
+    const ownPaste = await run('paste', ['--no-newline'], 5000);
+    check(ownPaste.code === 0 && ownPaste.stdout === 'wland-e2e from the engine', `wl-paste of the engine's selection returned "${ownPaste.stdout}"`);
+  }
   await run('copy', ['--clear'], 3000);
   await run('copy', ['--primary', '--clear'], 3000);
 
@@ -666,6 +708,46 @@ async function main() {
   check(s.opens === 3 && s.closes === 2, `one engine served three relay connections (${s.opens} opens, ${s.closes} closes)`);
   cp.kill();
   await cp.exited;
+
+  // --- GPU resources beside handles: --buffers procfd --dmabuf virtgpu ---------
+  console.log('== dmabuf virtgpu beside procfd handles (--dmabuf virtgpu:@fake, test-only device) ==');
+  if (realApps) {
+    console.log('  skipped: fixtures only (virtgpu:@fake takes memfds, not a real GPU\'s dmabufs)');
+    return;
+  }
+  if (!/virtgpu/.test(spawnSync(RELAY[0], [...RELAY.slice(1), '--help'], { encoding: 'utf8' }).stderr ?? '')) {
+    console.log('  skipped: this relay has no --dmabuf virtgpu (WLAND_E2E_RELAY: an older build)');
+    return;
+  }
+  const copyRelay = relay!;
+  const closes3 = s.closes, opens3 = s.opens;
+  copyRelay.kill();
+  await new Promise<void>((r) => (copyRelay.exitCode !== null || copyRelay.signalCode !== null ? r() : copyRelay.once('exit', () => r())));
+  await until(() => s.closes > closes3, 3000, 'the engine to see the copy relay go');
+  s.errors.length = 0;
+  s.async = false; // ACK count == COMMIT count per message again
+  startRelay('procfd', ['--dmabuf', 'virtgpu:@fake']);
+  await until(() => s.opens > opens3, 5000, 'the virtgpu relay to connect');
+  const g0 = s.gpuRefs.length, gk0 = s.commitFrames, ga0 = s.acks, gt0 = s.tokens;
+  const shmApp = app('shm');
+  const gpuApp = app('dmabuf');
+  await until(() => s.gpuRefs.length > g0 + 40 && s.tokens > gt0, 10000, 'GPU and shm commits on one link');
+  const refs = s.gpuRefs.slice(g0);
+  check(/dmabuf: format XR24 modifier 0x00ffffffffffffff/.test(gpuApp.stdoutText), 'the GPU client chose XRGB8888 with the implicit modifier');
+  // (a buffer released before the next frame is drawn again: one or both)
+  const named = new Set(refs.map((r) => r.resource));
+  check(named.size >= 1 && named.size <= 2 && [...named].every((r) => r >= 1), `${refs.length} kind-virtgpu COMMITs naming its buffers' resources (${[...named].join(', ')})`);
+  check(refs.every((r) => r.width === 256 && r.height === 192 && r.format === 0x34325258 && r.modifier === 0x00ffffffffffffffn), 'refs carry its size, XR24 and MOD_INVALID');
+  check([...s.formats].includes('bgrx') && [...s.formats].includes('gpu'), `shm commits by handle and GPU commits on the same link (${[...s.formats]})`);
+  check(s.ackMismatch === null && s.acks - ga0 === s.commitFrames - gk0, `one ACK per COMMIT of either kind (${s.acks - ga0}/${s.commitFrames - gk0})`);
+  shmApp.kill();
+  gpuApp.kill();
+  await shmApp.exited;
+  await gpuApp.exited;
+  await sleep(200);
+  check(s.gpuReleases === s.gpuRefs.length, `every resolved image released (${s.gpuReleases}/${s.gpuRefs.length})`);
+  check(s.tokens === s.tokenCloses, `every opened handle closed (${s.tokens}/${s.tokenCloses})`);
+  check(s.errors.length === 0 && s.badFrame === null, `no engine error events, sane frames${s.errors.length ? ` (${s.errors.join('; ')})` : ''}`);
 }
 
 let code = 0;

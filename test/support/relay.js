@@ -18,10 +18,13 @@
 //   un-ACKed COMMITs) reach zero; all of a conn's exports go when it closes;
 // - wl_keyboard.keymap FDMSG from the engine: makes the "memfd" for the client.
 //
-// With `gpu: true` it plays a GPU-resource emitter instead (wlandr has
-// none): each COMMIT is kind virtgpu, its "resource" the buffer's kwshm
-// export id (the page's createGpuSource resolves it, standing in for a
-// virgl host), everything else — handles, ACKs, releases — unchanged.
+// With `gpu: true` it plays a GPU-resource emitter instead (as wlandr
+// `--dmabuf virtgpu` does for dmabufs): each COMMIT is kind virtgpu, its
+// "resource" the buffer's kwshm export id (the page's createGpuSource
+// resolves it, standing in for a virgl host), everything else — handles,
+// ACKs, releases — unchanged. It then opens each link with FEATURE
+// dmabuf_kind (virtgpu), as wlandr does, though it offers no linux-dmabuf
+// (no linux_dmabuf frame follows: its "GPU" buffers are wl_shm ones).
 //
 // Frame callbacks are forwarded (this is a stream link): the engine fires
 // them from its frame clock. It also polices both sides and reports
@@ -32,6 +35,7 @@
 import {
   wlEach, wlMessage, eachEngineFrame, createBatch, stampPresented, monotonicNs, FD, HANDLE,
   connOpen, connClose, fdmsg, handleOpen, handleClose, kwshmBytes, shmCommit, virtgpuCommit,
+  dmabufKindFeature, BUFFER_KIND,
 } from './proto.js';
 
 // wl_shm format → DRM fourcc (ARGB8888 'AR24', XRGB8888 'XR24')
@@ -52,7 +56,11 @@ export function createRelay({ link, shm, violation, gpu = false }) {
   };
 
   link.start({
-    onOpen() { attached = true; },
+    onOpen() {
+      attached = true;
+      // first on the link, before any CONN_OPEN (STREAM.md FEATURE)
+      if (gpu) { batch.push(dmabufKindFeature(BUFFER_KIND.VIRTGPU)); flush(); }
+    },
     onMessage(buf) {
       eachEngineFrame(new Uint8Array(buf), (f) => {
         const c = conns.get(f.conn);
@@ -67,7 +75,9 @@ export function createRelay({ link, shm, violation, gpu = false }) {
           disconnect(c);
           c.client.killed('the compositor closed the connection');
         }
-        // FDMSG pipe (clipboard) and SRVOBJ: no clipboard in this demo
+        // FDMSG pipe (clipboard) and SRVOBJ: no clipboard in this demo — so
+        // no FEATURE selection_cache either: the engine's clipboard bridge
+        // is off on its links (selectionBridged() false), as on wlandr 0.1.0
       });
       flush();
     },

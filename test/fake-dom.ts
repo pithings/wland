@@ -1,6 +1,6 @@
 // Just enough DOM for lib/view.ts, input.ts, wm.ts and client.ts to run in
 // Node: elements with listeners and a 2D context that records puts and
-// draws (toDataURL names the paints; CSS.supports says yes), focus that fires focusin/blur,
+// draws (toDataURL names the paints; CSS.supports says yes), focus that fires focusin/focusout/blur,
 // pointer capture and Pointer Lock (requests recorded; the test grants
 // with lock()), the Fullscreen API (requests recorded, granted at once
 // unless fullscreenResult says otherwise; exitFullscreen()), navigator.userActivation, rAF, ResizeObserver and matchMedia —
@@ -157,8 +157,19 @@ class Element extends Target {
     const prev = this.doc.activeElement;
     if (prev === this) return;
     this.doc.activeElement = this;
-    if (prev) prev.dispatch('blur');
+    if (prev) {
+      prev.dispatch('blur');
+      this.doc.dispatch('focusout', { target: prev, relatedTarget: this });
+    }
     this.doc.dispatch('focusin', { target: this });
+  }
+  /** The focus goes to nothing (the body): blur and focusout, no focusin —
+   *  as an embedder's blur() or a click on plain page text does. */
+  blur() {
+    if (this.doc.activeElement !== this) return;
+    this.doc.activeElement = this.doc.body;
+    this.dispatch('blur');
+    this.doc.dispatch('focusout', { target: this, relatedTarget: null });
   }
   getBoundingClientRect() { return { left: 0, top: 0, width: 0, height: 0 }; }
   /** A stand-in PNG URL naming the size and how many paints it has seen. */
@@ -215,9 +226,15 @@ export interface FakeDom {
   /** Run the pending animation frames once. */
   frame(t?: number): void;
   /** What is still registered outside the container. */
-  leftovers(): { documentListeners: number; observers: number; mediaListeners: number; frames: number };
+  leftovers(): { documentListeners: number; windowListeners: number; observers: number; mediaListeners: number; frames: number };
   /** An 800×600 container attached to the body (a fake HTMLElement). */
   container(): any;
+  /** The element's layout changed: new client size, then every
+   *  ResizeObserver observing it is called. */
+  resize(el: any, width: number, height: number): void;
+  /** devicePixelRatio changes (zoom, another display): a 'change' to every
+   *  armed resolution query that no longer matches. */
+  setDpr(dpr: number): void;
   uninstall(): void;
 }
 
@@ -226,19 +243,21 @@ export function installFakeDom(): FakeDom {
   doc.body = new Element(doc, 'body');
   doc.activeElement = doc.body;
 
-  const live = { observers: new Set<object>(), media: new Set<Target>(), frames: new Map<number, (t: number) => void>() };
+  const live = { observers: new Set<{ cb: (entries: unknown[]) => void; targets: Set<unknown> }>(), media: new Set<Target & { media?: string }>(), frames: new Map<number, (t: number) => void>() };
   let nextFrame = 1;
   const g = globalThis as any;
   g.document = doc;
-  g.window = { devicePixelRatio: 1 };
+  const win = Object.assign(new Target(), { devicePixelRatio: 1 });
+  g.window = win;
   g.location = { protocol: 'http:', host: 'localhost:8080' };
   g.ImageData = FakeImageData;
   g.CSS = { supports: () => true };
   g.ResizeObserver = class ResizeObserver {
-    cb: unknown;
-    constructor(cb: unknown) { this.cb = cb; }
-    observe() { live.observers.add(this); }
-    disconnect() { live.observers.delete(this); }
+    cb: (entries: unknown[]) => void;
+    targets = new Set<unknown>();
+    constructor(cb: (entries: unknown[]) => void) { this.cb = cb; }
+    observe(el: unknown) { this.targets.add(el); live.observers.add(this); }
+    disconnect() { this.targets.clear(); live.observers.delete(this); }
   };
   g.matchMedia = (query: string) => {
     const mq = new Target() as Target & { media?: string };
@@ -272,6 +291,7 @@ export function installFakeDom(): FakeDom {
       for (const mq of live.media) media += mq.listenerCount;
       return {
         documentListeners: doc.listenerCount,
+        windowListeners: win.listenerCount,
         observers: live.observers.size,
         mediaListeners: media,
         frames: live.frames.size,
@@ -283,6 +303,15 @@ export function installFakeDom(): FakeDom {
       c.clientHeight = 600;
       doc.body.appendChild(c);
       return c;
+    },
+    resize(el, width, height) {
+      el.clientWidth = width;
+      el.clientHeight = height;
+      for (const o of [...live.observers]) if (o.targets.has(el)) o.cb([{ target: el }]);
+    },
+    setDpr(dpr) {
+      g.window.devicePixelRatio = dpr;
+      for (const mq of [...live.media]) if (mq.media !== `(resolution: ${dpr}dppx)`) mq.dispatch('change');
     },
     uninstall() {
       for (const k of ['document', 'window', 'location', 'ImageData', 'CSS', 'ResizeObserver', 'matchMedia', 'requestAnimationFrame', 'cancelAnimationFrame']) delete g[k];

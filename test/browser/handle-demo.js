@@ -11,6 +11,11 @@
 //   link=stream|memory   records over an in-page byte stream (default) or whole messages
 //   gpu=1                COMMITs of kind virtgpu, resolved by a stand-in virgl host
 //                        (createGpuSource) into a canvas the view draws
+//   shape=readv|view     the HandleSource's batched read (one call per commit) or
+//                        its in-place view (pixels straight from the export, no copy)
+//   sab=1                the clients' pools are SharedArrayBuffers (with shape=view
+//                        the commit's pixels are then shared memory); needs a
+//                        cross-origin-isolated page (test/support/isolated.ts)
 import { createWland } from '../../lib/client.ts';
 import { createStreamLink } from '../../lib/engine.ts';
 import { createShm, createHandleSource, createGpuSource } from '../support/kwshm.js';
@@ -24,6 +29,8 @@ const opts = {
   async: params.get('async') === '1',
   link: params.get('link') === 'memory' ? 'memory' : 'stream',
   gpu: params.get('gpu') === '1',
+  shape: params.get('shape') === 'readv' || params.get('shape') === 'view' ? params.get('shape') : 'read',
+  sab: params.get('sab') === '1',
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -38,7 +45,7 @@ function violation(what) {
 
 // the guest side's shared memory, and the embedder's view of it
 const shm = createShm();
-const source = createHandleSource(shm, { async: opts.async, violation });
+const source = createHandleSource(shm, { async: opts.async, violation, shape: opts.shape });
 const gpu = opts.gpu ? createGpuSource(shm, { violation }) : undefined;
 
 // the link: two ends, one for the relay, one for the engine
@@ -57,8 +64,11 @@ const palette = [
   { title: 'xrgb window', format: XRGB8888, hue: 210, width: 420, height: 300 },
   { title: 'argb window', format: ARGB8888, hue: 330, width: 360, height: 260 },
 ];
+if (opts.sab && !globalThis.crossOriginIsolated) {
+  violation('sab=1: the page is not cross-origin isolated (COOP/COEP): no SharedArrayBuffer');
+}
 function spawn(i = clients.length) {
-  const c = createClient(palette[i % palette.length]);
+  const c = createClient({ ...palette[i % palette.length], shared: opts.sab });
   clients.push(c);
   c.start(relay, violation);
   return c;
@@ -96,7 +106,7 @@ wl = await createWland({
 });
 
 // --- the panel -------------------------------------------------------------
-for (const [key, values] of Object.entries({ webgl: ['never', 'always'], async: [false, true], link: ['stream', 'memory'], gpu: [false, true] })) {
+for (const [key, values] of Object.entries({ webgl: ['never', 'always'], async: [false, true], link: ['stream', 'memory'], gpu: [false, true], shape: ['read', 'readv', 'view'] })) {
   const box = $(`#opt-${key}`);
   for (const v of values) {
     const b = document.createElement('button');
@@ -121,6 +131,9 @@ const stats = () => ({
   tokens: source.stats.open,
   exports: shm.live,
   reads: source.stats.reads,
+  // sab=1: the page can make SharedArrayBuffers, and views handed out of one
+  isolated: !!globalThis.crossOriginIsolated,
+  sharedViews: source.stats.sharedViews,
   resolves: gpu ? gpu.stats.resolves : 0,
   gpuReleased: gpu ? gpu.stats.released : 0,
   violations: violations.length,

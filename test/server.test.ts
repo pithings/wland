@@ -3,9 +3,9 @@
 // Needs `zig build`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { startServer } from '../lib/index.ts';
+import { serverBinary, startRelay, startServer } from '../lib/index.ts';
 import type { ServerInfo } from '../lib/index.ts';
 
 const stop = (info: ServerInfo) => new Promise<unknown>((done) => {
@@ -75,5 +75,27 @@ test('startServer: the next free wayland-N while one is taken', async () => {
     assert.deepEqual(readdirSync(runtimeDir), []);
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
+  }
+});
+
+test('the package installs on any platform; asking for the relay off Linux fails at run time, clearly', async () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.os, undefined, 'no install-time "os" restriction (the browser side runs anywhere)');
+  for (const [platform, arch] of [['darwin', 'arm64'], ['win32', 'x64'], ['freebsd', 'x64']]) {
+    assert.throws(() => serverBinary(platform, arch), (e: Error) =>
+      e.message.includes('Linux only') && e.message.includes(`${platform}-${arch}`) && e.message.includes('wland/client'));
+  }
+  assert.throws(() => serverBinary('linux', 'riscv64'), /no wlandr binary for linux-riscv64/);
+  assert.ok(existsSync(serverBinary()), 'here (Linux, a checkout): the zig build output');
+  // startServer / startRelay reject (not throw) with that message
+  const real = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', { ...real, value: 'darwin' });
+  try {
+    const started = startServer({ port: 0, onLog() {} });
+    const relay = startRelay({ onLog() {} });
+    await assert.rejects(started, /Linux only/);
+    await assert.rejects(relay, /Linux only/);
+  } finally {
+    Object.defineProperty(process, 'platform', real);
   }
 });

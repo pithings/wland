@@ -23,6 +23,8 @@ pub const App = struct {
     /// modifiers: Shift (xkb mod index 0) held
     shift: bool = false,
     ctrl: bool = false,
+    /// NumLock (Mod2, xkb mod index 4) locked: keypad keys type digits
+    numlock: bool = false,
     keymap_ok: bool = false,
 
     /// Connect, read the globals and bind the usual ones.
@@ -79,6 +81,7 @@ pub const App = struct {
             const mods = ev.uint(1) | ev.uint(2);
             app.shift = mods & 1 != 0;
             app.ctrl = mods & 4 != 0;
+            app.numlock = ev.uint(3) & 16 != 0;
             return true;
         }
         if (ev.is("wl_keyboard", "repeat_info") or ev.is("wl_seat", "name") or ev.iface == (comptime wl.iface("wl_output")) or
@@ -119,12 +122,26 @@ pub const App = struct {
     }
 };
 
-/// evdev keycode → character, US layout (plain, shifted). 0: none.
-pub fn keyChar(code: u32, shift: bool) u8 {
+/// evdev keycode → character, US layout (plain, shifted). 0: none. The
+/// keypad as the keymap's KEYPAD type has it: digits and '.' with NumLock
+/// and no Shift, navigation (none here) otherwise; its operators always.
+pub fn keyChar(code: u32, shift: bool, numlock: bool) u8 {
     const plain = "\x00\x001234567890-=\x08\tqwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./";
     const shifted = "\x00\x00!@#$%^&*()_+\x08\tQWERTYUIOP{}\n\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?";
     if (code == 57) return ' ';
     if (code == 96) return '\n'; // KP Enter
+    switch (code) {
+        55 => return '*',
+        74 => return '-',
+        78 => return '+',
+        98 => return '/',
+        71...73, 75...77, 79...83 => {
+            if (!numlock or shift) return 0; // KP_Home, KP_Up, … KP_Delete
+            const keypad = "789-456+1230.";
+            return keypad[code - 71];
+        },
+        else => {},
+    }
     if (code >= plain.len) return 0;
     return if (shift) shifted[code] else plain[code];
 }

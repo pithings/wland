@@ -127,7 +127,7 @@ test('engine runs without a DOM: registry, toplevel, title, commit, destroy', as
     ...msg(8, 2, 'hello wland'),
   ]))));
   const surface = events.find((e) => e.type === 'surface');
-  assert.deepEqual(surface, { type: 'surface', conn: CONN, surface: 6, role: 1, root: 6 });
+  assert.deepEqual(surface, { type: 'surface', conn: CONN, surface: 6, role: 1, root: 6, parent: 0, z: 0 });
   const title = events.find((e) => e.type === 'title');
   assert.deepEqual(title, { type: 'title', conn: CONN, surface: 6, title: 'hello wland' });
 
@@ -265,6 +265,55 @@ test('a FEATURE frame (linux_dmabuf) ahead of the conns makes the compositor adv
   assert.equal((await run(null)).zwp_linux_dmabuf_v1, undefined);
 });
 
+test('FEATURE dmabuf_kind (virtgpu) before linux_dmabuf: offered only by an engine with a gpu source; without one the global is absent (a bind is a protocol error), wl_shm stays, the core says why; readback (no dmabuf_kind) needs none; on every link', async () => {
+  const table = new Uint8Array([...u32s(0xe280, 0), ...u32s(0x34325258, 0, 0, 0)]);
+  const linuxDmabuf = frame(0x0c, u32s(1, table.length), table);
+  const dmabufKind = frame(0x0c, u32s(2, 4, 2)); // u32 buffer kind 2 = virtgpu
+  const run = async (gpu: boolean, features: Uint8Array[]) => {
+    const link = scriptedLink();
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const engine = await createEngine({
+      wasm, link, gpu: gpu ? { resolve: () => null } : undefined,
+      onEvent: (ev) => { if (ev.type === 'log') logs.push(ev.line); else if (ev.type === 'error') errors.push(ev.detail); },
+    });
+    engine.start();
+    const links: Record<string, { name: number; version: number }>[] = [];
+    for (let i = 0; i < 2; i++) { // a link, then the relay reconnects
+      link.sent.length = 0;
+      link.cb!.onOpen();
+      link.cb!.onMessage(pack(...features, connOpen(CONN), wireFrame(CONN, msg(1, 1, 2))));
+      links.push(globals(link.sent, 2));
+      if (i === 0) link.cb!.onClose({ takenOver: false });
+    }
+    // bound anyway, by its name: a protocol error (wl_display.error) for the client
+    link.sent.length = 0;
+    link.cb!.onMessage(pack(wireFrame(CONN, msg(2, 0, 14, 'zwp_linux_dmabuf_v1', 4, 3))));
+    const protocolError = wireEvents(link.sent, CONN).some((e) => e[0] === 1 && e[1] === 0);
+    const refused = logs.filter((l) => /linux-dmabuf not offered/.test(l)).length;
+    return { links, protocolError, refused, errors };
+  };
+  const dmabufOf = (r: Awaited<ReturnType<typeof run>>) => r.links.map((g) => g.zwp_linux_dmabuf_v1 ?? null);
+  const shmOf = (r: Awaited<ReturnType<typeof run>>) => r.links.every((g) => !!g.wl_shm && !!g.wl_compositor);
+  const offered = { name: 14, version: 4 };
+
+  const withGpu = await run(true, [dmabufKind, linuxDmabuf]);
+  assert.deepEqual(dmabufOf(withGpu), [offered, offered]);
+  assert.equal(withGpu.protocolError, false);
+  assert.equal(withGpu.refused, 0);
+
+  const without = await run(false, [dmabufKind, linuxDmabuf]);
+  assert.deepEqual(dmabufOf(without), [null, null], 'no gpu source: GPU clients must not take the GPU path');
+  assert.ok(shmOf(without), 'the software path stays');
+  assert.equal(without.protocolError, true);
+  assert.equal(without.refused, 2, 'one log line per link');
+  assert.deepEqual(without.errors, []);
+
+  const readback = await run(false, [linuxDmabuf]); // pixels in the stream: any engine shows them
+  assert.deepEqual(dmabufOf(readback), [offered, offered]);
+  assert.equal(readback.refused, 0);
+});
+
 // every wayland event the engine sent to `conn`: [object, opcode, ...arg words]
 function wireEvents(sent: Uint8Array[], conn: number): number[][] {
   const out: number[][] = [];
@@ -337,6 +386,70 @@ test('relative pointer + pointer lock through the engine: motions coalesce with 
   // the app hangs up: the lock is let go
   link.cb!.onMessage(pack(frame(4, u32s(CONN))));
   assert.deepEqual(events, [{ type: 'pointer-lock', conn: CONN, surface: 0 }, { type: 'disconnect', conn: CONN }]);
+});
+
+test('lock modifiers through the engine: NumLock (Mod2) locked from the start, keyboardLocks sets the browser\'s state; the state — lock keys\' toggles included — is kept across a link reopen', async () => {
+  const link = scriptedLink();
+  const engine = await createEngine({ wasm, link, onEvent: () => {} });
+  engine.start();
+  const KB = 11, MODIFIERS = 4, CAPS = 1 << 1, NUM = 1 << 4;
+  const mapped = () => {
+    link.sent.length = 0;
+    link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, msg(1, 1, 2))));
+    const g = globals(link.sent, 2);
+    // wl_compositor 4, xdg_wm_base 5, wl_seat 9; surface 6 → xdg_surface 7 → toplevel 8; keyboard 11
+    link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+      ...msg(2, 0, g.wl_compositor.name, 'wl_compositor', 4, 4),
+      ...msg(2, 0, g.xdg_wm_base.name, 'xdg_wm_base', g.xdg_wm_base.version, 5),
+      ...msg(2, 0, g.wl_seat.name, 'wl_seat', 5, 9),
+      ...msg(4, 0, 6), ...msg(5, 2, 7, 6), ...msg(7, 1, 8), ...msg(9, 1, KB),
+    ]))));
+    link.sent.length = 0; // (the keymap's FDMSG)
+  };
+  // [depressed, latched, locked, group] of each wl_keyboard.modifiers sent
+  const mods = () => wireEvents(link.sent.splice(0), CONN).filter((e) => e[0] === KB && e[1] === MODIFIERS).map((e) => e.slice(3));
+
+  link.cb!.onOpen();
+  mapped();
+  engine.keyboardEnter(CONN, 6);
+  assert.deepEqual(mods(), [[0, 0, NUM, 0]], 'the enter: NumLock on (keypad keys type digits)');
+  engine.key(CONN, 1, 71, true); // KP7: no modifier change
+  engine.key(CONN, 2, 71, false);
+  assert.deepEqual(mods(), []);
+  engine.keyboardLocks(true, true);
+  engine.keyboardLocks(true, true); // unchanged: nothing
+  assert.deepEqual(mods(), [[0, 0, CAPS | NUM, 0]]);
+  engine.keyboardLocks(false, false);
+  assert.deepEqual(mods(), [[0, 0, 0, 0]]);
+  // the lock keys toggle the core's state after keyboardLocks
+  engine.key(CONN, 3, 69, true); // NumLock
+  engine.key(CONN, 4, 69, false);
+  engine.key(CONN, 5, 58, true); // Caps Lock
+  engine.key(CONN, 6, 58, false);
+  assert.deepEqual(mods(), [[0, 0, NUM, 0], [0, 0, CAPS | NUM, 0]]);
+  // the next link's compositor is fresh: it starts from the state the last
+  // one ended with (the toggles), not keyboardLocks' stale (false, false)
+  link.cb!.onClose({ takenOver: false });
+  link.cb!.onOpen();
+  mapped();
+  engine.keyboardEnter(CONN, 6);
+  assert.deepEqual(mods(), [[0, 0, CAPS | NUM, 0]]);
+  // the embedder's word while closed wins over what the link ended with
+  engine.key(CONN, 7, 69, true); // NumLock off
+  assert.deepEqual(mods(), [[0, 0, CAPS, 0]]);
+  link.cb!.onClose({ takenOver: false });
+  engine.keyboardLocks(false, true); // while closed: kept
+  link.cb!.onOpen();
+  mapped();
+  engine.keyboardEnter(CONN, 6);
+  assert.deepEqual(mods(), [[0, 0, NUM, 0]]);
+  // a link that opens again without a close in between carries it too
+  engine.key(CONN, 8, 58, true); // Caps Lock on
+  assert.deepEqual(mods(), [[0, 0, CAPS | NUM, 0]]);
+  link.cb!.onOpen();
+  mapped();
+  engine.keyboardEnter(CONN, 6);
+  assert.deepEqual(mods(), [[0, 0, CAPS | NUM, 0]]);
 });
 
 // WIRE events and PRESENTED frames of the engine's output, in order: WIRE

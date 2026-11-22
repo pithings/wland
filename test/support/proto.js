@@ -74,8 +74,12 @@ export function wlEach(bytes, fn) {
 export const T = {
   WIRE: 0x01, BUFFER: 0x02, CONN_OPEN: 0x03, CONN_CLOSE: 0x04, FDMSG: 0x05, SRVOBJ: 0x06,
   BUFFER_LZ: 0x07, HANDLE_OPEN: 0x08, HANDLE_CLOSE: 0x09, COMMIT: 0x0a, ACK: 0x0b,
-  PRESENTED: 0x0e,
+  FEATURE: 0x0c, PRESENTED: 0x0e,
 };
+/** FEATURE kinds: 1 linux_dmabuf, 2 dmabuf_kind (bytes: u32 buffer kind). */
+export const FEATURE = { LINUX_DMABUF: 1, DMABUF_KIND: 2 };
+/** COMMIT buffer kinds. */
+export const BUFFER_KIND = { SHM: 1, VIRTGPU: 2 };
 export const FD = { SHM_POOL: 1, KEYMAP: 2, PIPE: 3 };
 export const HANDLE = { KWSHM: 1, PROCFD: 2 };
 export const SHM = { ARGB8888: 0, XRGB8888: 1 };
@@ -106,6 +110,9 @@ export const handleOpen = (conn, handle, kind, bytes) => frame(T.HANDLE_OPEN, co
 export const kwshmBytes = (id, size) => frame(0, id, { u64: size }).subarray(1);
 export const procfdBytes = (pid, fd, offset, size) => frame(0, pid, fd, { u64: offset }, { u64: size }).subarray(1);
 export const handleClose = (conn, handle) => frame(T.HANDLE_CLOSE, conn, handle);
+export const feature = (kind, bytes) => frame(T.FEATURE, kind, bytes.length, bytes);
+/** FEATURE dmabuf_kind: the relay's dmabuf commits are COMMITs of `bufferKind`. */
+export const dmabufKindFeature = (bufferKind) => feature(FEATURE.DMABUF_KIND, frame(0, bufferKind).subarray(1));
 /** COMMIT with buffer kind 1 = shm. ref: {handle, offset, width, height,
  *  stride, format}; rects: [[x, y, w, h], ...] in buffer px. */
 export function shmCommit(conn, surface, serial, ref, rects) {

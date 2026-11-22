@@ -16,16 +16,20 @@
 //!   constraints                  weston-constraints: confine, then lock
 //!   relative                     an SDL app in relative mouse mode
 //!   term [ignored args…]         foot: CSD subsurfaces, keys, a mini shell
-//!   files [DIR]                  nautilus: shadow, input region, popup menu,
-//!                                double click, minimize/maximize, drag and drop
+//!   files [DIR]                  nautilus: shadow, input region, popup menus
+//!                                (hamburger, right-click; shadowed), double
+//!                                click, minimize/maximize, drag and drop
 //!   fullscreen [-f]              weston-fullscreen: `f` toggles fullscreen
+//!   dmabuf                       weston-simple-dmabuf-egl: linux-dmabuf buffers
+//!                                (memfds: needs a relay that takes them, e.g.
+//!                                the test-only `--dmabuf virtgpu:@fake`)
 
 const std = @import("std");
 const wl = @import("wl.zig");
 
 const usage =
     \\usage: wland-fixture <mode> [args]
-    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen
+    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen dmabuf
     \\
 ;
 
@@ -56,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "term", @import("term.zig").run },
         .{ "files", @import("files.zig").run },
         .{ "fullscreen", @import("fullscreen.zig").run },
+        .{ "dmabuf", @import("dmabuf.zig").run },
     };
     inline for (modes) |m| {
         if (std.mem.eql(u8, mode, m[0])) return m[1](gpa, env, args);

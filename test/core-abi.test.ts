@@ -164,3 +164,25 @@ test('wland_decode_buffer: raw_len must equal the rects\' pixel bytes, else 0 (n
   const more = Array.from({ length: 20 }, (_, i) => i);
   assert.equal(withBytes(lz(20, literals(more)), (p: number, n: number) => ex.wland_decode_buffer(p, n)), 0);
 });
+
+test('wland_set_gpu_source: default on; off, FEATURE dmabuf_kind virtgpu keeps linux-dmabuf unadvertised, and it survives wland_init', async () => {
+  const table = [...u32(0xe280, 0), ...u32(0x34325258, 0, 0, 0)];
+  const features = frame([0x0c], u32(2, 4, 2), [0x0c], u32(1, table.length), table);
+  // a fresh link's compositor: FEATUREs, an app, its registry → advertised?
+  const advertised = (c: Awaited<ReturnType<typeof core>>) => {
+    c.calls.sent.length = 0;
+    c.withBytes(frame(features, [0x03], u32(5), [0x01], u32(5, 12), u32(1, (12 << 16) | 1, 2)), (p, n) => c.ex.wland_on_frame(p, n));
+    return c.calls.sent.some((b) => new TextDecoder().decode(b).includes('zwp_linux_dmabuf_v1'));
+  };
+  const c = await core();
+  assert.equal(advertised(c), true, 'an embedder that never says is unchanged');
+  c.ex.wland_set_gpu_source(0);
+  c.ex.wland_init(1, 120);
+  assert.equal(advertised(c), false);
+  assert.ok(c.calls.log.some((l) => /linux-dmabuf not offered/.test(l)));
+  c.ex.wland_init(1, 120); // the next link: still off
+  assert.equal(advertised(c), false);
+  c.ex.wland_set_gpu_source(1);
+  c.ex.wland_init(1, 120);
+  assert.equal(advertised(c), true);
+});

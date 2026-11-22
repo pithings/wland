@@ -16,11 +16,12 @@ import { createClient, XRGB8888, ARGB8888 } from './support/test-client.js';
 const wasm = await readFile(new URL('../lib/wland.wasm', import.meta.url));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function run({ link, async, rgba }: { link: string; async: boolean; rgba: boolean }) {
+type Shape = 'read' | 'readv' | 'view';
+async function run({ link, async, rgba, shape = 'read' }: { link: string; async: boolean; rgba: boolean; shape?: Shape }) {
   const violations: string[] = [];
   const violation = (v: string) => violations.push(v);
   const shm = createShm();
-  const source = createHandleSource(shm, { async, violation });
+  const source = createHandleSource(shm, { async, violation, shape });
   let relayLink: Link, engineLink: Link;
   if (link === 'stream') {
     const pair = streamPair();
@@ -79,41 +80,68 @@ async function run({ link, async, rgba }: { link: string; async: boolean; rgba: 
   return { violations, relay, source, shm, clients, commits };
 }
 
+const modes: { link: string; async: boolean; rgba: boolean; shape?: Shape }[] = [];
 for (const link of ['memory', 'stream']) {
   for (const async of [false, true]) {
-    for (const rgba of [false, true]) {
-      test(`demo over ${link} link, ${async ? 'async' : 'sync'} source, ${rgba ? 'rgba' : 'bgra/bgrx'}`, async () => {
-        const r = await run({ link, async, rgba });
-        assert.deepEqual(r.violations, []);
-        const [a, b] = r.clients;
-        assert.ok(a.stats.frames > 10 && b.stats.frames > 10, `frames ${a.stats.frames} ${b.stats.frames}`);
-        assert.ok(r.relay.stats.commits > 20);
-        // every COMMIT got its ACK, and releases follow the ACKs
-        assert.equal(r.relay.stats.acks, r.relay.stats.commits);
-        assert.ok(r.relay.stats.releases >= r.relay.stats.commits - 6);
-        assert.equal(r.commits.length, r.relay.stats.commits);
-        const formats = new Set(r.commits.map((c) => `${c.conn}:${c.format}`));
-        assert.deepEqual([...formats].sort(), rgba ? ['1:rgba', '2:rgba'] : ['1:bgrx', '2:bgra']);
-        assert.ok(r.commits.every((c) => c.opaque));
-        // resized: the old generation's handles are gone (≤ 3 per client)
-        assert.deepEqual([a.width, a.height], [260, 200]);
-        assert.ok(r.relay.stats.handles <= 6, `handles ${r.relay.stats.handles}`);
-        // handles: one per live buffer, and the engine holds exactly those
-        assert.equal(r.source.stats.open, r.relay.stats.handles);
-        assert.equal(r.shm.live, r.relay.stats.handles);
-        // input arrived
-        assert.equal(a.stats.typed, 'HEL');
-        assert.equal(a.stats.clicks, 1);
-        assert.ok(a.stats.keymap > 1000, 'keymap delivered through the relay');
-        // one presentation feedback per frame, each presented (stamped by
-        // the relay on the clients' clock: no violation) or discarded; the
-        // last one or two may still wait for a tick that never came
-        for (const c of r.clients) {
-          const { frames, presented, discarded } = c.stats;
-          assert.ok(presented > 5, `presented ${presented}`);
-          assert.ok(frames - presented - discarded >= 0 && frames - presented - discarded <= 2, `frames ${frames} presented ${presented} discarded ${discarded}`);
-        }
-      });
-    }
+    for (const rgba of [false, true]) modes.push({ link, async, rgba });
   }
 }
+// the batched and in-place source shapes (HandleSource.readv / view)
+modes.push({ link: 'stream', async: true, rgba: false, shape: 'readv' }, { link: 'memory', async: false, rgba: true, shape: 'readv' },
+  { link: 'stream', async: false, rgba: false, shape: 'view' }, { link: 'memory', async: true, rgba: true, shape: 'view' });
+for (const { link, async, rgba, shape } of modes) {
+  test(`demo over ${link} link, ${async ? 'async' : 'sync'} source${shape ? ` (${shape})` : ''}, ${rgba ? 'rgba' : 'bgra/bgrx'}`, async () => {
+    const r = await run({ link, async, rgba, shape });
+    assert.deepEqual(r.violations, []);
+    const [a, b] = r.clients;
+    assert.ok(a.stats.frames > 10 && b.stats.frames > 10, `frames ${a.stats.frames} ${b.stats.frames}`);
+    assert.ok(r.relay.stats.commits > 20);
+    // every COMMIT got its ACK, and releases follow the ACKs
+    assert.equal(r.relay.stats.acks, r.relay.stats.commits);
+    assert.ok(r.relay.stats.releases >= r.relay.stats.commits - 6);
+    assert.equal(r.commits.length, r.relay.stats.commits);
+    const formats = new Set(r.commits.map((c) => `${c.conn}:${c.format}`));
+    assert.deepEqual([...formats].sort(), rgba ? ['1:rgba', '2:rgba'] : ['1:bgrx', '2:bgra']);
+    assert.ok(r.commits.every((c) => c.opaque));
+    // resized: the old generation's handles are gone (≤ 3 per client)
+    assert.deepEqual([a.width, a.height], [260, 200]);
+    assert.ok(r.relay.stats.handles <= 6, `handles ${r.relay.stats.handles}`);
+    // handles: one per live buffer, and the engine holds exactly those
+    assert.equal(r.source.stats.open, r.relay.stats.handles);
+    assert.equal(r.shm.live, r.relay.stats.handles);
+    // input arrived
+    assert.equal(a.stats.typed, 'HEL');
+    assert.equal(a.stats.clicks, 1);
+    assert.ok(a.stats.keymap > 1000, 'keymap delivered through the relay');
+    // one presentation feedback per frame, each presented (stamped by
+    // the relay on the clients' clock: no violation) or discarded; the
+    // last one or two may still wait for a tick that never came
+    for (const c of r.clients) {
+      const { frames, presented, discarded } = c.stats;
+      assert.ok(presented > 5, `presented ${presented}`);
+      assert.ok(frames - presented - discarded >= 0 && frames - presented - discarded <= 2, `frames ${frames} presented ${presented} discarded ${discarded}`);
+    }
+  });
+}
+
+test('gpu relay: its links open with FEATURE dmabuf_kind (virtgpu), as wlandr --dmabuf virtgpu\'s do; an engine without a gpu source logs that linux-dmabuf is off, one with a source does not', async () => {
+  for (const withGpu of [false, true]) {
+    const { relay: relayLink, engine: engineLink } = memoryLinks();
+    const violations: string[] = [];
+    createRelay({ link: relayLink, shm: createShm(), violation: (v: string) => violations.push(v), gpu: true });
+    const logs: string[] = [];
+    let opened!: () => void;
+    const open = new Promise<void>((r) => { opened = r; });
+    const engine = await createEngine({
+      wasm, link: engineLink, gpu: withGpu ? { resolve: () => null } : undefined,
+      onEvent(ev) { if (ev.type === 'log') logs.push(ev.line); else if (ev.type === 'open') opened(); },
+    });
+    engine.start();
+    await open;
+    await sleep(10);
+    assert.equal(logs.some((l) => /linux-dmabuf not offered/.test(l)), !withGpu, logs.join('\n'));
+    assert.ok(!logs.some((l) => /FEATURE \d+: unknown/.test(l)));
+    assert.deepEqual(violations, []);
+    engine.dispose();
+  }
+});

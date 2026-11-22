@@ -45,9 +45,13 @@ export function createShm() {
 
 /** The HandleSource over createShm()'s exports. `async: true` answers every
  *  open() and read() with a promise that settles on a later task — the shape
- *  unkernel has when its kernel runs in a worker (copies, asynchronously). */
-export function createHandleSource(shm, { async = false, violation }) {
-  const stats = { open: 0, reads: 0, bytes: 0 };
+ *  unkernel has when its kernel runs in a worker (copies, asynchronously).
+ *  `shape`: 'read' (one call per span), 'readv' (all spans of a commit in
+ *  one call: one promise when async) or 'view' (the export's memory itself,
+ *  synchronously — `async` then applies to open() only). */
+export function createHandleSource(shm, { async = false, violation, shape = 'read' }) {
+  // sharedViews: views handed out that are SharedArrayBuffer memory
+  const stats = { open: 0, reads: 0, bytes: 0, sharedViews: 0 };
   const later = (fn) => new Promise((resolve, reject) => {
     setTimeout(() => { try { resolve(fn()); } catch (e) { reject(e); } }, 0);
   });
@@ -70,10 +74,23 @@ export function createHandleSource(shm, { async = false, violation }) {
     stats.bytes += dst.length;
   }
 
+  function readv(token, reads) {
+    for (const r of reads) read(token, r.offset, r.dst);
+  }
+  function view(token, offset, length) {
+    if (token.closed) violation(`engine viewed handle-export ${token.id} after closing it`);
+    if (token.e.released) throw new Error(`export ${token.id} released`);
+    stats.reads++;
+    if (!(token.e.mem.buffer instanceof ArrayBuffer)) stats.sharedViews++;
+    return token.e.mem.subarray(offset, offset + length);
+  }
+
   return {
     stats,
     open: async ? (h) => later(() => open(h)) : open,
     read: async ? (t, o, d) => later(() => read(t, o, d)) : read,
+    ...(shape === 'readv' && { readv: async ? (t, r) => later(() => readv(t, r)) : readv }),
+    ...(shape === 'view' && { view }),
     close(token) {
       if (token.closed) violation(`engine closed handle-export ${token.id} twice`);
       token.closed = true;

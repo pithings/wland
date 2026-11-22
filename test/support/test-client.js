@@ -41,7 +41,9 @@ const FONT = {
   '/': 0o11244, '_': 0o00007, '>': 0o42124, '#': 0o57575,
 };
 
-export function createClient({ title, width = 420, height = 300, format = XRGB8888, hue = 210 }) {
+// `shared`: the pools' "memfds" are SharedArrayBuffers (memory another
+// thread could write: what a kernel in a worker would hand out)
+export function createClient({ title, width = 420, height = 300, format = XRGB8888, hue = 210, shared = false }) {
   let sock = null;
   let nextId = 2;
   const objects = new Map([[1, 'wl_display']]);
@@ -161,7 +163,7 @@ export function createClient({ title, width = 420, height = 300, format = XRGB88
     W = w;
     H = h;
     const size = W * H * 4;
-    pool = { id: newId('wl_shm_pool'), file: new ArrayBuffer(size * NBUF) };
+    pool = { id: newId('wl_shm_pool'), file: shared ? new SharedArrayBuffer(size * NBUF) : new ArrayBuffer(size * NBUF) };
     send(m(id.shm, 0, [pool.id, pool.file.byteLength])); // create_pool: the fd travels out of band
     outFds.push(pool.file);
     bufs = [];

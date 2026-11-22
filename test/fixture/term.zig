@@ -12,6 +12,9 @@
 //!   echo WORDS     seq [FIRST] LAST     clear     exit
 //! Commands chain with `;`. The pointer gets cursor shapes (text over the
 //! grid); a press on the titlebar moves the window, on a border resizes it.
+//! The clipboard as foot's keys have it: Ctrl+Shift+V pastes the selection's
+//! text into the line, Ctrl+Shift+C copies — foot copies the mouse
+//! selection; this copies the last output line (no mouse selection here).
 //! Buffer scale follows wl_surface.preferred_buffer_scale.
 //! Extra arguments (foot's `bash --norc …`) are ignored.
 
@@ -30,6 +33,8 @@ const BG = 0xff1c1c24;
 const FG = 0xffd8d8c8;
 const PROMPT = 0xff60c080;
 const BTN_LEFT = 0x110;
+const linux = std.os.linux;
+const text_mimes = [_][]const u8{ "text/plain;charset=utf-8", "text/plain", "UTF8_STRING" };
 
 const Deco = enum(u3) { titlebar, top, left, right, bottom };
 
@@ -56,6 +61,15 @@ const Ctx = struct {
     py: f64 = 0,
     ready: bool = false,
     done: bool = false,
+    // clipboard: the data device, the offers announced (id → their types),
+    // the selection's offer, and what this client copied (its source)
+    data_device: u32 = 0,
+    ddm: u32 = 0,
+    offers: std.AutoHashMapUnmanaged(u32, std.ArrayList([]const u8)) = .empty,
+    selection: u32 = 0,
+    source: u32 = 0,
+    copied: []const u8 = "",
+    key_serial: u32 = 0,
 
     pub fn onEvent(ctx: *Ctx, ev: wl.Event) void {
         if (ctx.app.handle(ev)) return;
@@ -64,8 +78,31 @@ const Ctx = struct {
             for (&ctx.decos) |*d| if (d.pool.released(ev.id)) return;
             return;
         }
+        if (ev.is("wl_data_device", "data_offer")) {
+            ctx.offers.put(ctx.gpa, ev.uint(0), .empty) catch {};
+            return;
+        } else if (ev.is("wl_data_offer", "offer")) {
+            if (ctx.offers.getPtr(ev.id)) |l| l.append(ctx.gpa, ctx.gpa.dupe(u8, ev.str(0)) catch return) catch {};
+            return;
+        } else if (ev.is("wl_data_device", "selection")) {
+            if (ctx.selection != 0 and ctx.selection != ev.uint(0)) {
+                ctx.app.c.send(ctx.selection, "wl_data_offer", "destroy", &.{});
+                _ = ctx.offers.remove(ctx.selection);
+            }
+            ctx.selection = ev.uint(0);
+            return;
+        } else if (ev.is("wl_data_source", "send")) {
+            wl.writeFd(ev.fd, ctx.copied);
+            _ = linux.close(ev.fd);
+            return;
+        } else if (ev.is("wl_data_source", "cancelled")) {
+            ctx.app.c.send(ev.id, "wl_data_source", "destroy", &.{});
+            if (ev.id == ctx.source) ctx.source = 0;
+            return;
+        }
         if (!ctx.ready) return;
         if (ev.is("wl_keyboard", "key")) {
+            ctx.key_serial = ev.uint(0);
             if (ev.uint(3) == 1) ctx.key(ev.uint(2));
         } else if (ev.is("wl_keyboard", "enter") or ev.is("wl_keyboard", "leave")) {
             // focus: nothing to redraw (no cursor blink)
@@ -94,6 +131,11 @@ const Ctx = struct {
     // --- input -----------------------------------------------------------------
 
     fn key(ctx: *Ctx, code: u32) void {
+        if (ctx.app.ctrl and ctx.app.shift) {
+            if (code == 47) ctx.paste(); // Ctrl+Shift+V
+            if (code == 46) ctx.copy(); // Ctrl+Shift+C
+            return;
+        }
         if (ctx.app.ctrl) {
             if (code == 32) ctx.done = true; // ^D
             if (code == 46) { // ^C
@@ -103,7 +145,7 @@ const Ctx = struct {
             }
             return;
         }
-        const ch = app_mod.keyChar(code, ctx.app.shift);
+        const ch = app_mod.keyChar(code, ctx.app.shift, ctx.app.numlock);
         switch (ch) {
             0, '\t' => return,
             '\n' => {
@@ -121,6 +163,52 @@ const Ctx = struct {
             else => ctx.input.append(ctx.gpa, ch) catch {},
         }
         ctx.changed();
+    }
+
+    /// The selection's text (its best text type) into the line: receive
+    /// into a pipe, read it to EOF (2 s at most).
+    fn paste(ctx: *Ctx) void {
+        const offered = (ctx.offers.get(ctx.selection) orelse return).items;
+        var mime: ?[]const u8 = null;
+        outer: for (text_mimes) |want| for (offered) |m| if (std.mem.eql(u8, m, want)) {
+            mime = want;
+            break :outer;
+        };
+        if (mime == null) return;
+        var fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
+        defer _ = linux.close(fds[0]);
+        const c = ctx.app.c;
+        c.sendFds(ctx.selection, "wl_data_offer", "receive", &.{ .{ .string = mime.? }, .fd }, &.{fds[1]});
+        c.flush();
+        _ = linux.close(fds[1]);
+        const deadline = wl.nowMs() + 2000;
+        var buf: [4096]u8 = undefined;
+        while (wl.nowMs() < deadline) {
+            var pfd = [1]linux.pollfd{.{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 }};
+            if (linux.poll(&pfd, 1, 100) == 0) continue;
+            const n = linux.read(fds[0], &buf, buf.len);
+            if (linux.errno(n) == .INTR) continue;
+            if (linux.errno(n) != .SUCCESS or n == 0) break;
+            for (buf[0..n]) |ch| if (ch >= 0x20 and ch != 0x7f) ctx.input.append(ctx.gpa, ch) catch {};
+        }
+        ctx.changed();
+    }
+
+    /// Own the clipboard with the last output line (foot: the mouse selection).
+    fn copy(ctx: *Ctx) void {
+        var i = ctx.lines.items.len;
+        const line = while (i > 0) {
+            i -= 1;
+            if (!std.mem.startsWith(u8, ctx.lines.items[i], "$ ")) break ctx.lines.items[i];
+        } else return;
+        const c = ctx.app.c;
+        if (ctx.ddm == 0) return;
+        ctx.copied = ctx.gpa.dupe(u8, line) catch return;
+        ctx.source = c.new("wl_data_source");
+        c.send(ctx.ddm, "wl_data_device_manager", "create_data_source", &.{.{ .new_id = ctx.source }});
+        for (text_mimes) |m| c.send(ctx.source, "wl_data_source", "offer", &.{.{ .string = m }});
+        c.send(ctx.data_device, "wl_data_device", "set_selection", &.{ .{ .object = ctx.source }, .{ .uint = ctx.key_serial } });
     }
 
     fn output(ctx: *Ctx, text: []const u8) void {
@@ -436,6 +524,11 @@ pub fn run(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, args: []
     var ctx: Ctx = .{ .gpa = gpa };
     ctx.app = app_mod.App.init(gpa, env, &ctx);
     const c = ctx.app.c;
+    if (ctx.app.seat != 0 and c.global("wl_data_device_manager") != null) {
+        ctx.ddm = c.mustBind("wl_data_device_manager", 3);
+        ctx.data_device = c.new("wl_data_device");
+        c.send(ctx.ddm, "wl_data_device_manager", "get_data_device", &.{ .{ .new_id = ctx.data_device }, .{ .object = ctx.app.seat } });
+    }
     c.roundtrip(&ctx);
     try ctx.title.appendSlice(gpa, "term");
     ctx.win = app_mod.Window.create(&ctx.app, "term", "wland-fixture.term", ctx.w, ctx.h + T);
