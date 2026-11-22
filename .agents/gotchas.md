@@ -250,6 +250,30 @@ with it. New findings go in the matching section.
   are memfds (any regular file); nothing real can allocate on it. Unit
   tests can set `Fake.accept_pipes` to import an empty pipe: a dmabuf whose
   write fence never signals (how the fence-wait test sees the 100 ms).
+- **`--link-on-demand`: apps start the dial; a failed dial refuses them.**
+  State is `Relay.on_demand` under `relay.mutex`: an app finding no link
+  counts itself in `waiting` and signals `demand` (the dial loop in main.zig
+  `serveStreamLink` sleeps in `awaitDemand`); `dialFailed` zeroes `waiting`,
+  bumps `failures` and broadcasts `link_attached`, and a waiter that sees
+  `failures` move is refused (closed, `refused_line` logged — its text is
+  documented for unkernel: change it only with the docs). Waiters have no
+  timeout of their own (Io.Condition has no timed wait): the DIAL is
+  bounded (`dialWithin`: non-blocking connect + poll/EAGAIN retry up to
+  `--link-timeout`, then the fd made blocking for StreamLink), so every
+  wave ends in an attach or a failure. Apps arriving mid-dial wait on that
+  dial; a waiter counted out by a failure but taken on by a later link
+  doesn't decrement. After serveLink returns the loop dials at once only
+  if `waiting > 0` (every app of the closed link was dropped with it). An
+  app that hangs up while waiting still counts (its conn opens and closes
+  on the link) — the waiter doesn't poll its socket.
+- **`relay.dmabuf` can be set late, on demand only.** A `--dmabuf` node
+  that won't resolve at startup is retried before each dial (warn, not
+  err); the dial loop sets `relay.dmabuf` under the mutex while no link is
+  attached. So serveApp reads it (the `commits` → eventfd decision) only
+  after its link is attached — reading it before the wait raced the set
+  and left a conn without `ack_fd` (virtgpu ACKs dropped, no release).
+  FEATURE still goes first on each link from what is set then: a link
+  dialed before the node appears never offers linux-dmabuf.
 - **`wlandr --version`** prints `build_options.version` (package.json's,
   read by `build.zig`; `-Dversion=` overrides) and a `features:` line built
   at comptime in `main.zig` — buffers/dmabuf tokens straight from their
@@ -408,6 +432,24 @@ with it. New findings go in the matching section.
   SIGSEGVs if its cursor surface gets focus). **And focus-gated**: motion/button/axis dropped
   unless a surface holds pointer focus — `wheel` can fire with no preceding
   pointerenter, and foot SIGSEGVs on axis-after-leave.
+- **Seat events go to every object of the client, never to "its" one**
+  (`Conn.pointers/keyboards/data_devices/primary_devices/
+  relative_pointers`, a `SeatObjects` each). Firefox binds wl_seat twice —
+  GTK's at v5, then its own at v8 — and GTK's wl_pointer/wl_keyboard are
+  the ones its input handling listens on: one id per conn, overwritten by
+  the latest get_pointer, left Firefox deaf to all input. Each event goes
+  to every object with ONE serial (set_cursor/set_shape from any pointer
+  name the same enter serial); version gates are per object (the
+  binding's version: a v5 pointer gets axis_discrete, a v8 one
+  axis_value120 in the same scroll). Each data/primary device gets an
+  offer of its own (new server ids, dense; a SRVOBJ per primary offer),
+  drag enters too (one serial, wlroots-style; accept on any of them).
+  Focus is the conn's whether or not it has objects: an object made while
+  focused gets the enter it missed (the focus's serial, weston-style), a
+  data device the selection. Over `max_seat_objects` (8) per kind an
+  object is ignored — it exists, gets nothing. Releases leave the set. Not
+  fanned out: zwp_text_input_v3 (one per conn, a second replaces it);
+  touch has no capability, so nothing to track.
 - **Roles arrive late and go away**: GTK commits its cursor buffer BEFORE
   `set_cursor`, and reuses popover wl_surfaces (dismiss destroys only the
   xdg_popup/xdg_surface). Role changes flow to JS (`js_surface_event`) so the

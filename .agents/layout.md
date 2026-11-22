@@ -16,6 +16,8 @@ Where things live and which file owns what. Details are in the code.
 
 - `main.zig` CLI (`--port/--host/--web-root` = HTTP+WS; `--link fd:|unix:|vsock:`;
   `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `--no-fence-wait`;
+  `--link-on-demand [--link-timeout MS]` (the dial loop `serveStreamLink`, bounded `dialWithin`;
+  its state is relay.zig `OnDemand`);
   `--version` (version from package.json via `build.zig`, + a features line);
   `-Dhttp=false` = a --link-only build).
 - `relay.zig` — app sockets, fd interception, pools, attach/commit tracking,
@@ -111,6 +113,7 @@ import lib/ source, never dist/.
   (socket + fds, strict decoding, WAYLAND_DEBUG log), `app.zig` seat and
   toplevels, `simple.zig` shm + presentation, `clip.zig`, `pointer.zig`
   cursor/constraints/relative, `term.zig` (foot), `files.zig` (nautilus),
+  `browser.zig` (Firefox's seat shape: wl_seat bound twice),
   `dmabuf.zig` (a linux-dmabuf GPU client over memfds).
   `test/support/apps.ts` maps E2E roles to a fixture or the real app.
   `test/support/` — plain-JS Wayland helpers for tests (STREAM encoder, JS

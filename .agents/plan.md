@@ -61,6 +61,21 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
     that is never committed to a surface, so the relay must ship its pixels
     on a new path (read at add_buffer/set_icon, under the pool SIGBUS guard;
     a new frame or COMMIT naming the icon) — relay + core + lib work.
+- **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
+  Firefox render but ignore all input): the core kept one wl_pointer /
+  wl_keyboard / data device id per client, the last made, and Firefox
+  binds wl_seat twice (GTK's v5 first, its own v8) while GTK listens on
+  the first pair. Now every object gets every event, one serial,
+  version-gated per object; data and primary devices get offers of their
+  own, dnd enters too; late objects get the enter (gotchas.md, Compositor).
+  Checked: core unit tests (fan-out + gating at v9/v7/v3, release, late
+  objects, the cap, two data/primary devices, a dnd target with two),
+  headless-e2e's `browser` fixture (Firefox's shape, asserting on GTK's
+  pair), and real Firefox 160 by hand through wlandr + headless: HEAD's
+  wasm sent GTK's wl_pointer#8/wl_keyboard#19 nothing and the URL bar
+  ignored keys; with the fix both pairs get the input and Ctrl+L,
+  `about:robots`, Enter navigates. Not fanned out: text-input-v3 (one per
+  client, Current limits).
 - **Window states**, done: fullscreen and minimize next to maximize, core
   state (`Surface.maximized/fullscreen/minimized`, `applyMaximized/
   applyFullscreen/applyMinimized`), wm_capabilities = maximize, fullscreen,
@@ -409,6 +424,15 @@ Any of them is fair game to lift.
 - One engine link at a time: newest tab takes over (old tab gets WS close 4000);
   takeover/reload drops apps; apps never survive a link drop (a stream link is
   redialled and the engine starts empty).
+- `--link-on-demand` (unkernel: relay from boot, page loads wland at the
+  first link): a refused app sees a hang-up at its first round trip, not a
+  failed connect (the socket listens; the kernel completes the connect
+  before the relay accepts). A link that connected is kept until the other
+  end closes it (no relay-side idle drop: the page decides when to unload).
+  A dial counts as the engine attaching — STREAM has no engine hello — so a
+  page that accepts and only then fails to load the compositor shows up as
+  a link drop, its apps dropped. A `--dmabuf` node missing at a dial means
+  that link never offers linux-dmabuf (FEATURE is first on a link).
 - GPU clients only with a `--dmabuf` backend: readback (copy mode; LINEAR
   ARGB/XRGB8888; no y_invert; v1/v2 binders get no formats) or virtgpu (a
   virtio-gpu node only; [AX]RGB/[AX]BGR8888, implicit or LINEAR, one
@@ -464,6 +488,11 @@ Any of them is fair game to lift.
   clock everywhere.
 - Keymap is canned US; composed input (dead keys, CJK, emoji) works via
   text-input-v3 + a hidden IME sink.
+- One zwp_text_input_v3 per client: a second get_text_input replaces the
+  first, which gets no leave and no more events (GTK3/4 make one, on their
+  seat; Firefox's goes through GTK's). No touch: the seat never advertises
+  the capability. Wayland seat objects beyond 8 of a kind per client
+  (`max_seat_objects`) get no events.
 - Pointer images: shapes (cursor-shape-v1) and cursor surfaces
   (`wl_pointer.set_cursor`) are CSS on the client's windows; a cursor image
   over 128 CSS px (or a hotspot off it, a non-uniform viewport scale, no

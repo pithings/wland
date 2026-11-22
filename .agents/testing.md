@@ -60,6 +60,16 @@ satellite. GTK3 demos (`gtk3-demo`, `gtk3-widget-factory`) abort here at
 their first icon: glycin's bwrap'd SVG loader fails in this container. GTK4
 and foot use cursor-shape.
 
+Firefox (`/usr/sbin/firefox`, 160) as a Wayland client aborts at GTK's
+first icon like the GTK3 demos (glycin's bwrap'd loader). A pass-through
+`bwrap` first on PATH (a script that drops bwrap's options and execs the
+command) runs the loaders unsandboxed and Firefox maps; with a fresh
+`--profile` dir, `--no-remote`, a throwaway HOME and `WAYLAND_DEBUG=1` its
+log shows the seat shape the `browser` fixture mirrors (GTK's wl_seat v5
+with the data devices, pointer and keyboard; its own v8 on a second
+registry). By hand only: no test depends on it (the headless E2E's
+`browser` phase is fixtures-only).
+
 Pointer-constraint clients: `weston-constraints` (weston-demo; a press on
 its gray subsurface cycles unconstrained → confined → locked, both
 oneshot; read its WAYLAND_DEBUG for `confined()`/`locked()`/
@@ -109,10 +119,10 @@ apps do through the compositor is checked without a browser, by
 
 | Changed | Run |
 | --- | --- |
-| `core/`, protocol logic | `zig build test` (also `-Doptimize=Debug`) + `node tools/headless-e2e-test.ts` (and with `WLAND_E2E_APPS=real`) |
+| `core/`, protocol logic | `zig build test` (also `-Doptimize=Debug`) + `node tools/headless-e2e-test.ts` (and with `WLAND_E2E_APPS=real`); seat fan-out (several wl_seat bindings): its `browser` phase, real Firefox by hand (Setup) |
 | `server/` relay: WS path, wire handling, copy buffers | `zig build test` + `node tools/headless-e2e-test.ts` |
 | `server/src/xwayland.zig`, the X11 launch path | `zig build test` + `node --test test/relay.test.ts` (a stand-in satellite) + `WLAND_E2E_APPS=real node tools/headless-e2e-test.ts` with `xwayland-satellite`, `Xwayland`, `xeyes` on PATH (the x11 phase skips otherwise) |
-| `server/` relay: `--link`, STREAM framing, handle backends | `zig build test` + `node tools/relay-e2e-test.ts` |
+| `server/` relay: `--link`, STREAM framing, handle backends | `zig build test` + `node tools/relay-e2e-test.ts` (+ `node --test test/link-on-demand.test.ts` for the dial loop / `--link-on-demand`) |
 | linux-dmabuf (`dmabuf.zig`, `virtgpu.zig`, the dmabuf paths in relay/core) | `zig build test` (also Debug; memfds stand in for dmabufs, `virtgpu.Fake` for a virtio-gpu node) + both Node E2Es (their GPU phases: the `dmabuf` fixture over the test-only `--dmabuf virtgpu:@fake`, fixtures only — skipped with `WLAND_E2E_APPS=real`); a real GPU client is a human check (see Setup), a real virtio-gpu node unkernel's |
 | GPU commits in the engine/view/headless (`EngineOptions.gpu`, format 'gpu') | `node --test test/handles.test.ts test/client.test.ts test/headless.test.ts` + run-poc `handle-demo` (its `gpu=1` modes, 2D and GL) |
 | `lib/engine.ts`, links, handles | `npm run typecheck` + `node --test test/*.test.ts` + both Node E2Es |
@@ -129,7 +139,7 @@ apps do through the compositor is checked without a browser, by
 | `lib/client.ts`, the server's page serving and takeover | run-poc `foot takeover` |
 | Anything browser-facing that may differ in Gecko (input, present, view, client) | also `node tools/firefox-smoke.ts` (headless Firefox, its own port 8951 / BiDi 9351 / socket `wayland-ffsmoke`) |
 | `test/support/`, `test/browser/` | `node --test test/*.test.ts` + run-poc `handle-demo` (its `sab=1` modes load through `test/support/isolated.ts`, a COOP/COEP mirror of wlandr: wlandr's own pages can't make a SharedArrayBuffer) + `node tools/firefox-smoke.ts` |
-| `test/fixture/` (wland-fixture), `test/support/apps.ts` | `zig build` + both Node E2Es + the run-poc groups using the mode changed (`term`: foot, states; `files`: gtk; `cursor`; `constraints`) |
+| `test/fixture/` (wland-fixture), `test/support/apps.ts` | `zig build` + both Node E2Es + the run-poc groups using the mode changed (`term`: foot, states; `files`: gtk; `cursor`; `constraints`; `browser` is headless-e2e only) |
 | `web/` | nothing here: build it and look (`tools/run-poc.sh --demo`) |
 | Before a release, or a change that cuts across the above | all of the above: `npm test`, both Node E2Es, the whole `tools/run-poc.sh`; then the same with `WLAND_E2E_APPS=real` |
 
