@@ -192,7 +192,7 @@ await createWland({
   scale: 2,                   // pin the scale, 1.5 works too (default: follows devicePixelRatio)
   webgl: 'never',             // 'auto' | 'always' | 'never'
   browserFullscreen: true,    // fullscreen windows also go browser-fullscreen
-  shortcuts: false,           // turn off Alt+F9/F10/F11
+  shortcuts: false,           // turn off Alt+F9/F10/F11 ({ keys, drag }: the keys and Alt+drag apart)
   clipboard: false,           // keep the Wayland clipboard inside the desktop
 });
 ```
@@ -420,8 +420,35 @@ wl.engine.setBounds(width, height, width - 2 * border, height - titleBar - 2 * b
 within (`configure_bounds`) and the size a maximized window gets; 0×0 goes
 back to the output's size.
 
-The default wm expects the default mount. With your own frames, handle the
-`move`, `resize`, `maximize`, `fullscreen` and `minimize` events yourself.
+The default wm expects the default mount. With your own frames, your window
+manager can take what it owns and leave the rest (popups, drag and drop, the
+key bindings) to wland's:
+
+```js
+const wl = await createWland({
+  container,
+  mount, unmount,
+  // an app's move/resize request (its title bar, its border) or Alt+drag,
+  // with the press it came from: return true and drag your own window
+  interactive(ev, press) {   // ev.type: 'move' | 'resize' (ev.edges) | 'alt-drag'
+    const grab = wl.input.grab(press.pointerId);   // the apps lose the pointer…
+    myFrames.drag(ev, press, () => grab.active);    // …until that press ends, whatever happens
+    return true;
+  },
+  autoFocus: false,   // focus is yours too: wland focuses nothing by itself
+});
+// on a press in your frame (inside the pointerdown, so a phone's keyboard can open):
+wl.input.focus(conn, surface);
+wl.input.blur();      // the keyboard goes to none of them
+```
+
+A grab ends at its pointer's release, cancel or lost capture, when the
+browser window loses focus, or with `grab.end()`, and the app under the
+pointer gets it back; a press already released gets none. With `autoFocus:
+false` a press goes to the app without focusing it, a new window takes no
+focus, and when the focused one closes or is minimized none has it until
+you say. The `maximize`, `fullscreen` and `minimize` events are there for
+your frames to follow.
 
 The container is wland's: the view sets `touch-action: none` on it (touch
 drags are window moves and app input, not page pans — without it the

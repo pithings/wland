@@ -75,6 +75,17 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   live hints), node tests (engine, session, headless, client),
   headless-e2e's foot phase (app id; close() and foot exits by itself)
   on a passthrough and a `--profile session` relay and with real foot.
+  Milestone 2, done (2026-11-22, lib only): `input.grab(pointerId,
+  { onEnd })` → a PointerGrab ended by its pointer's release / cancel /
+  lost capture, the window's blur or `end()` (one code path: the wm's
+  move/resize, Alt+drag and dnd hold one; `suppress()` is a grab now);
+  `WindowManagerOptions.interactive(ev, press)` (app move/resize and an
+  'alt-drag', with the PointerPress) and `shortcuts: { keys, drag }`;
+  `autoFocus: false` (input; the wm and the view's `focusOnMap` follow)
+  with `input.blur()`; all through createWland. Checked: node tests
+  (client.test.ts) and run-poc's new `embedder` group (+ foot gtk cursor
+  constraints states). Not in headless (no DOM pointer; its scripted
+  grabs and `focusOnMap` stay as they were).
   Milestone 3, done (2026-11-22): server-side decorations as the
   embedder's choice — `decorations: 'client' | 'server'` on createEngine /
   createWland / createHeadless (wasm `wland_init`'s third arg, session
@@ -102,10 +113,9 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   mode (like zwp_linux_dmabuf_v1, conditional) would fix SDL under the
   default; on a session link a mode switch would then need wl_registry
   global / global_remove to existing registries (registries are not
-  tracked today). Open, in WINDOW.md's order: move/resize owned by the
-  embedder (a grab handle), visibility owned by the embedder, window
-  positions for popup constraints, tiled states and acked-configure
-  serials, a focus policy.
+  tracked today). Open, in WINDOW.md's order: visibility owned by the
+  embedder, window positions for popup constraints, tiled states and
+  acked-configure serials.
 - **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
   Firefox render but ignore all input): the core kept one wl_pointer /
   wl_keyboard / data device id per client, the last made, and Firefox

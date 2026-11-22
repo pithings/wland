@@ -896,7 +896,17 @@ with it. New findings go in the matching section.
   a destroyed surface or conn never does. The core keeps no focus policy.
   Minimized windows are skipped (`ViewWindow.minimized`, the scene's
   `shown`), and `input.focus` refuses one: the core would drop its enter
-  and input.ts would think it focused.
+  and input.ts would think it focused. **`autoFocus: false`** (input) is an
+  embedder's window manager owning focus: no hand-on, no focus on press, and
+  every other place that focused by itself must follow it — the view's map
+  focus (`focusOnMap`: the canvas.focus() at a toplevel's first commit
+  would otherwise steal the page's focus from the embedder's own element,
+  a terminal), the wm's restore / fullscreen / 'synced' focus (it reads
+  `input.autoFocus`), and input's focusin on a canvas (Tab, a click's
+  default): it moves no keyboard focus, and while a window has it the sink
+  takes the page's focus back (keys would land on the canvas and be lost).
+  createWland sets the view's from the same option; a page composing the
+  parts sets both.
 - **A fullscreen window is the view's layout, its position the wm's.** The
   view makes the element `100%` × `100%`, black, `overflow: hidden`, and
   centres the geometry with `calc(50% - …px)` on the origin element (no
@@ -948,17 +958,19 @@ with it. New findings go in the matching section.
   presses to the windows below. Event paths still run through the box, so
   capture listeners on it (the default mount's raise) still fire, and a
   pointer capture on it (Alt+drag) still works.
-- Microtasks run between listeners: to swallow a grab/drag's pointerup, the WM
-  calls `stopPropagation`, not a deferred flag.
+- Microtasks run between listeners: a grab's pointerup is kept from the
+  app by marking the event itself (input's `swallow`, a WeakSet of events,
+  set in input's capture-phase listener before anyone else sees it), not
+  a deferred flag.
 - **The implicit grab is pointer capture** (`input.ts` `captured`): the
   pointerdown's target (canvas or hit element) captures the pointer, so
   motion and the release go to the pressed surface even outside it (its
   local px, negative too) and no pointerout fires until the last button is
   up — then the browser sends the boundary events (lostpointercapture,
-  pointerout, pointerover) that are the leave/enter. `suppress(true)`
+  pointerout, pointerover) that are the leave/enter. A grab (`input.grab`)
   releases it: a wm grab/dnd must see the browser's own hover tracking, or
   the boundary events after the grab's pointerup would leave/enter again
-  behind the wm's re-enter. A popup of the pressed client mapping releases
+  behind the grab's re-enter. A popup of the pressed client mapping releases
   it too (a popup grab: GTK's press-drag-release menus). A captured element
   removed from the DOM gets no lostpointercapture (the document does): the
   next press checks `isConnected`.
@@ -975,18 +987,27 @@ with it. New findings go in the matching section.
   so a change refocuses the sink. A client without text-input gets hardware
   keys only — on touch devices no keyboard at all.
 - **A wm grab or drag needs a button down, and ends with it**: `held`
-  (pointerIds from pointerdown to pointerup/pointercancel) gates the
-  'move'/'resize' events (ignored) and 'drag-start' (dragCancel: an
-  unanswered drag wedges the seat); a grab ends at the pointerup, a
+  (pointerIds from pointerdown to pointerup/pointercancel, each with its
+  press: what `interactive` is handed) gates the 'move'/'resize' events
+  (ignored, before the hook) and 'drag-start' (dragCancel: an unanswered
+  drag wedges the seat). Ending is input's: every drag (the wm's
+  move/resize, Alt+drag, dnd, an embedder's) holds an `input.grab`, which
+  needs its pointer down in input's own `down` (else it is over at once:
+  a grab can't outlive its press — `suppress(true)` from an embedder that
+  never saw the pointerup stayed on for good) and ends at the pointerup, a
   pointercancel, a pointermove with `buttons === 0` (a release the page
-  never saw: drag → dragCancel) or the window's blur — of ITS pointer
-  only (`grab.pointer` / `dnd.pointer`: the last one pressed): a hovering
-  pen or a mouse moving beside a touch drag used to end it. Not on
-  lostpointercapture: suppress(true) releases input's capture of that very
-  pointer as the grab starts. Alt+drag (pointer
-  capture on the box) ends on pointerup, pointercancel,
-  lostpointercapture or a buttonless move — it used to go on moving the
-  window on hover after a lost capture.
+  never saw: dnd → dragCancel, only a pointerup drops), a
+  lostpointercapture or the window's blur — of ITS pointer only: a
+  hovering pen or a mouse moving beside a touch drag used to end it. Its
+  listeners are capture-phase on the document and registered before the
+  wm's (input is created first), so the wm's own listeners see the grab
+  over; onEnd runs before the re-enter (the dnd's drop must come first:
+  the core drops enters while the drag lasts). Lost captures: the one
+  input itself let go at the grab's start (or a popup's, `letGo`) and the
+  implicit grab's element at the start (`ignore`: a capture the embedder
+  took for its drag moved it away, its event arrives late) end nothing;
+  any other does (Alt+drag's capture on the box, the embedder's on its
+  frame) — Alt+drag used to go on moving the window on hover after one.
 - A move/resize grab starts at the WM's `lastPointer`, which `pointerdown`
   must update too: touch has no hover moves, so `pointermove` alone leaves it
   where the previous touch ended (the window jumps, then drags relatively).

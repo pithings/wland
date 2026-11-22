@@ -139,6 +139,7 @@ apps do through the compositor is checked without a browser, by
 | Pointer constraints / relative pointer (core, engine, `input.ts` Pointer Lock, headless) | `zig build test` + `node --test test/engine.test.ts test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (weston-constraints, SDL3) + run-poc `constraints` |
 | Clipboard bridge (core own selection / `readSelection`, relay pipe_read and pipe writes, engine selection API, `lib/clipboard.ts`, input's paste-chord queue) | `zig build test` (also Debug) + `node --test test/clipboard.test.ts` + both Node E2Es (their clipboard phases) + run-poc `foot` (its `clipboard` phase; CDP grants the clipboard permissions) + `node tools/firefox-smoke.ts` (step 3: Gecko's late paste event targets the body; step 4: a page selection Gecko keeps across the click into the desktop is not copied by Ctrl+C or a copy command there) |
 | `lib/wm.ts` (grabs, maximize, popups, dnd) | run-poc `foot gtk` (gtk's `dnd` phase drags in the `files` fixture); real nautilus: `tools/dnd-test.sh` |
+| Input grabs, `interactive`, `shortcuts`, `autoFocus` (input, wm, client; the embedder's window manager) | `node --test test/client.test.ts` + run-poc `foot embedder` (its page modes: `?embedder=1`, `?altdrag=0`, `?autofocus=0`) |
 | Window states (fullscreen, minimize, maximize: core, view, wm, input, headless) | `zig build test` (also Debug) + `node --test test/client.test.ts test/headless.test.ts` + both Node E2Es (headless: foot, weston-fullscreen, nautilus's minimize button — fixtures `term`, `fullscreen`, `files`; relay: a minimized simple-shm stops on the stream link) + run-poc `states` |
 | Decorations / bounds (core xdg-decoration, `setBounds`, 'decoration' events, `decorated` in view/headless/client) | `zig build test` (also Debug) + `node --test test/engine.test.ts test/session.test.ts test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (its `decorations` phase, fixture `game`; also `--profile session` via `WLAND_E2E_RELAY`, where a viewer's mode re-answers the running game) and with `WLAND_E2E_APPS=real` (neverball, foot) |
 | `lib/client.ts`, the server's page serving and takeover | run-poc `foot takeover` |
@@ -148,7 +149,7 @@ apps do through the compositor is checked without a browser, by
 | `web/` | nothing here: build it and look (`tools/run-poc.sh --demo`) |
 | Before a release, or a change that cuts across the above | all of the above: `npm test`, both Node E2Es, the whole `tools/run-poc.sh`; then the same with `WLAND_E2E_APPS=real` |
 
-run-poc groups, in run order: `foot gtk cursor constraints states retina takeover handle-demo relay`
+run-poc groups, in run order: `foot gtk cursor constraints states embedder retina takeover handle-demo relay`
 (`relay` is relay-e2e; alone it starts no browser).
 
 ## Approach
