@@ -401,6 +401,25 @@ const view = createView({
 carries the app's `appId` and size hints (`minW`, `minH`, `maxW`, `maxH`;
 0 = no limit), so your frames need not offer a size the app refuses.
 
+Server-side decorations: with `decorations: 'server'` (on `createWland`,
+`createEngine` or `createHeadless`) apps that let the compositor draw
+their frame (SDL games, foot, Qt) are told so, and their window is marked
+`decorated`: they draw none, your frame goes around it. Apps that draw
+their own anyway (GTK) stay `decorated: false`. It can change while the
+window is up (`onWindowsChange`); an app that asks before its first commit
+is marked by the time `mount` runs. Wland draws no frame itself, so use
+`'server'` only with a `mount` that does. Then tell apps the room they
+have, your workspace less your frame:
+
+```js
+const wl = await createWland({ container, decorations: 'server', mount, unmount });
+wl.engine.setBounds(width, height, width - 2 * border, height - titleBar - 2 * border);
+```
+
+`setBounds(w, h, decoratedW, decoratedH)` is what apps are told to stay
+within (`configure_bounds`) and the size a maximized window gets; 0×0 goes
+back to the output's size.
+
 The default wm expects the default mount. With your own frames, handle the
 `move`, `resize`, `maximize`, `fullscreen` and `minimize` events yourself.
 
@@ -696,8 +715,9 @@ authentication.
   not run on a Mac or an iPad in any browser: it follows the browsers'
   documented key events.
 - Pointer lock needs a click to start. Esc or switching tabs ends it.
-- No server-side decorations. Apps without their own titlebar can be moved
-  with Alt+drag, but not resized.
+- Wland draws no window frames. Apps without their own titlebar can be
+  moved with Alt+drag, but not resized, unless the page draws frames for
+  them (`decorations: 'server'`).
 - `wp_viewport` cropping is not supported yet.
 
 ## 🔧 Building from source

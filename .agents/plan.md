@@ -29,7 +29,8 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   One engine link at a time.
 - Advertised globals: wl_compositor 6, wl_subcompositor 1, wl_shm 2, wl_seat 9,
   wl_output 4, xdg_wm_base 6, wl_data_device_manager 3,
-  zxdg_decoration_manager_v1 1 (always client_side), wp_cursor_shape_manager_v1
+  zxdg_decoration_manager_v1 1 (client_side unless the embedder draws frames:
+  `decorations: 'server'`), wp_cursor_shape_manager_v1
   1, wp_viewporter 1, wp_fractional_scale_manager_v1 1,
   zwp_text_input_manager_v3 1, zwp_primary_selection_device_manager_v1 1,
   zwp_relative_pointer_manager_v1 1, zwp_pointer_constraints_v1 1,
@@ -74,11 +75,37 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   live hints), node tests (engine, session, headless, client),
   headless-e2e's foot phase (app id; close() and foot exits by itself)
   on a passthrough and a `--profile session` relay and with real foot.
-  Open, in
-  WINDOW.md's order: server-side decorations as the embedder's choice,
-  move/resize owned by the embedder (a grab handle), visibility owned by
-  the embedder, window positions for popup constraints, tiled states and
-  acked-configure serials, a focus policy, settable configure_bounds.
+  Milestone 3, done (2026-11-22): server-side decorations as the
+  embedder's choice — `decorations: 'client' | 'server'` on createEngine /
+  createWland / createHeadless (wasm `wland_init`'s third arg, session
+  CALL init's third word: a viewer's mode re-answers running apps before
+  its replay); 'decoration' events (EVENT 16, replayed) → `decorated` on
+  ViewWindow / HeadlessWindow / WindowEntry, known before the first
+  commit when the app asked first, changes through onWindowsChange;
+  xdg-decoration v1 errors enforced; `Engine.setBounds(w, h, dw, dh)`
+  (wasm export, CALL 30; reset at a session init): configure_bounds and
+  the maximized size, a pair for decorated windows. Checked: core unit
+  tests, session_test.zig, node tests, headless-e2e's `decorations` phase
+  (fixture `game` = an SDL game; passthrough and session; real neverball
+  and foot decorated under 'server').
+  Not done: the global stays advertised in 'client' mode, so SDL's switch
+  to libdecor on configure(client_side) during its first wait (WINDOW.md
+  §2.1: SDL 2.32.4 hangs there) still hits the default. Seen here too:
+  neverball (sdl2-compat 2.32.74 on SDL3 3.4.20) with libdecor allowed
+  gets client_side, destroys its decoration, moves to libdecor and never
+  maps (here libdecor's GTK plugin aborts on the glycin icon failure,
+  testing.md); under 'server' it maps 800x600, decorated. History: the
+  global was added (2026-07, "session 7b") for protocol hygiene only —
+  foot already drew its CSD without it; no app is known to need an always
+  client_side answer over no global, and SDL is hurt by it. Advertising
+  it only in 'server'
+  mode (like zwp_linux_dmabuf_v1, conditional) would fix SDL under the
+  default; on a session link a mode switch would then need wl_registry
+  global / global_remove to existing registries (registries are not
+  tracked today). Open, in WINDOW.md's order: move/resize owned by the
+  embedder (a grab handle), visibility owned by the embedder, window
+  positions for popup constraints, tiled states and acked-configure
+  serials, a focus policy.
 - **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
   Firefox render but ignore all input): the core kept one wl_pointer /
   wl_keyboard / data device id per client, the last made, and Firefox
