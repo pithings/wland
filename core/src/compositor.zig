@@ -301,6 +301,22 @@ const Surface = struct {
     /// it. Only the embedder sets and clears it; reset when the
     /// xdg_toplevel goes.
     hidden: bool = false,
+    /// The edges the embedder tiled the window against (setTiled; 1 top,
+    /// 2 bottom, 4 left, 8 right — resize edges' bits), sent as the
+    /// tiled_* states (xdg_wm_base v2) in every configure. Independent of
+    /// maximized and fullscreen, as the protocol's states are. Only the
+    /// embedder sets and clears it; reset when the xdg_toplevel goes.
+    tiled: u32 = 0,
+    /// The toplevel configures sent lately, newest at `cfg_head - 1` (a
+    /// ring): what an ack_configure's serial asked for. Clients ack the
+    /// latest they have seen, a few behind the newest at most.
+    cfgs: [cfg_ring]Configure = undefined,
+    cfg_head: u8 = 0,
+    cfg_len: u8 = 0,
+    /// The configure the last ack_configure named, until the commit that
+    /// applies it (acked_fn); `acked` is that configure once committed.
+    ack_pending: ?Configure = null,
+    acked: ?Configure = null,
     /// the window's size (its geometry) when it last floated — what the
     /// unmaximize / unfullscreen configure restores (0 = never presented,
     /// client decides)
@@ -375,6 +391,26 @@ const Surface = struct {
     /// surface is unmapped (role kept, embedder told none).
     notified: u32 = 0,
 };
+
+/// A toplevel configure as the embedder hears of it (configure_fn): its
+/// xdg_surface serial, the size it asked (0 = the client decides) and its
+/// states as `configure_*` bits.
+pub const Configure = struct { serial: u32, w: i32, h: i32, states: u32 };
+/// Configure bits (configure_fn's `states`): the states the configure
+/// carried, as the app was told (version-gated); the tiled edges are
+/// `tiled << configure_tiled_shift` (1 top, 2 bottom, 4 left, 8 right).
+pub const configure_maximized: u32 = 1;
+pub const configure_fullscreen: u32 = 2;
+pub const configure_activated: u32 = 4;
+pub const configure_suspended: u32 = 8;
+pub const configure_tiled_shift: u5 = 4;
+/// Window edges, as xdg_toplevel.resize_edge's bits and setTiled's.
+pub const edge_top: u32 = 1;
+pub const edge_bottom: u32 = 2;
+pub const edge_left: u32 = 4;
+pub const edge_right: u32 = 8;
+/// How many recent configures a toplevel remembers for its acks.
+const cfg_ring = 8;
 
 /// A rectangle in a surface's local coordinates, logical px.
 pub const Rect = struct { x: i32 = 0, y: i32 = 0, w: i32 = 0, h: i32 = 0 };
@@ -863,6 +899,19 @@ pub const Compositor = struct {
     /// carries the mode, so before the first buffer of a toplevel that made
     /// its decoration object before its initial commit.
     decoration_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void = null,
+    /// Every xdg_toplevel configure the core sends (with its xdg_surface
+    /// serial): the size it asks (0 = the client decides) and the states
+    /// as `configure_*` bits. `cause` is the embedder's token for the call
+    /// that made it (`cause` below; 0 = anything else: the app's request,
+    /// focus, bounds, the initial configure). The embedder learns the
+    /// serial its own call produced from it (a session call returns
+    /// nothing).
+    configure_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, cfg: Configure, cause: u32) void = null,
+    /// A commit applied a toplevel configure the app acked since its last
+    /// commit (ack_configure, then wl_surface.commit): which one, and the
+    /// size it had asked. Told before what the commit shows reaches the
+    /// embedder (its pixel frames follow the WIRE that carried it).
+    acked_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, serial: u32, w: i32, h: i32) void = null,
     /// Surface role changed (value = Role) or surface destroyed (value = destroyed_code).
     surface_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void = null,
     /// App-initiated interactive request the embedder must act on (window
@@ -962,6 +1011,11 @@ pub const Compositor = struct {
     /// true while the browser tab is hidden — mapped v6 toplevels are told
     /// via the xdg_toplevel suspended state so they can stop rendering.
     suspended: bool = false,
+    /// The embedder call being made carries this token (wasm and session
+    /// set it around requestResize / setMaximized / setFullscreen /
+    /// setTiled): every toplevel configure it produces is told with it
+    /// (configure_fn). 0 between calls.
+    cause: u32 = 0,
     /// linux-dmabuf as the relay offers it (its FEATURE frame); null = the
     /// relay takes no dmabufs and zwp_linux_dmabuf_v1 is not advertised.
     dmabuf: ?Dmabuf = null,
@@ -1608,6 +1662,10 @@ pub const Compositor = struct {
                 if (surface.size_serial) |serial| {
                     if (args[0].uint -% serial < 0x8000_0000) surface.size_acked = true;
                 }
+                // what it asked, for the embedder at the commit (acked_fn)
+                if (surface.role == .toplevel) {
+                    if (configureOf(surface, args[0].uint)) |cfg| surface.ack_pending = cfg;
+                }
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_surface") and std.mem.eql(u8, msg.name, "get_toplevel")) {
             if (surfaceByXdgId(conn, header.object_id)) |surface| {
@@ -1950,6 +2008,11 @@ pub const Compositor = struct {
                         surface.size_acked = false;
                         surface.size_serial = null;
                     }
+                    if (surface.ack_pending) |cfg| {
+                        surface.ack_pending = null;
+                        surface.acked = cfg;
+                        if (self.acked_fn) |f| f(self.ctx, conn_id, header.object_id, cfg.serial, cfg.w, cfg.h);
+                    }
                     const had_content = surface.on_output;
                     if (surface.pending_attach) |buffer_id| {
                         surface.pending_attach = null;
@@ -2109,6 +2172,10 @@ pub const Compositor = struct {
                         surface.fullscreen = false;
                         surface.minimized = false;
                         surface.hidden = false;
+                        surface.tiled = 0;
+                        surface.cfg_len = 0;
+                        surface.ack_pending = null;
+                        surface.acked = null;
                         surface.size_serial = null;
                         surface.size_acked = false;
                         // unmapped: its content is gone until the next
@@ -2562,6 +2629,12 @@ pub const Compositor = struct {
     const state_maximized: u32 = 1;
     const state_fullscreen: u32 = 2;
     const state_activated: u32 = 4;
+    // xdg_toplevel.state.tiled_* (since xdg_wm_base v2): the embedder
+    // snapped the window against these edges (setTiled)
+    const state_tiled_left: u32 = 5;
+    const state_tiled_right: u32 = 6;
+    const state_tiled_top: u32 = 7;
+    const state_tiled_bottom: u32 = 8;
     // xdg_toplevel.state.suspended (since xdg_wm_base v6) — set while the
     // browser tab is hidden or the window is minimized, so apps can stop
     // rendering
@@ -2576,7 +2649,21 @@ pub const Compositor = struct {
     fn sendToplevelConfigure(self: *Compositor, conn_id: u32, conn: *Conn, surface: *Surface, w: i32, h: i32, states: []const u32) void {
         if (surface.toplevel_id == 0 or surface.xdg_surface_id == 0) return;
         var state_bytes: [32]u8 = undefined;
-        for (states, 0..) |s, i| std.mem.writeInt(u32, state_bytes[i * 4 ..][0..4], s, .little);
+        var bits: u32 = 0;
+        for (states, 0..) |s, i| {
+            std.mem.writeInt(u32, state_bytes[i * 4 ..][0..4], s, .little);
+            bits |= switch (s) {
+                state_maximized => configure_maximized,
+                state_fullscreen => configure_fullscreen,
+                state_activated => configure_activated,
+                state_suspended => configure_suspended,
+                state_tiled_top => @as(u32, edge_top) << configure_tiled_shift,
+                state_tiled_bottom => @as(u32, edge_bottom) << configure_tiled_shift,
+                state_tiled_left => @as(u32, edge_left) << configure_tiled_shift,
+                state_tiled_right => @as(u32, edge_right) << configure_tiled_shift,
+                else => 0,
+            };
+        }
         self.sendEvent(conn_id, surface.toplevel_id, "xdg_toplevel", "configure", &.{
             .{ .int = w }, .{ .int = h }, .{ .array = state_bytes[0 .. states.len * 4] },
         });
@@ -2588,13 +2675,28 @@ pub const Compositor = struct {
             surface.size_serial = serial;
             surface.size_acked = false;
         }
+        const cfg: Configure = .{ .serial = serial, .w = w, .h = h, .states = bits };
+        surface.cfgs[surface.cfg_head] = cfg;
+        surface.cfg_head = (surface.cfg_head + 1) % cfg_ring;
+        surface.cfg_len = @min(surface.cfg_len + 1, cfg_ring);
+        if (self.configure_fn) |f| f(self.ctx, conn_id, surfaceIdOf(conn, surface), cfg, self.cause);
+    }
+
+    /// The configure `serial` names among the toplevel's recent ones.
+    fn configureOf(surface: *const Surface, serial: u32) ?Configure {
+        for (0..surface.cfg_len) |i| {
+            const c = surface.cfgs[(surface.cfg_head + cfg_ring - 1 - i) % cfg_ring];
+            if (c.serial == serial) return c;
+        }
+        return null;
     }
 
     /// The states every configure of this toplevel carries now: maximized,
     /// fullscreen; activated while it holds the keyboard (Chromium takes
-    /// "is this window active" from it, not from wl_keyboard); suspended
-    /// (v6) while the tab is hidden or the window minimized.
-    fn toplevelStates(self: *Compositor, conn: *Conn, surface: *Surface, states: *[4]u32) []const u32 {
+    /// "is this window active" from it, not from wl_keyboard); the tiled
+    /// edges the embedder set (v2); suspended (v6) while the tab is hidden
+    /// or the window minimized or hidden.
+    fn toplevelStates(self: *Compositor, conn: *Conn, surface: *Surface, states: *[8]u32) []const u32 {
         var n: usize = 0;
         if (surface.maximized) {
             states[n] = state_maximized;
@@ -2607,6 +2709,17 @@ pub const Compositor = struct {
         if (conn.keyboard_focus != 0 and conn.keyboard_focus == surfaceIdOf(conn, surface)) {
             states[n] = state_activated;
             n += 1;
+        }
+        if (surface.tiled != 0 and objVersion(conn, surface.toplevel_id) >= 2) {
+            const edges = [_][2]u32{
+                .{ edge_left, state_tiled_left },  .{ edge_right, state_tiled_right },
+                .{ edge_top, state_tiled_top },    .{ edge_bottom, state_tiled_bottom },
+            };
+            for (edges) |e| {
+                if (surface.tiled & e[0] == 0) continue;
+                states[n] = e[1];
+                n += 1;
+            }
         }
         if ((self.suspended or surface.minimized or surface.hidden) and objVersion(conn, surface.toplevel_id) >= 6) {
             states[n] = state_suspended;
@@ -2755,7 +2868,7 @@ pub const Compositor = struct {
         // the floating size from now on (the client is still at the old one)
         surface.last_w = cw;
         surface.last_h = ch;
-        var states: [4]u32 = undefined;
+        var states: [8]u32 = undefined;
         self.sendToplevelConfigure(conn_id, conn, surface, cw, ch, self.toplevelStates(conn, surface, &states));
     }
 
@@ -2797,7 +2910,7 @@ pub const Compositor = struct {
         const big = surface.maximized or surface.fullscreen;
         const w = if (big) area[0] else surface.last_w;
         const h = if (big) area[1] else surface.last_h;
-        var states: [4]u32 = undefined;
+        var states: [8]u32 = undefined;
         self.sendToplevelConfigure(conn_id, conn, surface, w, h, self.toplevelStates(conn, surface, &states));
     }
 
@@ -2909,7 +3022,8 @@ pub const Compositor = struct {
 
     /// A new embedder takes over (a session viewer's init): what the last
     /// one set per window for its own window manager goes — hidden windows
-    /// are shown (setVisible true). The new one sets its own.
+    /// are shown (setVisible true), tiled ones untiled (setTiled 0). The
+    /// new one sets its own.
     pub fn resetEmbedderWindows(self: *Compositor) void {
         var it = self.conns.iterator();
         while (it.next()) |kv| {
@@ -2917,8 +3031,36 @@ pub const Compositor = struct {
             while (sit.next()) |skv| {
                 if (skv.value_ptr.role != .toplevel) continue;
                 if (skv.value_ptr.hidden) self.setVisible(kv.key_ptr.*, skv.key_ptr.*, true);
+                if (skv.value_ptr.tiled != 0) self.setTiled(kv.key_ptr.*, skv.key_ptr.*, 0, 0, 0);
             }
         }
+    }
+
+    /// Embedder: the window is snapped against these edges (1 top, 2
+    /// bottom, 4 left, 8 right; 0 = floating again) — the tiled_* states
+    /// (xdg_wm_base v2; an older client hears nothing of them), so the app
+    /// drops its shadows and rounded corners there. Core state like
+    /// maximized: in every configure from now on, until the embedder says
+    /// otherwise; independent of maximized and fullscreen. The size is the
+    /// embedder's: w×h > 0 sends it in the same configure (clamped to the
+    /// app's hints, as requestResize does: one configure per snap), else
+    /// the configure repeats the current size — and none goes out when the
+    /// edges did not change. While maximized or fullscreen the size is
+    /// theirs (w×h ignored). Before the initial commit only the edges are
+    /// kept: the initial configure carries them.
+    pub fn setTiled(self: *Compositor, conn_id: u32, surface_id: u32, edges: u32, w: i32, h: i32) void {
+        const t = self.toplevelSurface(conn_id, surface_id) orelse return;
+        const surface = t.surface;
+        const e = edges & (edge_top | edge_bottom | edge_left | edge_right);
+        const changed = surface.tiled != e;
+        surface.tiled = e;
+        if (!surface.configured) return;
+        const big = surface.maximized or surface.fullscreen;
+        if (w > 0 and h > 0 and !big) return self.requestResize(conn_id, surface_id, w, h);
+        // (a pre-v2 client has no tiled state to hear of)
+        if (!changed or objVersion(t.conn, surface.toplevel_id) < 2) return;
+        self.refreshFloatingSize(conn_id, t.conn, surface);
+        self.sendCurrentConfigure(conn_id, t.conn, surface);
     }
 
     /// Embedder: show or hide a toplevel's window for its own reasons
@@ -3085,7 +3227,7 @@ pub const Compositor = struct {
                 // commit: it maps that way
                 self.sendCurrentConfigure(conn_id, conn, surface);
             } else {
-                var states: [4]u32 = undefined;
+                var states: [8]u32 = undefined;
                 self.sendToplevelConfigure(conn_id, conn, surface, 0, 0, self.toplevelStates(conn, surface, &states));
             }
         } else if (surface.role == .popup and surface.popup_id != 0) {
@@ -4880,6 +5022,9 @@ pub const Compositor = struct {
                     if (s.decorated) {
                         if (self.decoration_fn) |f| f(self.ctx, conn_id, surface_id, true);
                     }
+                    if (s.acked) |cfg| {
+                        if (self.acked_fn) |f| f(self.ctx, conn_id, surface_id, cfg.serial, cfg.w, cfg.h);
+                    }
                     if (self.interactive_fn) |f| {
                         if (s.maximized) f(self.ctx, conn_id, surface_id, 2, 0);
                         if (s.fullscreen) f(self.ctx, conn_id, surface_id, 6, 0);
@@ -5109,6 +5254,30 @@ const TestSink = struct {
     deco_surface: u32 = 0,
     decorated: ?bool = null,
     deco_calls: u32 = 0,
+    // configure_fn: last configure, its cause + count
+    cfg: ?Configure = null,
+    cfg_cause: u32 = 0,
+    cfg_calls: u32 = 0,
+    // acked_fn: last {serial, w, h} + count
+    acked: ?[3]u32 = null,
+    acked_calls: u32 = 0,
+
+    fn configure(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, cfg: Configure, cause: u32) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        _ = conn_id;
+        _ = surface_id;
+        self.cfg = cfg;
+        self.cfg_cause = cause;
+        self.cfg_calls += 1;
+    }
+
+    fn ackedCb(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, serial: u32, w: i32, h: i32) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        _ = conn_id;
+        _ = surface_id;
+        self.acked = .{ serial, @bitCast(w), @bitCast(h) };
+        self.acked_calls += 1;
+    }
 
     fn decoration(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx.?));
@@ -6680,11 +6849,16 @@ test "configure_bounds: setBounds is the work area (client-side and decorated to
 /// Map a v6 toplevel: registry 2, wl_compositor 3, xdg_wm_base(v6) 4,
 /// surface 6, xdg_surface 7, toplevel 8. Leaves the toplevel UNcommitted.
 fn wmBaseToplevel(comp: *Compositor, conn_id: u32) !void {
+    return wmBaseToplevelAt(comp, conn_id, 6);
+}
+
+/// wmBaseToplevel with xdg_wm_base bound at `version`.
+fn wmBaseToplevelAt(comp: *Compositor, conn_id: u32, version: u32) !void {
     var buf: [128]u8 = undefined;
     try comp.connOpen(conn_id);
     try comp.onWire(conn_id, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
     try comp.onWire(conn_id, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 1 }, .{ .new_id_dynamic = .{ .interface = "wl_compositor", .version = 4, .id = 3 } } }));
-    try comp.onWire(conn_id, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 6 }, .{ .new_id_dynamic = .{ .interface = "xdg_wm_base", .version = 6, .id = 4 } } }));
+    try comp.onWire(conn_id, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 6 }, .{ .new_id_dynamic = .{ .interface = "xdg_wm_base", .version = version, .id = 4 } } }));
     try comp.onWire(conn_id, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 6 }})); // create_surface
     try comp.onWire(conn_id, wire.encodeMessage(&buf, 4, 2, &.{ .{ .new_id = 7 }, .{ .object = 6 } })); // get_xdg_surface
     try comp.onWire(conn_id, wire.encodeMessage(&buf, 7, 1, &.{.{ .new_id = 8 }})); // get_toplevel
@@ -7572,6 +7746,129 @@ test "hidden by the embedder: suspended, frame callbacks held and feedback disca
         states = (try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .int, .int, .array }, &vals))[2].array;
     }
     try std.testing.expectEqual(Compositor.state_suspended, std.mem.readInt(u32, states.?[0..4], .little));
+}
+
+test "tiled: setTiled sets the tiled_* states (v2+) in every configure, with activated and maximized alike; a size rides the same configure; the same edges send nothing; a new embedder untiles" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    const L = Compositor.state_tiled_left;
+    const R = Compositor.state_tiled_right;
+    const TP = Compositor.state_tiled_top;
+    const B = Compositor.state_tiled_bottom;
+
+    comp.setTiled(1, 6, edge_left | edge_top | 0x30, 0, 0); // stray bits dropped
+    try T.expectConfigure(&sink, 1, 800, 600, &.{ L, TP });
+    comp.setTiled(1, 6, edge_left | edge_top, 0, 0); // the same: nothing
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    // a snap: the edges and the size in one configure, clamped to the hints
+    comp.conns.get(1).?.surfaces.getPtr(6).?.max_w = 700;
+    comp.setTiled(1, 6, edge_right | edge_top | edge_bottom, 750, 950);
+    try T.expectConfigure(&sink, 1, 700, 950, &.{ R, TP, B });
+    // every other configure carries them: focus, maximize (independent)
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
+    try T.send(&comp, 9, 1, &.{.{ .new_id = 11 }});
+    sink.events.clearRetainingCapacity();
+    comp.keyboardEnter(1, 6);
+    try T.expectConfigure(&sink, 1, 700, 950, &.{ T.A, R, TP, B });
+    comp.setMaximized(1, 6, true);
+    try T.expectConfigure(&sink, 1, 1500, 950, &.{ T.M, T.A, R, TP, B });
+    // while maximized a size is the maximized one's; the edges still change
+    comp.setTiled(1, 6, edge_left, 300, 300);
+    try T.expectConfigure(&sink, 1, 1500, 950, &.{ T.M, T.A, L });
+    comp.setMaximized(1, 6, false);
+    try T.expectConfigure(&sink, 1, 700, 950, &.{ T.A, L });
+    comp.setVisible(1, 6, false);
+    try T.expectConfigure(&sink, 1, 700, 950, &.{ T.A, L, T.S });
+    comp.setVisible(1, 6, true);
+    sink.events.clearRetainingCapacity();
+    // a new embedder untiles
+    comp.resetEmbedderWindows();
+    try T.expectConfigure(&sink, 1, 700, 950, &.{T.A});
+
+    // a v1 client is never told: no configure for the edges alone, none in
+    // its states; a size still goes out
+    var sink_buf: [64]u8 = undefined;
+    try wmBaseToplevelAt(&comp, 2, 1);
+    try comp.onWire(2, wire.encodeMessage(&sink_buf, 6, T.commit_op, &.{}));
+    sink.events.clearRetainingCapacity();
+    comp.setTiled(2, 6, edge_left, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    comp.setTiled(2, 6, edge_right, 400, 300);
+    try T.expectConfigure(&sink, 1, 400, 300, &.{});
+    // set before the initial commit: the initial configure carries it
+    try wmBaseToplevel(&comp, 3);
+    comp.setTiled(3, 6, edge_bottom, 10, 10);
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(3, wire.encodeMessage(&sink_buf, 6, T.commit_op, &.{}));
+    try T.expectConfigure(&sink, 1, 0, 0, &.{B});
+}
+
+test "configure_fn: every toplevel configure with its serial, size, states and the embedder call's token; acked_fn at the commit that applies an ack — the configure acked, skipped ones included; none without an ack, an unknown serial or a second commit" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.configure_fn = TestSink.configure;
+    comp.acked_fn = TestSink.ackedCb;
+    try T.setup(&comp, &sink);
+    const conn = comp.conns.get(1).?;
+    const ack_op = comptime protocol.find("xdg_surface").?.requestIndex("ack_configure").?;
+
+    // (the initial configure: 0×0, no cause)
+    try std.testing.expectEqual(@as(u32, 1), sink.cfg_calls);
+    try std.testing.expectEqual(@as(u32, 0), sink.cfg_cause);
+    comp.cause = 41;
+    comp.requestResize(1, 6, 700, 500);
+    comp.cause = 0;
+    const s1 = conn.serial;
+    try std.testing.expectEqual(Configure{ .serial = s1, .w = 700, .h = 500, .states = 0 }, sink.cfg.?);
+    try std.testing.expectEqual(@as(u32, 41), sink.cfg_cause);
+    comp.cause = 42;
+    comp.setTiled(1, 6, edge_left | edge_bottom, 640, 480);
+    comp.cause = 0;
+    const s2 = conn.serial;
+    try std.testing.expectEqual(Configure{ .serial = s2, .w = 640, .h = 480, .states = (edge_left | edge_bottom) << configure_tiled_shift }, sink.cfg.?);
+    try std.testing.expectEqual(@as(u32, 42), sink.cfg_cause);
+    comp.setVisible(1, 6, false); // not a token call: cause 0
+    try std.testing.expectEqual(@as(u32, 0), sink.cfg_cause);
+    try std.testing.expectEqual(configure_suspended | (edge_left | edge_bottom) << configure_tiled_shift, sink.cfg.?.states);
+    const s3 = conn.serial;
+
+    // the app acks the middle one (it hadn't seen the last yet), commits
+    try T.send(&comp, 7, ack_op, &.{.{ .uint = s2 }});
+    try std.testing.expectEqual(@as(u32, 0), sink.acked_calls); // at the commit
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try std.testing.expectEqual([3]u32{ s2, 640, 480 }, sink.acked.?);
+    try T.send(&comp, 6, T.commit_op, &.{}); // no new ack: nothing
+    try std.testing.expectEqual(@as(u32, 1), sink.acked_calls);
+    // two acks before a commit: the last one counts (the first skipped)
+    try T.send(&comp, 7, ack_op, &.{.{ .uint = s1 }});
+    try T.send(&comp, 7, ack_op, &.{.{ .uint = s3 }});
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try std.testing.expectEqual([3]u32{ s3, 640, 480 }, sink.acked.?);
+    // a serial never sent (or long gone): nothing
+    try T.send(&comp, 7, ack_op, &.{.{ .uint = s3 +% 1000 }});
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try std.testing.expectEqual(@as(u32, 2), sink.acked_calls);
+    // the ring keeps the recent ones: the 8th back is still known
+    var serials: [8]u32 = undefined;
+    for (&serials, 0..) |*sr, i| {
+        comp.requestResize(1, 6, 300 + @as(i32, @intCast(i)), 200);
+        sr.* = conn.serial;
+    }
+    try T.send(&comp, 7, ack_op, &.{.{ .uint = serials[0] }});
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try std.testing.expectEqual([3]u32{ serials[0], 300, 200 }, sink.acked.?);
+    // the xdg_toplevel goes: its configures with it
+    try T.send(&comp, 7, ack_op, &.{.{ .uint = serials[7] }});
+    try T.send(&comp, 8, comptime T.tl.requestIndex("destroy").?, &.{});
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try std.testing.expectEqual(@as(u32, 3), sink.acked_calls);
 }
 
 test "xdg_popup.reposition emits repositioned + configure sequence" {

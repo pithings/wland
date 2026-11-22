@@ -31,6 +31,14 @@ extern "env" fn js_size_limits(conn_id: u32, surface_id: u32, min_w: i32, min_h:
 /// A toplevel's decoration mode changed: decorated 1 = server_side (the
 /// embedder draws its frame), 0 = client-side again.
 extern "env" fn js_decoration(conn_id: u32, surface_id: u32, decorated: u32) void;
+/// The core sent a toplevel an xdg_toplevel configure: its xdg_surface
+/// serial, the size it asks (0 = the client decides), its states as bits
+/// (1 maximized, 2 fullscreen, 4 activated, 8 suspended, the tiled edges
+/// << 4) and the token of the embedder call that made it (0 = none).
+extern "env" fn js_configure(conn_id: u32, surface_id: u32, serial: u32, w: i32, h: i32, states: u32, cause: u32) void;
+/// A commit applied the configure `serial` the app acked (w×h: what it
+/// asked).
+extern "env" fn js_acked(conn_id: u32, surface_id: u32, serial: u32, w: i32, h: i32) void;
 extern "env" fn js_conn_close(conn_id: u32) void;
 /// value = role (0-4) on role change, 0xffffffff when the surface is destroyed.
 extern "env" fn js_surface_event(conn_id: u32, surface_id: u32, value: u32) void;
@@ -116,6 +124,8 @@ export fn wland_init(scale: i32, scale_120: i32, decorations: u32) void {
     compositor.app_id_fn = setAppId;
     compositor.size_limits_fn = sizeLimits;
     compositor.decoration_fn = decoration;
+    compositor.configure_fn = configure;
+    compositor.acked_fn = acked;
     compositor.surface_fn = surfaceEvent;
     compositor.interactive_fn = interactive;
     compositor.cursor_shape_fn = cursorShape;
@@ -313,14 +323,30 @@ export fn wland_toplevel_state(conn_id: u32, surface_id: u32) u32 {
 
 /// The embedder's window management (its UI, key bindings): the same
 /// configures as the app's own requests; the change comes back through
-/// js_interactive. on = 0/1.
-export fn wland_set_maximized(conn_id: u32, surface_id: u32, on: u32) void {
+/// js_interactive. on = 0/1. `cause`: the embedder's token, told with the
+/// configure it makes (js_configure; 0 = none).
+export fn wland_set_maximized(conn_id: u32, surface_id: u32, on: u32, cause: u32) void {
+    compositor.cause = cause;
     compositor.setMaximized(conn_id, surface_id, on != 0);
+    compositor.cause = 0;
     flushOut();
 }
 
-export fn wland_set_fullscreen(conn_id: u32, surface_id: u32, on: u32) void {
+export fn wland_set_fullscreen(conn_id: u32, surface_id: u32, on: u32, cause: u32) void {
+    compositor.cause = cause;
     compositor.setFullscreen(conn_id, surface_id, on != 0);
+    compositor.cause = 0;
+    flushOut();
+}
+
+/// The window is snapped against `edges` (1 top, 2 bottom, 4 left, 8
+/// right; 0 none): the tiled_* states (v2) in its configures from now on;
+/// w×h > 0 rides the same configure (as wland_request_resize), else it
+/// repeats the size. `cause` as wland_set_maximized's.
+export fn wland_set_tiled(conn_id: u32, surface_id: u32, edges: u32, w: i32, h: i32, cause: u32) void {
+    compositor.cause = cause;
+    compositor.setTiled(conn_id, surface_id, edges, w, h);
+    compositor.cause = 0;
     flushOut();
 }
 
@@ -405,8 +431,11 @@ export fn wland_popup_dismiss(conn_id: u32, surface_id: u32) void {
 }
 
 /// Resize-grip drag → xdg_toplevel.configure(w,h) (clamped to size hints).
-export fn wland_request_resize(conn_id: u32, surface_id: u32, w: i32, h: i32) void {
+/// `cause` as wland_set_maximized's.
+export fn wland_request_resize(conn_id: u32, surface_id: u32, w: i32, h: i32, cause: u32) void {
+    compositor.cause = cause;
     compositor.requestResize(conn_id, surface_id, w, h);
+    compositor.cause = 0;
     flushOut();
 }
 
@@ -825,6 +854,16 @@ fn setAppId(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, app_id: []const u8)
 fn sizeLimits(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
     _ = ctx;
     js_size_limits(conn_id, surface_id, min_w, min_h, max_w, max_h);
+}
+
+fn configure(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, cfg: core.compositor.Configure, cause: u32) void {
+    _ = ctx;
+    js_configure(conn_id, surface_id, cfg.serial, cfg.w, cfg.h, cfg.states, cause);
+}
+
+fn acked(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, serial: u32, w: i32, h: i32) void {
+    _ = ctx;
+    js_acked(conn_id, surface_id, serial, w, h);
 }
 
 fn decoration(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void {

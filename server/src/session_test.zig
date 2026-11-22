@@ -697,6 +697,64 @@ test "session: set_visible hides a window for the viewer (suspended), the next v
     try std.testing.expectEqual(n + 2, c.count(w.toplevel, toplevel_configure));
 }
 
+fn leI(v: i32) [4]u8 {
+    return le(@bitCast(v));
+}
+
+test "session: set_tiled (with a size, a cause) — the app's configure, EVENT configure with the cause, EVENT acked at its commit; request_resize without a cause says 0; the next viewer's replay has the acked configure and its init untiles" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    const c = try rig.connect();
+    const w = try openToplevel(&rig, c, 6);
+    const conn: u32 = 1;
+    var states: [8]u32 = undefined;
+
+    const a = try rig.viewer();
+    try a.init();
+    try rig.synced(a);
+    const n = c.count(w.toplevel, toplevel_configure);
+    var mark = a.frames.items.len;
+    try a.call(.set_tiled, &(le(conn) ++ le(w.surface) ++ le(4 | 1) ++ leI(300) ++ leI(200) ++ le(7)));
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7 }, try statesAfter(&rig, c, w.toplevel, n + 1, &states)); // tiled_left, tiled_top
+    const body = c.last(w.toplevel, toplevel_configure).?.body;
+    try std.testing.expectEqual(@as(i32, 300), std.mem.readInt(i32, body[0..4], .little));
+    const serial = std.mem.readInt(u32, c.last(w.xdg_surface, comptime op("xdg_surface", .event, "configure")).?.body[0..4], .little);
+    const Ev = struct { v: *Viewer, from: usize, o: stream.EventOp };
+    const pred = struct {
+        fn pred(x: Ev) bool {
+            return x.v.findEvent(x.from, x.o) != null;
+        }
+    }.pred;
+    try rig.until(Ev{ .v = a, .from = mark, .o = .configure }, pred);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(serial) ++ leI(300) ++ leI(200) ++ le(5 << 4) ++ le(7)), a.frames.items[a.findEvent(mark, .configure).?].parse().event.args);
+    // acked and committed: EVENT acked
+    mark = a.frames.items.len;
+    try c.send(w.xdg_surface, comptime op("xdg_surface", .request, "ack_configure"), &.{.{ .uint = serial }});
+    try c.send(w.surface, comptime op("wl_surface", .request, "commit"), &.{});
+    try rig.until(Ev{ .v = a, .from = mark, .o = .acked }, pred);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(serial) ++ leI(300) ++ leI(200)), a.frames.items[a.findEvent(mark, .acked).?].parse().event.args);
+    // a viewer before tokens: no cause word, read as 0
+    mark = a.frames.items.len;
+    try a.call(.request_resize, &(le(conn) ++ le(w.surface) ++ leI(310) ++ leI(210)));
+    try rig.until(Ev{ .v = a, .from = mark, .o = .configure }, pred);
+    try std.testing.expectEqualSlices(u8, &le(0), a.frames.items[a.findEvent(mark, .configure).?].parse().event.args[24..28]);
+    _ = try statesAfter(&rig, c, w.toplevel, n + 2, &states);
+    a.close();
+
+    // the next viewer: the acked configure in its replay, before synced; its
+    // init untiles the window (a configure without the tiled states)
+    const b = try rig.viewer();
+    try b.init();
+    try rig.synced(b);
+    const acked_at = b.findEvent(0, .acked) orelse return error.NoAckedReplay;
+    try std.testing.expect(acked_at < b.findEvent(0, .synced).?);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(serial) ++ leI(300) ++ leI(200)), b.frames.items[acked_at].parse().event.args);
+    // (n + 3: suspended as the viewer went; n + 4: back at the init)
+    try std.testing.expectEqualSlices(u32, &.{}, try statesAfter(&rig, c, w.toplevel, n + 5, &states));
+}
+
 fn writeAll(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {

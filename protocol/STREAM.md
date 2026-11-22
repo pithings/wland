@@ -1114,7 +1114,11 @@ op's arguments may grow at the end the same way: init's `decorations` is
 ignored by a relay that predates it (toplevels stay client-side), and a
 viewer that predates it sends none (read as 0); a relay before CALL 30 /
 EVENT 16 keeps the output's size as the bounds and tells no decoration; a
-relay before CALL 31 renders for windows the viewer hides.
+relay before CALL 31 renders for windows the viewer hides. `cause` (the
+last word of CALLs 19, 20, 23 and 32) is the viewer's token for the call:
+every EVENT configure the call makes carries it back, so a viewer learns
+the serial its own call produced without a reply (absent: 0); a relay
+before EVENTs 17–18 tells neither configures nor acks.
 
 ### 0x0f CALL — an embedder call, viewer→relay only (session)
 
@@ -1145,11 +1149,11 @@ u8  args[len]
 | 16 | keyboard_locks | u32 locks |
 | 17 | text_input_preedit | u32 conn, bytes text, i32 cursor_begin, i32 cursor_end |
 | 18 | text_input_commit_string | u32 conn, bytes text |
-| 19 | set_maximized | u32 conn, u32 surface, u32 on |
-| 20 | set_fullscreen | u32 conn, u32 surface, u32 on |
+| 19 | set_maximized | u32 conn, u32 surface, u32 on, u32 cause |
+| 20 | set_fullscreen | u32 conn, u32 surface, u32 on, u32 cause |
 | 21 | set_minimized | u32 conn, u32 surface, u32 on |
 | 22 | popup_dismiss | u32 conn, u32 surface |
-| 23 | request_resize | u32 conn, u32 surface, i32 w, i32 h |
+| 23 | request_resize | u32 conn, u32 surface, i32 w, i32 h, u32 cause |
 | 24 | drag_motion | u32 conn, u32 surface, u32 time_ms, i32 x_fixed, i32 y_fixed |
 | 25 | drag_drop | — |
 | 26 | drag_cancel | — |
@@ -1158,6 +1162,7 @@ u8  args[len]
 | 29 | close | u32 conn, u32 surface (xdg_toplevel.close to that toplevel) |
 | 30 | set_bounds | i32 w, i32 h, i32 decorated_w, i32 decorated_h (the work area: configure_bounds and the maximized size; 0×0 = the desktop's size, decorated 0×0 = w×h) |
 | 31 | set_visible | u32 conn, u32 surface, u32 visible (0: the viewer hides the toplevel's window — frame callbacks held, feedback discarded, v6 `suspended`, nothing else changed; 1: shown) |
+| 32 | set_tiled | u32 conn, u32 surface, u32 edges, i32 w, i32 h, u32 cause (the tiled_* states from now on: edges 1 top, 2 bottom, 4 left, 8 right, 0 none; w×h > 0 rides the same configure, clamped like request_resize) |
 
 **init is the attach.** A viewer sends it once, first, when it has seen
 FEATURE session (followed by its set_gpu_source / desktop_size /
@@ -1168,10 +1173,12 @@ mode it changes are answered again — their decoration configure, a
 configure — before the replay, which then carries the new state), drops
 the bounds a previous viewer set (the viewer sends its own set_bounds after
 init when it has any) and the per-window state it set (windows it hid with
-set_visible are shown: the new viewer hides its own) and answers with the **scene replay** — for every app conn a CONN_OPEN, for
+set_visible are shown, those it tiled untiled: the new viewer sets its
+own) and answers with the **scene replay** — for every app conn a CONN_OPEN, for
 every surface its SURFACE and the EVENTs that describe it now
 (surface_event with its role, set_title, set_app_id, input_region,
-size_limits unless all 0, decoration when decorated, the interactive state
+size_limits unless all 0, decoration when decorated, acked with the
+configure the toplevel last committed, the interactive state
 kinds 2/6/8 that are set),
 parents before what hangs from them, then
 for every surface with content one BUFFER (or BUFFER_LZ) holding its whole
@@ -1232,6 +1239,8 @@ u8  args[len]
 | 14 | set_app_id | u32 conn, u32 surface, bytes app_id |
 | 15 | size_limits | u32 conn, u32 surface, i32 min_w, i32 min_h, i32 max_w, i32 max_h (a toplevel's committed set_min_size / set_max_size, window geometry px, 0 = unset; all 0 when its xdg_toplevel goes) |
 | 16 | decoration | u32 conn, u32 surface, u32 decorated (1: the toplevel was configured server_side, the viewer draws its frame; 0: client-side again) |
+| 17 | configure | u32 conn, u32 surface, u32 serial, i32 w, i32 h, u32 states, u32 cause (every xdg_toplevel configure the compositor sends: its xdg_surface serial, the size asked — 0 = the client decides —, the states as the app was told them: 1 maximized, 2 fullscreen, 4 activated, 8 suspended, the tiled edges << 4 (1 top, 2 bottom, 4 left, 8 right); cause = the token of the CALL that made it, 0 = none) |
+| 18 | acked | u32 conn, u32 surface, u32 serial, i32 w, i32 h (a commit applied the configure `serial` the app acked since its last commit; w×h is what it asked; before that commit's pixel frames) |
 
 EVENTs keep the order the compositor made them in, relative to each other
 and to the pixel frames, CONN_OPEN/CONN_CLOSE and SURFACE frames around

@@ -146,6 +146,24 @@ test('decorations \'server\' rides init (its third word), bounds follow as set_b
   ]);
 });
 
+test('EVENT 17 is a configure event (states decoded, the cause), EVENT 18 an acked event', async () => {
+  const { link, events } = await setup();
+  link.cb!.onMessage(msg(feature(4, u64(SID))));
+  events.length = 0;
+  link.cb!.onMessage(msg(connOpen(7), surface(7, 10, { role: 1, root: 10 }),
+    event(17, u32(7, 10, 0xfffffff0), i32(640, 480), u32(1 | 4 | (5 << 4), 3)),
+    event(17, u32(7, 10, 0xfffffff1), i32(0, 0), u32(2 | 8, 0)),
+    event(18, u32(7, 10, 0xfffffff0), i32(640, 480)),
+    event(13)));
+  assert.deepEqual(events.filter((e) => e.type === 'configure' || e.type === 'acked'), [
+    { type: 'configure', conn: 7, surface: 10, serial: 0xfffffff0, width: 640, height: 480,
+      maximized: true, fullscreen: false, activated: true, suspended: false, tiled: 5, cause: 3 },
+    { type: 'configure', conn: 7, surface: 10, serial: 0xfffffff1, width: 0, height: 0,
+      maximized: false, fullscreen: true, activated: false, suspended: true, tiled: 0, cause: 0 },
+    { type: 'acked', conn: 7, surface: 10, serial: 0xfffffff0, width: 640, height: 480 },
+  ]);
+});
+
 test('scene replay: surfaces, titles, regions, states and commits from the SURFACE mirror, then synced', async () => {
   const { link, events, engine, take } = await setup();
   link.cb!.onMessage(msg(feature(4, u64(SID))));
@@ -242,13 +260,15 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
   engine.keyboardLocks(false, true);
   engine.textInputPreedit(7, 'hé');
   engine.textInputCommit(7, 'ok');
-  engine.setMaximized(7, 10, true);
-  engine.setFullscreen(7, 10, false);
+  assert.equal(engine.setMaximized(7, 10, true), 1, 'the token');
+  assert.equal(engine.setFullscreen(7, 10, false), 2);
   engine.setMinimized(7, 10, true);
   engine.popupDismiss(7, 12);
   engine.close(7, 10);
   engine.setVisible(7, 10, false);
-  engine.requestResize(7, 10, 640.4, 480.6);
+  assert.equal(engine.requestResize(7, 10, 640.4, 480.6), 3);
+  assert.equal(engine.setTiled(7, 10, 4 | 1, 300.2, 199.6), 4);
+  assert.equal(engine.setTiled(7, 10, 0), 5);
   engine.dragMotion(7, 10, 105, 1, 2);
   engine.dragDrop();
   engine.dragCancel();
@@ -269,13 +289,15 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
     call(16, u32(2)),
     call(17, u32(7), bytes('hé'), i32(3, 3)),
     call(18, u32(7), bytes('ok')),
-    call(19, u32(7, 10, 1)),
-    call(20, u32(7, 10, 0)),
+    call(19, u32(7, 10, 1, 1)),
+    call(20, u32(7, 10, 0, 2)),
     call(21, u32(7, 10, 1)),
     call(22, u32(7, 12)),
     call(29, u32(7, 10)),
     call(31, u32(7, 10, 0)),
-    call(23, u32(7, 10), i32(640, 481)),
+    call(23, u32(7, 10), i32(640, 481), u32(3)),
+    call(32, u32(7, 10, 5), i32(300, 200), u32(4)),
+    call(32, u32(7, 10, 0), i32(0, 0), u32(5)),
     call(24, u32(7, 10, 105), i32(fx(1), fx(2))),
     call(25),
     call(26),

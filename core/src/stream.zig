@@ -745,6 +745,7 @@ pub const CallOp = enum(u16) {
     close = 29,
     set_bounds = 30,
     set_visible = 31,
+    set_tiled = 32,
     _,
 };
 
@@ -766,6 +767,8 @@ pub const EventOp = enum(u16) {
     set_app_id = 14,
     size_limits = 15,
     decoration = 16,
+    configure = 17,
+    acked = 18,
     _,
 };
 

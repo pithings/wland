@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createEngine, type Link, type LinkCallbacks } from '../lib/engine.ts';
+import { createEngine, EDGE_LEFT, EDGE_TOP, type Link, type LinkCallbacks } from '../lib/engine.ts';
 
 const wasm = await readFile(new URL('../lib/wland.wasm', import.meta.url));
 
@@ -307,6 +307,33 @@ test('setVisible: a hidden toplevel is configured suspended (v6) with nothing el
   assert.deepEqual(configures(), [[0, 0, 9], [0, 0]]);
   assert.deepEqual(events.filter((e) => e.type === 'minimize'), [], 'not minimized');
   engine.dispose();
+});
+
+test('setTiled / requestResize return a token the configure event carries back; the app\'s ack + commit is an acked event naming that configure; tiled states reach the app', async () => {
+  const { link, events, engine, send, configures } = await withToplevel();
+  const initial = events.filter((e) => e.type === 'configure');
+  assert.deepEqual(initial.map((e) => [e.width, e.height, e.cause]), [[0, 0, 0]], 'the initial configure: no cause');
+  link.sent.length = 0;
+  events.length = 0;
+  const t1 = engine.setTiled(CONN, 6, EDGE_LEFT | EDGE_TOP, 400.4, 300);
+  const t2 = engine.requestResize(CONN, 6, 500, 350);
+  assert.ok(t1 > 0 && t2 === t1 + 1);
+  assert.deepEqual(configures(), [[400, 300, 5, 7], [500, 350, 5, 7]]); // tiled_left, tiled_top
+  const cfgs = events.filter((e) => e.type === 'configure');
+  assert.deepEqual(cfgs.map((e) => [e.width, e.height, e.tiled, e.cause]), [[400, 300, EDGE_LEFT | EDGE_TOP, t1], [500, 350, EDGE_LEFT | EDGE_TOP, t2]]);
+  assert.equal(cfgs[1].serial, cfgs[0].serial + 1);
+  // the app acks the first (it had not seen the second), then commits
+  events.length = 0;
+  send(msg(7, 4, cfgs[0].serial));
+  assert.deepEqual(events.filter((e) => e.type === 'acked'), [], 'at the commit');
+  send(msg(6, 6));
+  assert.deepEqual(events.filter((e) => e.type === 'acked'), [{ type: 'acked', conn: CONN, surface: 6, serial: cfgs[0].serial, width: 400, height: 300 }]);
+  // the same edges, no size: nothing (no token comes back)
+  events.length = 0;
+  engine.setTiled(CONN, 6, EDGE_LEFT | EDGE_TOP);
+  assert.deepEqual(events.filter((e) => e.type === 'configure'), []);
+  engine.dispose();
+  assert.equal(engine.setTiled(CONN, 6, 0), 0, 'nothing sent: no token');
 });
 
 test('motion is coalesced and held back while the link is backed up', async () => {

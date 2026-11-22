@@ -80,6 +80,13 @@ export const ROLE_CURSOR = 3;
 export const ROLE_POPUP = 4;
 export const ROLE_DND_ICON = 5;
 
+/** Window edges, bits of a mask: ResizeEvent.edges, Engine.setTiled's
+ *  `edges`, ConfigureEvent.tiled. */
+export const EDGE_TOP = 1;
+export const EDGE_BOTTOM = 2;
+export const EDGE_LEFT = 4;
+export const EDGE_RIGHT = 8;
+
 /** The transport to the relay. `createWsLink` is the WebSocket one. */
 export interface Link {
   /** Begin connecting; drive the callbacks from then on. */
@@ -455,16 +462,36 @@ export interface Engine {
   /** Outside click while a popup is up → xdg_popup.popup_done. */
   popupDismiss(conn: number, surface: number): void;
   /** xdg_toplevel.configure with this size (clamped to the app's hints).
-   *  Ignored while the window is maximized or fullscreen. */
-  requestResize(conn: number, surface: number, width: number, height: number): void;
+   *  Ignored while the window is maximized or fullscreen.
+   *
+   *  Returns this call's token (0: the link is not open, nothing sent):
+   *  the 'configure' event of the configure it made carries it as `cause`
+   *  — on a session link too, where the call itself returns nothing from
+   *  the compositor. How to tell when the app answered: see
+   *  ConfigureEvent. Likewise setMaximized, setFullscreen and setTiled. */
+  requestResize(conn: number, surface: number, width: number, height: number): number;
   /** Maximize / unmaximize a toplevel from the embedder's side (its UI):
-   *  the configure the app's own request would get, and a 'maximize' event. */
-  setMaximized(conn: number, surface: number, maximized: boolean): void;
+   *  the configure the app's own request would get, and a 'maximize' event.
+   *  Returns the call's token (see requestResize). */
+  setMaximized(conn: number, surface: number, maximized: boolean): number;
   /** Put a toplevel in or out of fullscreen from the embedder's side (a key
    *  binding, the browser's own fullscreen ending): a configure of the
    *  output's size with the fullscreen state (or back to what it was), and
-   *  a 'fullscreen' event. */
-  setFullscreen(conn: number, surface: number, fullscreen: boolean): void;
+   *  a 'fullscreen' event. Returns the call's token (see requestResize). */
+  setFullscreen(conn: number, surface: number, fullscreen: boolean): number;
+  /** The window is snapped against `edges` (EDGE_* bits; 0 = floating
+   *  again): the xdg_toplevel tiled_left/right/top/bottom states (apps on
+   *  xdg_wm_base v2+), so the app drops its shadows and rounded corners on
+   *  those sides as it does when maximized. A state like maximized: every
+   *  configure carries it from now on, until you change it; independent of
+   *  maximized and fullscreen. Tiling sizes nothing: with `width`×`height`
+   *  the same configure asks for that size too (clamped to the app's hints,
+   *  as requestResize — one configure per snap); without, it repeats the
+   *  current size, and nothing is sent when the edges did not change. While
+   *  maximized or fullscreen the size is theirs. Returns the call's token
+   *  (see requestResize). On a session link a new viewer's attach untiles
+   *  what the last one tiled. */
+  setTiled(conn: number, surface: number, edges: number, width?: number, height?: number): number;
   /** Minimize (hide) or restore a mapped toplevel — restoring is only ever
    *  the embedder's: xdg_toplevel has set_minimized and no way back. A
    *  'minimize' event follows; see MinimizeEvent. */
@@ -551,6 +578,7 @@ export type Event =
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
   | TitleEvent | AppIdEvent | SizeLimitsEvent | DecorationEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
   | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
+  | ConfigureEvent | AckedEvent
   | SelectionEvent | PositionEvent | SyncedEvent;
 
 /** The link is up and the compositor initialised; input calls work now. */
@@ -775,6 +803,48 @@ export interface InputRegionEvent { type: 'input-region'; conn: number; surface:
  *  pointerLockLost. 0: the lock is not wanted any more — exit the
  *  browser's pointer lock (no report needed). */
 export interface PointerLockEvent { type: 'pointer-lock'; conn: number; surface: number }
+/** The core sent a toplevel an xdg_toplevel configure (whoever caused
+ *  it: your call, the app's own request, keyboard focus, bounds, the tab's
+ *  visibility, its initial configure). `serial` is its xdg_surface
+ *  serial; `width`×`height` the size it asks (window geometry px; 0 = the
+ *  app decides); the states it carried, as the app was told them (an app
+ *  on an older xdg_wm_base is not told the newer ones: tiled from v2,
+ *  suspended from v6). `cause` is the token requestResize / setMaximized /
+ *  setFullscreen / setTiled returned for the call that made it, 0 for
+ *  anything else (and in a session's scene replay).
+ *
+ *  Matching a size change to your request: keep the serial of the
+ *  configure whose `cause` is your call's token. The app has answered it
+ *  once an AckedEvent for the window names a serial ≥ it (an app acks
+ *  only the latest configure it has seen, so a later serial answers yours
+ *  too; serials grow per app connection, as u32s); the commit events that
+ *  follow show the size it chose (an app may round: foot to whole cells).
+ *  A call that changes nothing configures nothing and its token never
+ *  comes back (requestResize on a maximized window, setTiled with the
+ *  same edges and no size, a window not mapped yet). */
+export interface ConfigureEvent {
+  type: 'configure';
+  conn: number;
+  surface: number;
+  serial: number;
+  width: number;
+  height: number;
+  maximized: boolean;
+  fullscreen: boolean;
+  activated: boolean;
+  suspended: boolean;
+  /** EDGE_* bits */
+  tiled: number;
+  cause: number;
+}
+/** A commit of the toplevel applied a configure it acked since its last
+ *  commit (xdg_surface.ack_configure, then wl_surface.commit): `serial`
+ *  (ConfigureEvent.serial) and the size that configure asked (0 = the app
+ *  decides). It precedes the commit events of that commit. A configure
+ *  acked later than one the window's previous AckedEvent named answers
+ *  every request before it too. Also in a session's scene replay (the last
+ *  one per window). */
+export interface AckedEvent { type: 'acked'; conn: number; surface: number; serial: number; width: number; height: number }
 /** xdg_toplevel.move: start an interactive move grab. */
 export interface MoveEvent { type: 'move'; conn: number; surface: number }
 /** xdg_toplevel.resize: edges bitmask 1 top, 2 bottom, 4 left, 8 right. */
@@ -1120,6 +1190,12 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
         emit({ type: 'size-limits', conn: conn >>> 0, surface, minW, minH, maxW, maxH }),
       js_decoration: (conn, surface, decorated) =>
         emit({ type: 'decoration', conn: conn >>> 0, surface, decorated: decorated !== 0 }),
+      js_configure: (conn, surface, serial, width, height, states, cause) =>
+        emit({ type: 'configure', conn: conn >>> 0, surface, serial: serial >>> 0, width, height,
+               maximized: (states & 1) !== 0, fullscreen: (states & 2) !== 0, activated: (states & 4) !== 0,
+               suspended: (states & 8) !== 0, tiled: (states >>> 4) & 15, cause: cause >>> 0 }),
+      js_acked: (conn, surface, serial, width, height) =>
+        emit({ type: 'acked', conn: conn >>> 0, surface, serial: serial >>> 0, width, height }),
       js_conn_close: (conn) => {
         conn >>>= 0;
         conns.delete(conn);
@@ -1728,6 +1804,16 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     run(fn, ...args);
   };
 
+  // a configuring window call: run with a fresh token (never 0), which the
+  // configure it makes carries back ('configure' events' cause)
+  let lastCause = 0;
+  const caused = (fn: (cause: number) => unknown): number => {
+    if (!live) return 0;
+    const t = lastCause = lastCause >= 0x7fffffff ? 1 : lastCause + 1;
+    run(fn, t);
+    return t;
+  };
+
   function withUtf8(text: string, fn: (ptr: number, len: number) => void) {
     const bytes = enc.encode(text);
     const size = Math.max(1, bytes.length);
@@ -1934,10 +2020,12 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
 
     // window management
     popupDismiss: call((conn, surface) => ex.wland_popup_dismiss(conn, surface), true),
-    requestResize: call((conn, surface, width, height) =>
-      ex.wland_request_resize(conn, surface, Math.round(width), Math.round(height))),
-    setMaximized: call((conn, surface, on) => ex.wland_set_maximized(conn, surface, on ? 1 : 0)),
-    setFullscreen: call((conn, surface, on) => ex.wland_set_fullscreen(conn, surface, on ? 1 : 0)),
+    requestResize: (conn, surface, width, height) =>
+      caused((t) => ex.wland_request_resize(conn, surface, Math.round(width), Math.round(height), t)),
+    setMaximized: (conn, surface, on) => caused((t) => ex.wland_set_maximized(conn, surface, on ? 1 : 0, t)),
+    setFullscreen: (conn, surface, on) => caused((t) => ex.wland_set_fullscreen(conn, surface, on ? 1 : 0, t)),
+    setTiled: (conn, surface, edges, width = 0, height = 0) =>
+      caused((t) => ex.wland_set_tiled(conn, surface, edges & 15, Math.round(width) || 0, Math.round(height) || 0, t)),
     // minimizing sends a pointer leave: after any pending motion
     setMinimized: call((conn, surface, on) => ex.wland_set_minimized(conn, surface, on ? 1 : 0), true),
     setVisible: call((conn, surface, on) => ex.wland_set_visible(conn, surface, on ? 1 : 0)),

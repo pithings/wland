@@ -81,17 +81,18 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_keyboard_leave: [14, 'u'],
   wland_key: [15, 'uuuu'],
   wland_keyboard_locks: [16, 'u'],
-  wland_set_maximized: [19, 'uuu'],
-  wland_set_fullscreen: [20, 'uuu'],
+  wland_set_maximized: [19, 'uuuu'],
+  wland_set_fullscreen: [20, 'uuuu'],
   wland_set_minimized: [21, 'uuu'],
   wland_popup_dismiss: [22, 'uu'],
-  wland_request_resize: [23, 'uuii'],
+  wland_request_resize: [23, 'uuiiu'],
   wland_drag_motion: [24, 'uuuii'],
   wland_drag_drop: [25, ''],
   wland_drag_cancel: [26, ''],
   wland_close: [29, 'uu'],
   wland_set_bounds: [30, 'iiii'],
   wland_set_visible: [31, 'uuu'],
+  wland_set_tiled: [32, 'uuuiiu'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
 
@@ -261,6 +262,14 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
       case 16: {
         const conn = a.u32(), surface = a.u32(), decorated = a.u32();
         return env.js_decoration(conn, surface, decorated);
+      }
+      case 17: {
+        const conn = a.u32(), surface = a.u32(), serial = a.u32(), w = a.i32(), h = a.i32(), states = a.u32(), cause = a.u32();
+        return env.js_configure(conn, surface, serial, w, h, states, cause);
+      }
+      case 18: {
+        const conn = a.u32(), surface = a.u32(), serial = a.u32(), w = a.i32(), h = a.i32();
+        return env.js_acked(conn, surface, serial, w, h);
       }
       default: return; // an op this viewer does not know: skipped
     }

@@ -155,6 +155,8 @@ pub const Session = struct {
         c.app_id_fn = evAppId;
         c.size_limits_fn = evSizeLimits;
         c.decoration_fn = evDecoration;
+        c.configure_fn = evConfigure;
+        c.acked_fn = evAcked;
         c.surface_fn = evSurface;
         c.interactive_fn = evInteractive;
         c.cursor_shape_fn = evCursorShape;
@@ -538,6 +540,25 @@ pub const Session = struct {
         self.endEvent(.decoration);
     }
 
+    fn evConfigure(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, cfg: core.compositor.Configure, cause: u32) void {
+        const self = of(ctx);
+        self.noteNamed(conn_id, surface_id);
+        const w = self.beginEvent() orelse return;
+        inline for (.{ conn_id, surface_id, cfg.serial }) |v| w.u32_(v) catch return;
+        inline for (.{ cfg.w, cfg.h }) |v| w.i32_(v) catch return;
+        inline for (.{ cfg.states, cause }) |v| w.u32_(v) catch return;
+        self.endEvent(.configure);
+    }
+
+    fn evAcked(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, serial: u32, cw: i32, ch: i32) void {
+        const self = of(ctx);
+        self.noteNamed(conn_id, surface_id);
+        const w = self.beginEvent() orelse return;
+        inline for (.{ conn_id, surface_id, serial }) |v| w.u32_(v) catch return;
+        inline for (.{ cw, ch }) |v| w.i32_(v) catch return;
+        self.endEvent(.acked);
+    }
+
     fn evSurface(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void {
         const self = of(ctx);
         if (value != core.compositor.surface_destroyed_code) self.noteNamed(conn_id, surface_id);
@@ -848,14 +869,39 @@ pub const Session = struct {
             },
             .text_input_preedit => c.textInputPreedit(try a.u32_(), try a.bytes(), try a.i32_(), try a.i32_()),
             .text_input_commit_string => c.textInputCommitString(try a.u32_(), try a.bytes()),
-            .set_maximized => c.setMaximized(try a.u32_(), try a.u32_(), try a.u32_() != 0),
-            .set_fullscreen => c.setFullscreen(try a.u32_(), try a.u32_(), try a.u32_() != 0),
+            .set_maximized, .set_fullscreen => {
+                const conn_id = try a.u32_();
+                const surface_id = try a.u32_();
+                const on = try a.u32_() != 0;
+                // (a viewer before tokens sends no cause)
+                c.cause = a.u32_() catch 0;
+                defer c.cause = 0;
+                if (op == .set_maximized) c.setMaximized(conn_id, surface_id, on) else c.setFullscreen(conn_id, surface_id, on);
+            },
             .set_minimized => c.setMinimized(try a.u32_(), try a.u32_(), try a.u32_() != 0),
             .popup_dismiss => c.popupDismiss(try a.u32_(), try a.u32_()),
             .close => c.closeToplevel(try a.u32_(), try a.u32_()),
             .set_bounds => c.setBounds(try a.i32_(), try a.i32_(), try a.i32_(), try a.i32_()),
             .set_visible => c.setVisible(try a.u32_(), try a.u32_(), try a.u32_() != 0),
-            .request_resize => c.requestResize(try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
+            .request_resize => {
+                const conn_id = try a.u32_();
+                const surface_id = try a.u32_();
+                const w = try a.i32_();
+                const h = try a.i32_();
+                c.cause = a.u32_() catch 0;
+                defer c.cause = 0;
+                c.requestResize(conn_id, surface_id, w, h);
+            },
+            .set_tiled => {
+                const conn_id = try a.u32_();
+                const surface_id = try a.u32_();
+                const edges = try a.u32_();
+                const w = try a.i32_();
+                const h = try a.i32_();
+                c.cause = a.u32_() catch 0;
+                defer c.cause = 0;
+                c.setTiled(conn_id, surface_id, edges, w, h);
+            },
             .drag_motion => c.dragMotion(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_drop => c.dragDrop(),
             .drag_cancel => c.dragCancel(),
