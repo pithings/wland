@@ -699,7 +699,7 @@ side), logged as having no guest backing of the claimed size. The first refusal 
 each kind is logged with its reason, as is the first buffer of each
 (format, modifier, flags) it does name; refusals have their own bounded
 table, so no client can use up the accepted-buffer lines, and the
-fence-timeout warning below is per conn.
+fence-timeout note below is per conn.
 Lifetime: the GEM handle keeps the resource alive; the relay counts its
 holders — each wl_buffer made from it plus each un-ACKed COMMIT naming it
 (one handle per object per DRM file: two wl_buffers over one dmabuf share
@@ -739,9 +739,14 @@ more: in unkernel that is right after its renderer ran the commands in its
 WebGL context (not GPU completion), which is exactly what a resolver
 reading the texture in that same context needs; QEMU in strict mode
 answers at host GPU completion. The wait is bounded (100 ms): past it the
-COMMIT goes out anyway and the first such timeout of each conn is logged;
+COMMIT goes out anyway and the first such timeout of each conn is logged
+(at info: a slow first frame, compiling its shaders, can take that long);
 it holds up only that client's thread (other clients and the link go
-on). Explicit sync
+on). `wlandr --no-fence-wait` skips the wait: for a device that delivers
+the client's GPU work to the page before the link's later bytes on its
+own (unkernel: GPU requests and vsock packets share one channel), where
+the wait adds nothing but a round trip per frame; emission order is then
+the whole guarantee. Explicit sync
 (`linux-drm-syncobj-v1`) is not advertised (FD RULE), so no client attaches
 a sync file and the ref carries no fence.
 

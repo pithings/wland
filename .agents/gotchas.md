@@ -224,7 +224,7 @@ with it. New findings go in the matching section.
   (the safe side); its log line says so (`refusalText`, one page).
 - **virtgpu once-logs are per class**: refusals (a client can mint kinds
   at will) can't crowd out the accepted-buffer lines (≤ 16 kinds exist);
-  the fence-timeout warning is a per-conn flag. A device that won't open
+  the fence-timeout line (info) is a per-conn flag. A device that won't open
   is no buffer's property and repeats at every import (a resize storm):
   `Device.open` logs nothing, the importer logs it at most once a minute
   with the count since (`open_log_interval_ms`; reason + errno carried in
@@ -235,14 +235,26 @@ with it. New findings go in the matching section.
   the COMMIT is built while handling the client's `wl_surface.commit`, after
   its WIRE, never queued or deferred (Mesa submitted before it sent the
   request), plus a bounded poll on the dmabuf for its implicit write fences
-  (100 ms, then sent anyway, logged once per conn). Don't move COMMIT emission off
-  the commit path (batching across bursts, a sender thread) without
-  re-deriving this.
+  (100 ms, then sent anyway, logged once per conn at info: slow first frames
+  — shader compiles — hit it legitimately). `--no-fence-wait`
+  (`dmabuf.Config.fence_wait`) skips the poll, for unkernel: GPU requests and
+  vsock packets share one channel to the page, so ordering never depended
+  on it and each poll costs a worker⇄page round trip per frame. Don't move
+  COMMIT emission off the commit path (batching across bursts, a sender
+  thread) without re-deriving this — with the wait off, emission order is
+  the whole guarantee.
 - **virtgpu's ioctl seam** is `virtgpu.Device.fake` (a runtime pointer, not
   kwshm's comptime swap) so the shipped binary can run the stand-in:
   `--dmabuf virtgpu:@fake` is TEST-ONLY and kept out of the usage text —
   the E2Es' only way to drive the backend with no /dev/dri. Its "dmabufs"
-  are memfds (any regular file); nothing real can allocate on it.
+  are memfds (any regular file); nothing real can allocate on it. Unit
+  tests can set `Fake.accept_pipes` to import an empty pipe: a dmabuf whose
+  write fence never signals (how the fence-wait test sees the 100 ms).
+- **`wlandr --version`** prints `build_options.version` (package.json's,
+  read by `build.zig`; `-Dversion=` overrides) and a `features:` line built
+  at comptime in `main.zig` — buffers/dmabuf tokens straight from their
+  enums, so a new mode shows up by itself (and must keep `@fake` out: it is
+  a NODE, not a mode). Tokens are append-only: guest scripts test them.
 - **FEATURE goes out before the link is attached** (serveLink, before
   `relay.link = link`), so it precedes every CONN_OPEN and the core never
   answers a registry without knowing about dmabuf. One message

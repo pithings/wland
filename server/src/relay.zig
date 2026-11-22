@@ -1122,10 +1122,15 @@ fn finishCommit(conn: *AppConn, surface_id: u32) !void {
             .resource => |r| {
                 // the client's GPU work for this frame was submitted before
                 // its commit request; wait (bounded) for the buffer's
-                // implicit write fences so the engine's renderer has it
-                if (!dmabuf_buffer.?.awaitWrites(virtgpu_fence_wait_ms)) {
+                // implicit write fences so the engine's renderer has it —
+                // unless --no-fence-wait says the device orders it anyway
+                const fence_wait = conn.relay.dmabuf.?.fence_wait;
+                if (fence_wait and !dmabuf_buffer.?.awaitWrites(virtgpu_fence_wait_ms)) {
+                    // expected now and then (a first frame compiling its
+                    // shaders): the COMMIT still follows the client's
+                    // submission on the way to the host
                     if (!conn.fence_timeout_logged)
-                        std.log.warn("conn {d}: dmabuf buffer {d} (resource {d}) still being written after {d} ms; sending its COMMIT anyway (logged once per conn)", .{ conn.conn_id, state.buffer_id, r.ref.resource, virtgpu_fence_wait_ms });
+                        std.log.info("conn {d}: dmabuf buffer {d} (resource {d}): implicit fence not signalled within {d} ms; COMMIT sent without waiting longer (expected on slow first frames; logged once per conn)", .{ conn.conn_id, state.buffer_id, r.ref.resource, virtgpu_fence_wait_ms });
                     conn.fence_timeout_logged = true;
                 }
                 try conn.batch.virtgpuCommit(conn.relay.gpa, conn.conn_id, surface_id, serial, r.ref, rects);
@@ -1151,7 +1156,8 @@ fn finishCommit(conn: *AppConn, surface_id: u32) !void {
 /// How long a virtgpu COMMIT waits for its dmabuf's implicit write fences
 /// before going out anyway: long enough for a frame the host is still
 /// executing, short enough that a hung GPU only slows the app's relay
-/// thread (other apps and the link are unaffected).
+/// thread (other apps and the link are unaffected). Skipped altogether
+/// with `--no-fence-wait` (dmabuf.Config.fence_wait).
 const virtgpu_fence_wait_ms = 100;
 
 /// zwp_linux_buffer_params_v1.add(fd, plane_idx, offset, stride, mod_hi,

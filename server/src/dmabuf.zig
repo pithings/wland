@@ -107,6 +107,11 @@ pub const Config = struct {
     /// Mesa opens its render node from it): the render node the backend
     /// reads (readback) or names resources on (virtgpu).
     main_device: u64,
+    /// virtgpu: wait (bounded) for a dmabuf's implicit write fences before
+    /// each COMMIT (relay.zig `finishCommit`). `wlandr --no-fence-wait`
+    /// turns it off, for a device whose GPU requests reach the page in
+    /// order with the link anyway (unkernel: one channel for both).
+    fence_wait: bool = true,
 
     const kind_frame_len = stream.feature_header_len + stream.DmabufKindFeature.len;
     pub const max_features_len = kind_frame_len + stream.feature_header_len + 8 + 16 * 16;

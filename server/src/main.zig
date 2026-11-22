@@ -31,11 +31,15 @@ const usage_synopsis = if (build_options.http)
     \\                 serve the browser compositor (HTTP + /ws)
     \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE]
     \\                 serve one engine over a byte stream, no HTTP
+    \\       wlandr --version
+    \\                 print the version and this build's features (below), exit 0
     \\
     \\
 else
     \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE]
     \\                 serve one engine over a byte stream (this build has no HTTP server: --link is required)
+    \\       wlandr --version
+    \\                 print the version and this build's features (below), exit 0
     \\
     \\
 ;
@@ -72,6 +76,9 @@ const usage_link =
     \\                                    NODE must be a virtio_gpu node; it is held open only while
     \\                                    a GPU buffer exists
     \\                   Clients allocate on NODE (default: the first /dev/dri/renderD*).
+    \\  --no-fence-wait  with --dmabuf virtgpu: send each COMMIT without first waiting (up to 100 ms)
+    \\                   for the dmabuf's implicit write fences — for a device that delivers GPU work
+    \\                   to the page ahead of the link's COMMIT on its own (unkernel: one channel)
     \\  --xwayland MODE  X11 apps through xwayland-satellite, started with the first X client:
     \\
 ;
@@ -95,9 +102,28 @@ const usage_tail =
     \\wl_surface.frame callbacks are left to the engine (it fires them when it presents).
     \\When a reconnecting link drops, every app connected through it is disconnected (its
     \\compositor state lived in that engine); apps connecting meanwhile wait for the next one.
+    \\--version prints `wlandr VERSION`, then `features:` and space-separated tokens, one per thing
+    \\this build supports (tokens are only ever added): http, link:fd, link:unix, link:vsock,
+    \\buffers:MODE and dmabuf:MODE per mode above, no-fence-wait, selection_cache, xwayland.
     \\
 ;
 const usage = usage_synopsis ++ usage_display ++ usage_http ++ usage_link ++ usage_xwayland_default ++ usage_tail;
+
+/// `wlandr --version`, on stdout: `wlandr VERSION` (package.json's at build
+/// time, or -Dversion=), then `features:` and one space-separated token per
+/// capability of this binary, for guest scripts to test instead of parsing
+/// the usage text. A token, once listed, keeps its spelling; new ones are
+/// appended. The modes come from the enums parseArgs takes them from.
+const features = blk: {
+    var f: []const u8 = if (build_options.http) "http " else "";
+    f = f ++ "link:fd link:unix link:vsock";
+    for (@typeInfo(buffers.Kind).@"enum".fields) |m| f = f ++ " buffers:" ++ m.name;
+    for (@typeInfo(std.meta.Tag(dmabuf.Backend)).@"enum".fields) |m| f = f ++ " dmabuf:" ++ m.name;
+    // --no-fence-wait; STREAM FEATURE selection_cache (the clipboard
+    // bridge); --xwayland
+    break :blk f ++ " no-fence-wait selection_cache xwayland";
+};
+const version_text = "wlandr " ++ build_options.version ++ "\nfeatures: " ++ features ++ "\n";
 
 /// Where a no-HTTP relay finds its engine.
 const LinkSpec = union(enum) {
@@ -137,6 +163,8 @@ const Options = struct {
     buffer_mode: buffers.Kind = .copy,
     xwayland: ?[]const u8 = null,
     dmabuf: ?DmabufMode = null,
+    /// false: --no-fence-wait (virtgpu COMMITs skip the write-fence wait)
+    fence_wait: bool = true,
     http_address: Io.net.IpAddress = undefined,
 };
 
@@ -149,7 +177,8 @@ const DmabufMode = struct {
 };
 
 /// Parse and validate the arguments (argv0 already taken). `out.print`
-/// receives what a person should read; `--help` returns error.Help.
+/// receives what a person should read; `--help` returns error.Help,
+/// `--version` error.Version (main prints `version_text`).
 fn parseArgs(args: anytype, out: anytype) !Options {
     var o: Options = .{};
     while (args.next()) |arg| {
@@ -180,6 +209,10 @@ fn parseArgs(args: anytype, out: anytype) !Options {
                 return error.BadDmabufMode;
             };
             o.dmabuf = .{ .tag = tag, .spec = if (colon) |c| mode[c + 1 ..] else null, .text = mode };
+        } else if (std.mem.eql(u8, arg, "--no-fence-wait")) {
+            o.fence_wait = false;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            return error.Version;
         } else if (std.mem.eql(u8, arg, "--xwayland")) {
             o.xwayland = args.next() orelse return error.MissingXwaylandValue;
         } else if (std.mem.eql(u8, arg, "--buffers")) {
@@ -207,6 +240,11 @@ fn parseArgs(args: anytype, out: anytype) !Options {
         out.print("--dmabuf readback copies pixels into the stream: it needs --buffers copy\n\n" ++ usage, .{});
         return error.DmabufNeedsCopy;
     };
+    if (!o.fence_wait and (o.dmabuf == null or o.dmabuf.?.tag != .virtgpu)) {
+        // only virtgpu COMMITs wait; readback's read must see the GPU's writes
+        out.print("--no-fence-wait applies to --dmabuf virtgpu only\n\n" ++ usage, .{});
+        return error.FenceWaitNeedsVirtgpu;
+    }
     // after the loop: --port may follow --host
     o.http_address = Io.net.IpAddress.parse(o.host, o.port) catch {
         out.print("--host takes an IPv4 or IPv6 address (e.g. 127.0.0.1, 0.0.0.0, ::1), not {s}\n\n" ++ usage, .{o.host});
@@ -228,9 +266,10 @@ pub fn main(init: std.process.Init) !void {
     var args: std.process.Args.Iterator = .init(init.minimal.args);
     defer args.deinit();
     _ = args.next(); // argv0
-    const opts = parseArgs(&args, Stderr{}) catch |err| {
-        if (err == error.Help) return;
-        return err;
+    const opts = parseArgs(&args, Stderr{}) catch |err| switch (err) {
+        error.Help => return,
+        error.Version => return Io.File.stdout().writeStreamingAll(io, version_text),
+        else => return err,
     };
     const link_spec = opts.link_spec;
     const link_text = opts.link_text;
@@ -252,7 +291,8 @@ pub fn main(init: std.process.Init) !void {
             return err;
         } },
     };
-    const dmabuf_config: ?dmabuf.Config = if (opts.dmabuf) |mode| try openDmabuf(io, gpa, mode) else null;
+    var dmabuf_config: ?dmabuf.Config = if (opts.dmabuf) |mode| try openDmabuf(io, gpa, mode) else null;
+    if (dmabuf_config) |*cfg| cfg.fence_wait = opts.fence_wait;
 
     // wayland unix socket in $XDG_RUNTIME_DIR (fallback: /tmp/wland-run)
     const runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse blk: {
@@ -292,7 +332,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    if (dmabuf_config) |cfg| std.log.info("dmabuf: {t}, main device 0x{x}", .{ cfg.backend, cfg.main_device });
+    if (dmabuf_config) |cfg| std.log.info("dmabuf: {t}, main device 0x{x}{s}", .{ cfg.backend, cfg.main_device, if (cfg.fence_wait) "" else ", no fence wait" });
 
     // bind everything before announcing: lib/index.ts (the npm CLI) waits
     // for the "wayland socket:" line as its ready signal
@@ -588,6 +628,13 @@ test "arguments are validated whole, whatever their order, before anything is op
     try std.testing.expectError(error.BadBuffersMode, tryArgs(&.{ "--link", "fd:3", "--buffers", "gpu" }));
     try std.testing.expectError(error.MissingDmabufValue, tryArgs(&.{ "--link", "fd:3", "--dmabuf" }));
     try std.testing.expectError(error.Help, tryArgs(&.{"--help"}));
+    try std.testing.expectError(error.Version, tryArgs(&.{"--version"}));
+    try std.testing.expectError(error.Version, tryArgs(&.{ "--link", "fd:3", "--version", "--buffers", "gpu" })); // before the rest is checked
+    // --no-fence-wait: only where a fence wait happens (virtgpu COMMITs)
+    try std.testing.expectError(error.FenceWaitNeedsVirtgpu, tryArgs(&.{ "--link", "fd:3", "--no-fence-wait" }));
+    try std.testing.expectError(error.FenceWaitNeedsVirtgpu, tryArgs(&.{ "--no-fence-wait", "--link", "fd:3", "--dmabuf", "readback" }));
+    try std.testing.expect((try tryArgs(&.{ "--link", "fd:3", "--dmabuf", "virtgpu" })).fence_wait);
+    try std.testing.expect(!(try tryArgs(&.{ "--no-fence-wait", "--link", "fd:3", "--buffers", "kwshm", "--dmabuf", "virtgpu" })).fence_wait);
     const o = try tryArgs(&.{ "--link", "vsock:2:1023", "--buffers", "kwshm", "--dmabuf", "virtgpu:/dev/dri/renderD129" });
     try std.testing.expectEqual(buffers.Kind.kwshm, o.buffer_mode);
     try std.testing.expectEqual(std.meta.Tag(dmabuf.Backend).virtgpu, o.dmabuf.?.tag);
@@ -614,4 +661,28 @@ test "the usage text matches the build" {
     // the synopsis names every mode flag
     try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE]"));
     try std.testing.expect(!has("virtgpu:@fake")); // test-only, never offered
+    try std.testing.expect(has("wlandr --version"));
+    try std.testing.expect(has("--no-fence-wait  with --dmabuf virtgpu"));
+}
+
+test "--version: the build's version, then one token per feature of this build" {
+    var lines = std.mem.splitScalar(u8, version_text, '\n');
+    try std.testing.expectEqualStrings("wlandr " ++ build_options.version, lines.next().?);
+    try std.testing.expect(build_options.version.len > 0);
+    const line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.startsWith(u8, line, "features: "));
+    const has = struct {
+        fn f(l: []const u8, token: []const u8) bool {
+            var it = std.mem.splitScalar(u8, l["features: ".len..], ' ');
+            while (it.next()) |t| if (std.mem.eql(u8, t, token)) return true;
+            return false;
+        }
+    }.f;
+    try std.testing.expectEqual(build_options.http, has(line, "http"));
+    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland" }) |t|
+        try std.testing.expect(has(line, t));
+    try std.testing.expect(std.mem.indexOf(u8, line, "@fake") == null); // test-only, never offered
+    try std.testing.expect(std.mem.indexOf(u8, line, "  ") == null); // no empty token
 }

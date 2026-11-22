@@ -428,6 +428,10 @@ pub const Fake = struct {
     closed_with_handles: usize = 0,
     /// the next open fails (the node vanished)
     fail_open: bool = false,
+    /// also take a pipe as a "dmabuf" (RESOURCE_INFO size: `info_size`):
+    /// one whose implicit write fence never signals — poll(POLLIN) on an
+    /// empty pipe stays unreadable, as on a dmabuf the GPU still writes
+    accept_pipes: bool = false,
 
     const max = 64;
     const Object = struct { handle: u32 = 0, resource: u32 = 0, dev: u64 = 0, ino: u64 = 0, fd: i32 = -1, size: u64 = 0 };
@@ -501,7 +505,7 @@ pub const Fake = struct {
                 }
                 var stx: linux.Statx = undefined;
                 if (linux.errno(linux.statx(p.fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true, .SIZE = true }, &stx)) != .SUCCESS) return err(.BADF);
-                if (!linux.S.ISREG(stx.mode)) return err(.INVAL); // dma_buf_get: not a dmabuf
+                if (!linux.S.ISREG(stx.mode) and !(self.accept_pipes and linux.S.ISFIFO(stx.mode))) return err(.INVAL); // dma_buf_get: not a dmabuf
                 const dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
                 for (self.objects) |o| if (o.handle != 0 and o.dev == dev and o.ino == stx.ino) {
                     p.handle = o.handle;

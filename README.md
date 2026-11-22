@@ -540,6 +540,9 @@ wlandr [--port 8080] [--host ADDR] [--web-root DIR] [--dmabuf MODE]
 
 # Stream: connects to one engine, no HTTP
 wlandr --link SPEC [--buffers MODE] [--dmabuf MODE]
+
+# Version and features, on stdout (exit 0)
+wlandr --version
 ```
 
 `--link` can be:
@@ -558,7 +561,27 @@ whose renderer holds it (the `gpu` option of `createWland`); NODE must be a
 virtio_gpu render node, held open only while a GPU buffer exists. A page
 without a `gpu` option doesn't offer GPU buffers to apps on such a relay,
 so they render in software instead of showing blank windows. Both are off
-by default, and experimental.
+by default, and experimental. Before each virtgpu frame the relay waits (up
+to 100 ms) for the GPU to finish writing the buffer; `--no-fence-wait` skips
+that wait, for a device that already delivers the GPU work to the page
+before the frame (unkernel). It is refused without `--dmabuf virtgpu`.
+
+`wlandr --version` prints two lines:
+
+```
+wlandr 0.1.0
+features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland
+```
+
+The first is the package version the binary was built from. The second
+has one space-separated token per thing this build supports: `http` (the
+HTTP server; absent from the `--link`-only build), each `--link` kind,
+each `--buffers` and `--dmabuf` mode, `no-fence-wait`, `selection_cache`
+(the page clipboard bridge) and `xwayland`. A token keeps its spelling once
+listed and new ones are only added, so a script can test for a whole
+token, e.g. `case " $(wlandr --version | sed -n 's/^features: //p') " in
+*" dmabuf:virtgpu "*)`. Releases up to v0.1.0-261122-f36330a have no
+`--version`: they print the usage and exit with status 1.
 
 A relay for a VM guest, with no HTTP: each
 [GitHub release](https://github.com/pithings/wland/releases) after

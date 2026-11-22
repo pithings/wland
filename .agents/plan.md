@@ -112,7 +112,12 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
     `finishCommit` on the conn's one serial space and Pending/ACK ledger
     (shared with the handle backends); the conn gets the ACK path under
     copy too. Before each COMMIT a bounded (100 ms) poll on the dmabuf
-    waits for its implicit write fences (STREAM.md "wlandr's emitter").
+    waits for its implicit write fences (STREAM.md "wlandr's emitter");
+    `--no-fence-wait` skips it (unkernel's ask, 2026-11-22: its GPU
+    requests and vsock share one channel to the page, and each poll is a
+    worker⇄page round trip per frame). `wlandr --version` prints the
+    package version and a `features:` token line (unkernel's other ask:
+    its guest script grepped `--help` for `virtgpu[`).
     The core now sends v1/v2 binders a `format` per MOD_INVALID format.
     Checked through the ioctl seam's stand-in (`virtgpu.Fake`: memfds as
     dmabufs, one handle per file, resource ids, a host-side `resolve`):
@@ -413,7 +418,7 @@ Any of them is fair game to lift.
   feedback; a dmabuf the backend can't import is accepted but never shown,
   released per commit — not a `failed` event; never run against a real
   GPU. No explicit sync (drm-syncobj): readback waits ≤ 500 ms, virtgpu
-  ≤ 100 ms for implicit fences. X11 apps need `xwayland-satellite` + Xwayland
+  ≤ 100 ms (none with `--no-fence-wait`) for implicit fences. X11 apps need `xwayland-satellite` + Xwayland
   installed (software rendering, no maximize, fullscreen untested; see the
   satellite entry above); no in-tree Xwayland.
 - dnd works between wland clients only, not to/from the host page.

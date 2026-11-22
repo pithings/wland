@@ -19,8 +19,14 @@ pub fn build(b: *std.Build) void {
     // relay executable (wlandr). -Dhttp=false drops the HTTP/WebSocket server
     // (and std.http) for a smaller --link-only build — the shape a guest wants.
     const http = b.option(bool, "http", "Include the HTTP/WebSocket server (default true; false = --link-only)") orelse true;
+    // `wlandr --version` prints this: package.json's version unless
+    // -Dversion= overrides it. The release workflow sets package.json's
+    // (`npm pkg set version=...`) before building, so release binaries carry
+    // the published version.
+    const version = b.option([]const u8, "version", "Version wlandr --version prints (default: package.json's)") orelse packageVersion(b);
     const server_options = b.addOptions();
     server_options.addOption(bool, "http", http);
+    server_options.addOption([]const u8, "version", version);
     const options_mod = server_options.createModule();
 
     // core: shared wayland implementation, native flavor (server + tests)
@@ -57,6 +63,7 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "Build wlandr (full + --link-only) for linux x64 + arm64 (zig-out/release/)");
     const link_options = b.addOptions();
     link_options.addOption(bool, "http", false);
+    link_options.addOption([]const u8, "version", version);
     const link_options_mod = link_options.createModule();
     const releases = [_]struct { arch: std.Target.Cpu.Arch, node: []const u8 }{
         .{ .arch = .x86_64, .node = "x64" },
@@ -125,6 +132,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_server_tests.step);
+}
+
+/// package.json's "version" (the build fails if it can't be read).
+fn packageVersion(b: *std.Build) []const u8 {
+    const text = b.build_root.handle.readFileAlloc(b.graph.io, "package.json", b.allocator, .limited(1 << 20)) catch |err|
+        std.debug.panic("cannot read package.json for the version: {t} (pass -Dversion=)", .{err});
+    const parsed = std.json.parseFromSliceLeaky(struct { version: []const u8 }, b.allocator, text, .{ .ignore_unknown_fields = true }) catch |err|
+        std.debug.panic("package.json has no string \"version\": {t} (pass -Dversion=)", .{err});
+    return parsed.version;
 }
 
 fn serverModule(

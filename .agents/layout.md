@@ -15,8 +15,9 @@ Where things live and which file owns what. Details are in the code.
 ## `server/src/` — the relay
 
 - `main.zig` CLI (`--port/--host/--web-root` = HTTP+WS; `--link fd:|unix:|vsock:`;
-  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `-Dhttp=false`
-  = a --link-only build).
+  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `--no-fence-wait`;
+  `--version` (version from package.json via `build.zig`, + a features line);
+  `-Dhttp=false` = a --link-only build).
 - `relay.zig` — app sockets, fd interception, pools, attach/commit tracking,
   the release ledger (`settleRelease`), ACK hand-over, frame-callback
   interception, pipe tokens, SRVOBJ, presentation timestamps (PRESENTED),

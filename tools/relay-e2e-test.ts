@@ -37,7 +37,8 @@
 //     --dmabuf virtgpu:@fake: a GPU client (the `dmabuf` fixture) beside a
 //     wl_shm one on the same link — kind-virtgpu COMMITs resolved by the
 //     engine's gpu source next to procfd handles, one ACK per COMMIT, the
-//     GPU client kept drawing (releases after ACKs).
+//     GPU client kept drawing (releases after ACKs). With --no-fence-wait
+//     too (unkernel's shape) when the relay's --version lists it.
 //
 // The apps are test/support/apps.ts's: wland-fixture modes standing in for
 // weston-simple-shm, foot (`term`), wl-clipboard, wayland-info and
@@ -726,7 +727,10 @@ async function main() {
   await until(() => s.closes > closes3, 3000, 'the engine to see the copy relay go');
   s.errors.length = 0;
   s.async = false; // ACK count == COMMIT count per message again
-  startRelay('procfd', ['--dmabuf', 'virtgpu:@fake']);
+  // unkernel runs it with --no-fence-wait; a relay from before it lacks the token
+  const version = spawnSync(RELAY[0], [...RELAY.slice(1), '--version'], { encoding: 'utf8' });
+  const noFenceWait = version.status === 0 && / no-fence-wait( |$)/m.test(version.stdout);
+  startRelay('procfd', ['--dmabuf', 'virtgpu:@fake', ...(noFenceWait ? ['--no-fence-wait'] : [])]);
   await until(() => s.opens > opens3, 5000, 'the virtgpu relay to connect');
   const g0 = s.gpuRefs.length, gk0 = s.commitFrames, ga0 = s.acks, gt0 = s.tokens;
   const shmApp = app('shm');

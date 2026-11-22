@@ -1800,6 +1800,59 @@ test "virtgpu: what it can't name (interlaced, a failed import) is released unsh
     try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
 }
 
+/// `n` commits of one virtgpu buffer whose write fence never signals (a
+/// pipe stands in for its dmabuf: poll never readable), each settled
+/// before the next; the ns they took.
+fn commitsOnBusyDmabuf(fence_wait: bool, n: usize) !u64 {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    gpu.fake.accept_pipes = true;
+    gpu.fake.info_size = 4096;
+    var cfg = gpu.config();
+    cfg.fence_wait = fence_wait;
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&pipe_fds, .{ .CLOEXEC = true }));
+    defer for (pipe_fds) |fd| {
+        _ = linux.close(fd);
+    };
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = cfg });
+    defer loop.stop();
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    const buffer = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, pipe_fds[0], 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+    try loop.roundtrip(c);
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.live());
+    try attach(c, w.surface, buffer);
+
+    const start = monoNs();
+    for (0..n) |_| {
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface);
+        try loop.settle(c);
+    }
+    const took = monoNs() - start;
+    try std.testing.expectEqual(n, loop.engine.gpu_commits.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+    return took;
+}
+
+fn monoNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "virtgpu: each COMMIT waits (bounded, 100 ms) for the dmabuf's write fence; --no-fence-wait sends it at once" {
+    // the default: the fence never signals, so each COMMIT goes out after
+    // the full bound (the timeout's once-per-conn line is info, not shown)
+    try std.testing.expect(try commitsOnBusyDmabuf(true, 1) >= 100 * std.time.ns_per_ms);
+    // fence_wait off: 20 COMMITs in well under the 2 s their waits would take
+    try std.testing.expect(try commitsOnBusyDmabuf(false, 20) < 1000 * std.time.ns_per_ms);
+}
+
 test "virtgpu: conn close with COMMITs in flight drops every GEM reference; late ACKs ignored; the next app is served" {
     var gpu: Gpu = undefined;
     gpu.init();
