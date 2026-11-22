@@ -51,16 +51,23 @@ pub const Relay = struct {
     gpa: std.mem.Allocator,
     /// Buffer backend every app conn gets (fixed for the relay's life).
     backend: buffers.Backend = .copy,
-    /// linux-dmabuf (fixed for the relay's life): null = the relay takes no
-    /// dmabufs, the compositor never advertises zwp_linux_dmabuf_v1 (it
-    /// does when the relay's FEATURE frames say so, first on every link —
-    /// with virtgpu only if its embedder can draw GPU resources).
+    /// linux-dmabuf: null = the relay takes no dmabufs, the compositor never
+    /// advertises zwp_linux_dmabuf_v1 (it does when the relay's FEATURE
+    /// frames say so, first on every link — with virtgpu only if its
+    /// embedder can draw GPU resources). Fixed for the relay's life, except
+    /// that an on-demand relay whose render node did not resolve at startup
+    /// sets it once, later: on the dial thread, under `mutex`, while no link
+    /// is attached (main.zig `serveStreamLink`) — so app threads read it only
+    /// once their link is attached (serveApp), never before.
     /// readback needs `backend == .copy` (main.zig checks).
     dmabuf: ?dmabuf.Config = null,
     /// Handle backends: handle ids are never reused within a run (≥ 1).
     next_handle_id: std.atomic.Value(u32) = .init(1),
+    /// `--link-on-demand` (main.zig): the link is dialed for waiting apps.
+    on_demand: ?OnDemand = null,
     mutex: Io.Mutex = .init,
-    /// Broadcast when a link attaches (apps waiting for an engine wake up).
+    /// Broadcast when a link attaches (apps waiting for an engine wake up),
+    /// and when an on-demand dial failed (they are refused).
     link_attached: Io.Condition = .init,
     /// Broadcast when the attached link has detached (a takeover waits).
     link_detached: Io.Condition = .init,
@@ -133,6 +140,70 @@ pub const Relay = struct {
         if (last) app.destroy(relay.io, relay.gpa);
     }
 };
+
+/// `--link-on-demand`: no link is dialed until an app needs one. An app
+/// that finds no link attached counts itself in `waiting` and waits for
+/// the dial that wakes (`awaitDemand`, on main.zig's dial thread): the link
+/// attaching takes it on as usual; the dial failing (`dialFailed`; the dial
+/// is bounded, so a hung transport fails too) refuses every app waiting —
+/// closed at once, so it fails fast instead of hanging. All under
+/// `Relay.mutex`.
+pub const OnDemand = struct {
+    /// The --link SPEC as given (the refusal line names it).
+    link_text: []const u8,
+    /// Apps waiting for an engine. Zeroed by a failed dial (which refuses
+    /// them all); an app taken on by an attaching link counts itself out.
+    waiting: u32 = 0,
+    /// Failed dials so far: an app that sees it move was refused.
+    failures: u32 = 0,
+    /// What the latest failed dial failed with.
+    last_error: anyerror = error.ConnectFailed,
+    /// Signalled when an app starts waiting (the dial thread sleeps on it).
+    demand: Io.Condition = .init,
+};
+
+/// The stable prefix of the line logged (info) for each app an on-demand
+/// relay refuses because no engine could be reached; documented for
+/// embedders to match (README, usage text). Followed by the --link SPEC and
+/// the reason in parentheses.
+pub const refused_line = "wayland client refused: no engine on link ";
+
+/// On demand, relay.mutex held: wait for the dial this app asks for (or
+/// one already under way). True: a link is attached; false: the dial
+/// failed and this app is refused.
+fn awaitDial(relay: *Relay, od: *OnDemand) bool {
+    const failures = od.failures;
+    od.waiting += 1;
+    od.demand.signal(relay.io);
+    while (relay.link == null) {
+        if (od.failures != failures) return false; // dialFailed counted us out
+        relay.link_attached.waitUncancelable(relay.io, &relay.mutex);
+    }
+    // an app counted out by a failed dial that a later dial's link takes
+    // on anyway is not in `waiting` any more
+    if (od.failures == failures) od.waiting -= 1;
+    return true;
+}
+
+/// On demand, the dial thread: block until some app waits for an engine.
+pub fn awaitDemand(relay: *Relay) void {
+    const od = &relay.on_demand.?;
+    relay.mutex.lockUncancelable(relay.io);
+    defer relay.mutex.unlock(relay.io);
+    while (od.waiting == 0) od.demand.waitUncancelable(relay.io, &relay.mutex);
+}
+
+/// On demand, the dial thread: the dial `awaitDemand` woke for failed —
+/// every app waiting is refused (and the next app dials again).
+pub fn dialFailed(relay: *Relay, err: anyerror) void {
+    const od = &relay.on_demand.?;
+    relay.mutex.lockUncancelable(relay.io);
+    od.failures +%= 1;
+    od.waiting = 0;
+    od.last_error = err;
+    relay.mutex.unlock(relay.io);
+    relay.link_attached.broadcast(relay.io);
+}
 
 /// Relay.own_cache: one generation's payloads, by the engine's blob index.
 const OwnCache = struct {
@@ -566,23 +637,34 @@ pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
         return;
     };
     app.* = .{ .stream = app_stream };
+
+    relay.mutex.lockUncancelable(io);
+    if (relay.on_demand) |*od| {
+        if (relay.link == null and !awaitDial(relay, od)) {
+            const reason = od.last_error;
+            relay.mutex.unlock(io);
+            std.log.info(refused_line ++ "{s} ({t})", .{ od.link_text, reason });
+            app.destroy(io, gpa); // the app reads EOF: its first round trip fails
+            return;
+        }
+    } else while (relay.link == null) {
+        std.log.info("app connected, waiting for an engine...", .{});
+        relay.link_attached.waitUncancelable(io, &relay.mutex);
+    }
+    const link = relay.link.?;
+    // relay.dmabuf is read only now, with a link attached: an on-demand
+    // dial may have set it (see its field)
     const commits = relay.backend != .copy or if (relay.dmabuf) |cfg| cfg.backend.sendsCommits() else false;
     if (commits) {
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         if (linux.errno(rc) != .SUCCESS) {
+            relay.mutex.unlock(io);
             std.log.err("eventfd failed: {t}", .{linux.errno(rc)});
             app.destroy(io, gpa);
             return;
         }
         app.ack_fd = @intCast(rc);
     }
-
-    relay.mutex.lockUncancelable(io);
-    while (relay.link == null) {
-        std.log.info("app connected, waiting for an engine...", .{});
-        relay.link_attached.waitUncancelable(io, &relay.mutex);
-    }
-    const link = relay.link.?;
     const conn_id = relay.next_conn_id;
     // conn 0 is reserved (STREAM.md CONN_OPEN): never handed out, even
     // after 2^32 conns

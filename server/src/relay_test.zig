@@ -517,6 +517,78 @@ test "an app waits for an engine; a new link takes over and drops the old link's
     app2_thread.join();
 }
 
+test "on demand: an app asks for the dial; a failed dial refuses every app waiting for it, the next app asks again; a link takes the apps waiting" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var relay: relay_mod.Relay = .{ .io = io, .gpa = gpa, .on_demand = .{ .link_text = "unix:/test" } };
+    defer relay.deinit();
+    var rec: std.ArrayList(u8) = .empty;
+    defer rec.deinit(gpa);
+    var byte: [1]u8 = undefined;
+
+    // the first app wakes the dial thread
+    const app1 = try harness.socketpair();
+    defer _ = linux.close(app1[1]);
+    const app1_thread = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &relay, appStream(app1[0]) });
+    relay_mod.awaitDemand(&relay);
+    // a second app arrives while that dial is under way: it waits on it
+    const app2 = try harness.socketpair();
+    defer _ = linux.close(app2[1]);
+    const app2_thread = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &relay, appStream(app2[0]) });
+    while (true) { // (counted under the mutex)
+        relay.mutex.lockUncancelable(io);
+        const n = relay.on_demand.?.waiting;
+        relay.mutex.unlock(io);
+        if (n == 2) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // the dial fails: both are closed at once, and nobody waits any more
+    relay_mod.dialFailed(&relay, error.ConnectionRefused);
+    app1_thread.join();
+    app2_thread.join();
+    for ([_]i32{ app1[1], app2[1] }) |fd| {
+        try harness.waitReadable(fd);
+        try std.testing.expectEqual(@as(usize, 0), linux.read(fd, &byte, 1)); // hung up
+    }
+    try std.testing.expectEqual(@as(u32, 0), relay.on_demand.?.waiting);
+    try std.testing.expectEqual(@as(u32, 1), relay.on_demand.?.failures);
+
+    // the next app asks again; this dial connects: the link takes it on
+    const app3 = try harness.socketpair();
+    defer _ = linux.close(app3[1]);
+    const app3_thread = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &relay, appStream(app3[0]) });
+    relay_mod.awaitDemand(&relay);
+    const l = try harness.socketpair();
+    defer _ = linux.close(l[0]);
+    defer _ = linux.close(l[1]);
+    var link: StreamLink = undefined;
+    link.init(io, l[0], .engine);
+    const link_thread = try std.Thread.spawn(.{}, relay_mod.serveLink, .{ &relay, &link.link });
+    try harness.readRecord(gpa, l[1], &rec);
+    try std.testing.expectEqual(stream.FrameType.feature, std.meta.activeTag(try stream.parse(rec.items)));
+    try harness.readRecord(gpa, l[1], &rec);
+    try std.testing.expectEqual(@as(u32, 1), (try stream.parse(rec.items)).conn_open); // conn ids start at 1: refused apps took none
+    // an app connecting while the link is up needs no dial
+    const app4 = try harness.socketpair();
+    defer _ = linux.close(app4[1]);
+    const app4_thread = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &relay, appStream(app4[0]) });
+    try harness.readRecord(gpa, l[1], &rec);
+    try std.testing.expectEqual(@as(u32, 2), (try stream.parse(rec.items)).conn_open);
+    relay.mutex.lockUncancelable(io);
+    try std.testing.expectEqual(@as(u32, 0), relay.on_demand.?.waiting); // app3 counted itself out
+    relay.mutex.unlock(io);
+
+    // the link drops: its apps are dropped, nobody waits (the dial thread idles)
+    link.link.kick();
+    link_thread.join();
+    app3_thread.join();
+    app4_thread.join();
+    try std.testing.expectEqual(@as(u32, 0), relay.on_demand.?.waiting);
+    try std.testing.expectEqual(@as(u32, 1), relay.on_demand.?.failures);
+}
+
 fn appStream(fd: i32) std.Io.net.Stream {
     return .{ .socket = .{ .handle = fd, .address = undefined } };
 }

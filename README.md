@@ -539,7 +539,7 @@ It runs in two shapes:
 wlandr [--port 8080] [--host ADDR] [--web-root DIR] [--dmabuf MODE]
 
 # Stream: connects to one engine, no HTTP
-wlandr --link SPEC [--buffers MODE] [--dmabuf MODE]
+wlandr --link SPEC [--buffers MODE] [--dmabuf MODE] [--link-on-demand [--link-timeout MS]]
 
 # Version and features, on stdout (exit 0)
 wlandr --version
@@ -550,6 +550,33 @@ wlandr --version
 - `fd:N` — an inherited, connected socket. The relay exits when it closes.
 - `unix:PATH` — a unix socket. Reconnects when it drops.
 - `vsock:CID:PORT` — AF_VSOCK, e.g. from a VM guest to its host. Reconnects.
+
+`--link-on-demand` (with `unix:` or `vsock:`; refused otherwise) makes the
+relay dial its link only when an app needs it, so it can start at boot,
+before anything listens on the other end. At startup it binds the Wayland
+socket and logs its usual `wayland socket:` line, but dials nothing. The
+first app to connect starts a dial; apps connecting meanwhile wait for that
+dial too, and are served once it connects, as usual. If the dial fails
+(nothing listens, no vsock transport) or hasn't connected within
+`--link-timeout` milliseconds (default 5000), every app waiting for it is
+closed at once — its first round trip fails, as with a compositor that
+hangs up — and the relay logs one line per app:
+
+```
+wayland client refused: no engine on link vsock:2:1023 (ConnectionRefused)
+```
+
+That line's text up to the link is stable, for an embedder to match; the
+reason in parentheses is the dial's error (`ConnectionRefused`,
+`NoVsockTransport`, `ConnectionTimedOut`, `FileNotFound` for a missing unix
+socket, …). The relay stays up, and the next app dials again. A link that
+connected stays up while apps come and go: the other end decides when it
+ends (a page that wants to unload its compositor closes the link). When it
+closes — a reload, a suspend, a vsock reset — its apps are closed as usual,
+and the relay dials again only when an app connects (at once if one
+already waits). With `--dmabuf`, a render node that doesn't exist yet at
+startup is not fatal in this mode (a warning): it is looked up again before
+each dial, and links dialed once it is found offer GPU buffers.
 
 `--buffers` can be `copy` (default), `procfd` (same machine, for debugging)
 or `kwshm` (VM guest ⇄ host page).
@@ -570,14 +597,14 @@ before the frame (unkernel). It is refused without `--dmabuf virtgpu`.
 
 ```
 wlandr 0.1.0
-features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland
+features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland link-on-demand
 ```
 
 The first is the package version the binary was built from. The second
 has one space-separated token per thing this build supports: `http` (the
 HTTP server; absent from the `--link`-only build), each `--link` kind,
 each `--buffers` and `--dmabuf` mode, `no-fence-wait`, `selection_cache`
-(the page clipboard bridge) and `xwayland`. A token keeps its spelling once
+(the page clipboard bridge), `xwayland` and `link-on-demand`. A token keeps its spelling once
 listed and new ones are only added, so a script can test for a whole
 token, e.g. `case " $(wlandr --version | sed -n 's/^features: //p') " in
 *" dmabuf:virtgpu "*)`. Releases up to v0.1.0-261122-f36330a have no
@@ -597,6 +624,7 @@ same `--link` flags too, but they are twice the size.
 tar -xzf wlandr-link-linux-arm64.tar.gz      # → ./wlandr
 ./wlandr --link vsock:2:PORT --buffers kwshm                   # shm apps, by handle
 ./wlandr --link vsock:2:PORT --buffers kwshm --dmabuf virtgpu  # + GPU apps, by resource
+./wlandr --link vsock:2:PORT --buffers kwshm --link-on-demand   # started at boot: dials for the first app
 ```
 
 `zig build release` builds all four into `zig-out/release/`.

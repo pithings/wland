@@ -117,7 +117,11 @@ Behavioural differences from the WS transport:
 - One stream link at a time, like WS; a `unix:` or `vsock:` link that
   closes is reconnected (apps that connect meanwhile wait), an `fd:` link
   that closes ends the relay. Either way the closed link's app connections
-  are dropped (see Rules). The engine side treats every new connection as a
+  are dropped (see Rules). With `wlandr --link-on-demand` a `unix:`/`vsock:`
+  link is instead dialed only while an app waits for an engine — first at
+  the first app, after a close at the next app — and a dial that fails
+  closes the apps waiting for it rather than retrying. Nothing changes on
+  the link itself: an engine sees the same connections, just later. The engine side treats every new connection as a
   new link: a fresh compositor, no apps (the reference engine ends the old
   link's conns itself when it closes, as if each had a CONN_CLOSE).
 
@@ -1043,6 +1047,8 @@ a variable one).
   their compositor state lived in that engine.
 - App connections made while no engine is attached wait (kernel-buffered)
   until one attaches; the server then sends CONN_OPEN and starts relaying.
+  (wlandr `--link-on-demand`: they wait for the dial they start, and are
+  closed if it fails.)
 - conn_ids and handle_ids are never reused within a server run.
 - FEATURE frames come first on a link (dmabuf_kind before linux_dmabuf);
   the rest of a link never changes what the relay can do.
