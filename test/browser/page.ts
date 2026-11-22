@@ -20,6 +20,7 @@
 //                        are wland's own grab's), a resize changes nothing
 //   ?altdrag=0           shortcuts { drag: false } (Alt+F9/F10/F11 stay)
 //   ?autofocus=0         createWland's autoFocus: false (the embedder phase)
+//   ?display=0           createWland's manageDisplay: false (the embedder phase)
 import { createWland, type CursorEvent, type InteractiveEvent, type PointerPress, type Wland } from '../../lib/client.ts';
 
 /** One request the ?embedder=1 window manager took: `moves` counts its
@@ -79,6 +80,7 @@ try {
     interactive: query.get('embedder') === '1' ? interactive : undefined,
     shortcuts: query.get('altdrag') === '0' ? { drag: false } : true,
     autoFocus: query.get('autofocus') !== '0',
+    manageDisplay: query.get('display') !== '0',
     onEvent(ev) {
       switch (ev.type) {
         case 'log': window.wlandLog.push(ev.line); break;

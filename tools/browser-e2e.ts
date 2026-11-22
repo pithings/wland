@@ -41,18 +41,23 @@
 //                browser's pointer → wm dnd → wl_data_device) arrives
 //   gtk          nautilus: popup opens below its button, outside click
 //                dismisses, navigation; the fixture's right-click menu
-//                lands at the pointer (positioners from the window geometry)
+//                lands at the pointer (positioners from the window geometry);
+//                Alt+dragged to the desktop's right edge, its right-click
+//                menu stays inside the desktop (the wm told the core where
+//                the window is: constraint adjustment)
 //   csd          nautilus: headerbar drag moves, maximize and restore buttons
 //   states       ?browserfs=1, spawns foot: Alt+F11 fills the desktop and
 //                takes the browser's fullscreen, leaving that ends foot's;
 //                Alt+F9 hides it, windows()[0].raise() restores it focused
-//   embedder     reloads with ?embedder=1, ?altdrag=0, ?autofocus=0, spawns
+//   embedder     reloads with ?embedder=1, ?altdrag=0, ?display=0, ?autofocus=0, spawns
 //                terms itself: a blur mid-drag ends wland's own grab and an
 //                embedder's input.grab (the next drag works); the embedder's
 //                `interactive` takes a move, a resize and an Alt+drag with
 //                their press (no grab of wland's); Alt+drag off leaves the
 //                press to the app and Alt+F10 on; autoFocus off focuses
-//                nothing by itself, input.focus() does
+//                nothing by itself, input.focus() does; minimized hides the
+//                element, with ?display=0 (manageDisplay off) the view
+//                never writes its display
 //   retina      dpr 2 → 2x buffers shown at logical size (spawns foot)
 //   takeover     the first tab after a second connected: notice, no reload
 //   webgl        forced GL present path, software GL at dpr 1 (spawns foot)
@@ -867,6 +872,54 @@ const phases: Record<string, () => Promise<void>> = {
       if (await popupVisible()) fail("a click on a menu item left the menu open");
     }
 
+    // a menu at the desktop's right edge: wland's window manager tells the
+    // core where the window is (here: after an Alt+drag moved it there), so
+    // the menu is constrained back inside the output instead of running off
+    {
+      const desk = await evalJs(`(() => { const r = document.getElementById('desktop').getBoundingClientRect(); return { l: r.left, t: r.top, r: r.right, b: r.bottom }; })()`);
+      const box = async () => evalJs(`(() => {
+        window.scrollTo(0, 0);
+        const r = document.querySelector('[data-wland="${mainKey}"]').closest('.wland-window').getBoundingClientRect();
+        return { l: r.left, t: r.top, r: r.right, b: r.bottom };
+      })()`);
+      const altDrag = async (from: [number, number], dx: number, dy: number) => {
+        await mouse("mouseMoved", from[0], from[1]);
+        await mouse("mousePressed", from[0], from[1], { button: "left", buttons: 1, clickCount: 1, modifiers: 1 });
+        for (let i = 1; i <= 8; i++) {
+          await mouse("mouseMoved", from[0] + (dx * i) / 8, from[1] + (dy * i) / 8, { button: "left", buttons: 1, modifiers: 1 });
+          await sleep(30);
+        }
+        await mouse("mouseReleased", from[0] + dx, from[1] + dy, { button: "left", buttons: 0, clickCount: 1, modifiers: 1 });
+        await sleep(300);
+      };
+      const b0 = await box();
+      // its box's left 450 px from the desktop's right edge (the window
+      // hangs past it); a right-click 120 px from that edge
+      const dx = Math.round(desk.r - 450 - b0.l);
+      const grip: [number, number] = [Math.round(b0.l + 400), Math.round(b0.t + 300)];
+      await altDrag(grip, dx, 0);
+      const b1 = await box();
+      if (Math.abs(b1.l - (b0.l + dx)) > 1) fail(`Alt+drag did not move the window: ${b0.l} → ${b1.l}`);
+      const rx = Math.round(desk.r - 120), ry = Math.round(b1.t + 300);
+      await mouse("mouseMoved", rx, ry);
+      await mouse("mousePressed", rx, ry, { button: "right", buttons: 2, clickCount: 1 });
+      await mouse("mouseReleased", rx, ry, { button: "right", buttons: 0, clickCount: 1 });
+      let q = null;
+      for (let i = 0; i < 25 && !q; i++) { await sleep(200); q = await popupRect(); }
+      if (!q) fail("the right-click menu near the desktop's edge did not open");
+      await sleep(500);
+      q = (await popupRect())!;
+      // (a menu's shadow may hang past its geometry: 30 px of slack)
+      console.log(`menu near the edge: surface ${q.l},${q.t} ${q.w}x${q.h}, desktop right ${desk.r}, click at ${rx}`);
+      if (q.l + q.w > desk.r + 30 || q.l >= rx) fail(`the menu runs off the desktop: its surface spans ${q.l}..${q.l + q.w}, the desktop ends at ${desk.r}`);
+      if (!realApps && Math.abs(q.l + 6 + 200 - desk.r) > 1) fail(`the fixture's menu did not slide flush with the edge: geometry right ${q.l + 6 + 200}`);
+      await plainClick(Math.round(b1.l + 200), Math.round(b1.t + 300)); // dismiss it
+      await sleep(1000);
+      if (await popupVisible()) fail("the edge menu did not dismiss");
+      await altDrag([Math.round(b1.l + 400), Math.round(b1.t + 300)], -dx, 0); // back where it was
+      console.log("edge menu ok: constrained inside the desktop after the window was moved to its edge");
+    }
+
     // the first icon, ~(307,145) in nautilus's default view (run-poc opens
     // a fixture directory whose only entry is a folder)
     cr = await origin();
@@ -1264,6 +1317,42 @@ const phases: Record<string, () => Promise<void>> = {
       await call("Input.dispatchKeyEvent", { type: "keyUp", key: "F10", code: "F10", windowsVirtualKeyCode: 121, modifiers: 1 });
       await until((v) => v.maximized, "Alt+F10 still maximizes with Alt+drag off", s.key);
       console.log("altdrag=0 ok: the Alt+press went to the app, the window stayed; Alt+F10 maximized it");
+
+      // --- manageDisplay: the view hides a minimized window by default; with
+      // ?display=0 it leaves the element's display to the page --------------
+      const display = (key: string): Promise<any> => evalJs(`(() => {
+        const wl = window.wland, w = wl.view.windows().find((w) => w.key === ${JSON.stringify(key)});
+        return w && { minimized: w.minimized, display: w.element.style.display };
+      })()`);
+      const minimize = (key: string, on: boolean) => evalJs(`(() => {
+        const e = window.wland.windows().find((e) => e.key === ${JSON.stringify(key)});
+        ${on} ? e.minimize() : e.restore();
+      })()`);
+      const untilDisplay = async (key: string, ok: (d: any) => boolean, what: string) => {
+        let d = await display(key);
+        for (let i = 0; i < 25 && !(d && ok(d)); i++) { await sleep(200); d = await display(key); }
+        if (!(d && ok(d))) fail(`${what}: ${JSON.stringify(d)}`);
+        return d;
+      };
+      await minimize(s3.key, true);
+      await untilDisplay(s3.key, (d) => d.minimized && d.display === "none", "minimized: the view hides the element (default)");
+      await minimize(s3.key, false);
+      await untilDisplay(s3.key, (d) => !d.minimized && d.display === "", "restored: shown again");
+      await load("?display=0");
+      const s4 = await spawnTerm("a term mapped (display=0)");
+      await evalJs(`window.wland.view.window(${s4.conn}, ${s4.surface}).element.style.display = 'block'`); // the page's own
+      await minimize(s4.key, true);
+      await untilDisplay(s4.key, (d) => d.minimized, "minimized (display=0)");
+      await sleep(300);
+      let d4 = await display(s4.key);
+      if (d4.display !== "block") fail(`the view wrote display with manageDisplay off: "${d4.display}"`);
+      await evalJs(`window.wland.view.window(${s4.conn}, ${s4.surface}).element.style.display = 'none'`);
+      await minimize(s4.key, false);
+      await untilDisplay(s4.key, (d) => !d.minimized, "restored (display=0)");
+      await sleep(300);
+      d4 = await display(s4.key);
+      if (d4.display !== "none") fail(`the view wrote display at the restore with manageDisplay off: "${d4.display}"`);
+      console.log("manageDisplay ok: minimized hides the element by default; with display=0 the view never writes it");
 
       // --- ?autofocus=0: focus only when told ------------------------------
       await load("?autofocus=0");

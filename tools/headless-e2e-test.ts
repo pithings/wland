@@ -804,6 +804,14 @@ async function nautilus() {
     check(item === 'Paste', `a click on the second item chose "${item}" and closed the menu`);
   }
 
+  // a context menu near the output's bottom-right corner, the window
+  // hanging past it: the scene told the core where the window is, so the
+  // menu is constrained back inside the output (the fixture's positioner
+  // slides, as GTK's may also flip and resize) instead of running off it
+  if (configures.length) await edgeMenu(win, app, popupList, configured);
+  else console.log('  skipped the edge menu: this relay predates window positions');
+  win = hl.windows()[0]!;
+
   // the header bar's minimize button: right of the path bar, left of
   // maximize and close (box-relative, the floating layout)
   await settle();
@@ -863,6 +871,39 @@ async function nautilus() {
     await stop(dnd.p);
     await noWindows();
   }
+}
+
+/** nautilus's right-click menu with its window moved so the click lands
+ *  150 px from the output's right and 40 px from its bottom edge: an
+ *  unconstrained 200x160 menu would run off both. Back where it was after. */
+async function edgeMenu(win: HeadlessWindow, app: { text(): string }, popupList: () => ReturnType<Headless['surfaces']>,
+  configured: (n: number) => readonly [number, number] | null) {
+  const out = hl.output, x0 = win.x, y0 = win.y;
+  const n0 = [...app.text().matchAll(/POPUP at/g)].length;
+  hl.move(win, out.width - 700, out.height - 500);
+  await settle();
+  const w = hl.windows()[0]!;
+  const rx = out.width - 150, ry = out.height - 40;
+  hl.click(rx, ry, 'right');
+  await until(() => popupList().length > 0, 5000, 'the context menu near the edge');
+  await settle();
+  const pop = popupList()[0]!;
+  const sx = w.originX + pop.x, sy = w.originY + pop.y; // its surface, shadow included
+  if (!realApps) {
+    await until(() => configured(n0 + 1), 3000, 'its configure');
+    const [cx, cy] = configured(n0 + 1)!;
+    // slid left and up until its geometry (200x160) fits: flush with the edges
+    check(w.x + cx === out.width - 200 && w.y + cy === out.height - 160,
+      `the menu slid inside the output: its geometry at ${w.x + cx},${w.y + cy} (unconstrained: ${rx + 1},${ry + 1})`);
+  } else {
+    // GTK's menu: its own shadow hangs outside its geometry (≤ 30 px here)
+    check(sx + pop.logicalWidth <= out.width + 30 && sy + pop.logicalHeight <= out.height + 30 && sx < rx,
+      `the menu stays inside the output: its surface at ${sx},${sy}, ${pop.logicalWidth}x${pop.logicalHeight} (click at ${rx},${ry})`);
+  }
+  hl.click(w.x + 300, w.y + 300); // an outside press dismisses it
+  await until(() => popupList().length === 0, 3000, 'the menu to close');
+  hl.move(win, x0, y0);
+  await settle();
 }
 
 async function x11() {
