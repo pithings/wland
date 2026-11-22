@@ -266,6 +266,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
   engine.popupDismiss(7, 12);
   engine.close(7, 10);
   engine.setVisible(7, 10, false);
+  engine.setWindowPosition(7, 10, 12.4, -3.6);
   assert.equal(engine.requestResize(7, 10, 640.4, 480.6), 3);
   assert.equal(engine.setTiled(7, 10, 4 | 1, 300.2, 199.6), 4);
   assert.equal(engine.setTiled(7, 10, 0), 5);
@@ -295,6 +296,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
     call(22, u32(7, 12)),
     call(29, u32(7, 10)),
     call(31, u32(7, 10, 0)),
+    call(33, u32(7, 10), i32(12, -4)),
     call(23, u32(7, 10), i32(640, 481), u32(3)),
     call(32, u32(7, 10, 5), i32(300, 200), u32(4)),
     call(32, u32(7, 10, 0), i32(0, 0), u32(5)),

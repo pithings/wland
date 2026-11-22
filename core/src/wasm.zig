@@ -366,6 +366,15 @@ export fn wland_set_visible(conn_id: u32, surface_id: u32, visible: u32) void {
     flushOut();
 }
 
+/// Where the toplevel's window-geometry origin is in the output (logical
+/// px), kept up to date by the embedder's window manager: popups are
+/// constrained to the output from then on (xdg_positioner constraint
+/// adjustment); reactive ones are placed again.
+export fn wland_set_window_position(conn_id: u32, surface_id: u32, x: i32, y: i32) void {
+    compositor.setWindowPosition(conn_id, surface_id, x, y);
+    flushOut();
+}
+
 /// Ask a toplevel to close (xdg_toplevel.close); the app decides what to do.
 export fn wland_close(conn_id: u32, surface_id: u32) void {
     compositor.closeToplevel(conn_id, surface_id);

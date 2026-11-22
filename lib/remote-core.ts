@@ -93,6 +93,7 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_set_bounds: [30, 'iiii'],
   wland_set_visible: [31, 'uuu'],
   wland_set_tiled: [32, 'uuuiiu'],
+  wland_set_window_position: [33, 'uuii'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
 

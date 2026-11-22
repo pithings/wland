@@ -746,6 +746,7 @@ pub const CallOp = enum(u16) {
     set_bounds = 30,
     set_visible = 31,
     set_tiled = 32,
+    set_window_position = 33,
     _,
 };
 

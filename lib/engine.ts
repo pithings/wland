@@ -511,6 +511,21 @@ export interface Engine {
    *  Default: shown. On a session link a new viewer's attach shows every
    *  window the last one hid. */
   setVisible(conn: number, surface: number, visible: boolean): void;
+  /** Where the toplevel's window is: the top-left of its window geometry
+   *  (CommitEvent.geometry — the box ViewWindow.element is) in the output,
+   *  logical px. Keep it up to date as your window manager places and moves
+   *  the window (calls that change nothing send nothing; a maximized
+   *  window is wherever you put it, usually 0,0). From then on the app's
+   *  popups are constrained to the output (xdg_positioner constraint
+   *  adjustment: a menu near the right or bottom edge flips, slides or
+   *  shrinks as its positioner allows), at their creation and on
+   *  reposition; open ones are not moved when the window moves (they move
+   *  with it), except reactive ones (set_reactive), which are placed again.
+   *  Unknown until set: popups are placed as their positioner says, without
+   *  adjustment. wland's own window manager (wm.ts, with the view's default
+   *  mount) and wland/headless call it themselves. On a session link a new
+   *  viewer's attach forgets the last one's positions. */
+  setWindowPosition(conn: number, surface: number, x: number, y: number): void;
   /** Ask a toplevel to close (xdg_toplevel.close: a close button, a
    *  taskbar's "close window"). Nothing else happens here: the app decides
    *  — it destroys the window ('surface' role none / 'destroy' events
@@ -2029,6 +2044,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     // minimizing sends a pointer leave: after any pending motion
     setMinimized: call((conn, surface, on) => ex.wland_set_minimized(conn, surface, on ? 1 : 0), true),
     setVisible: call((conn, surface, on) => ex.wland_set_visible(conn, surface, on ? 1 : 0)),
+    setWindowPosition: call((conn, surface, x, y) => ex.wland_set_window_position(conn, surface, Math.round(x) || 0, Math.round(y) || 0)),
     close: call((conn, surface) => ex.wland_close(conn, surface)),
     dragMotion: call((conn, surface, time, x, y) =>
       ex.wland_drag_motion(conn, surface, time >>> 0, fixed(x), fixed(y)), true),

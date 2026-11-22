@@ -883,6 +883,7 @@ pub const Session = struct {
             .close => c.closeToplevel(try a.u32_(), try a.u32_()),
             .set_bounds => c.setBounds(try a.i32_(), try a.i32_(), try a.i32_(), try a.i32_()),
             .set_visible => c.setVisible(try a.u32_(), try a.u32_(), try a.u32_() != 0),
+            .set_window_position => c.setWindowPosition(try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .request_resize => {
                 const conn_id = try a.u32_();
                 const surface_id = try a.u32_();
@@ -931,7 +932,8 @@ pub const Session = struct {
     /// CALL init: the viewer attaches — the scale as set_dpr, un-suspended,
     /// its decorations mode (toplevels it changes answered again: apps
     /// outlive viewers), no bounds of the last viewer's and none of its
-    /// per-window state (hidden windows shown: it sends its own), then the
+    /// per-window state (hidden windows shown, tiled ones untiled, window
+    /// positions unknown: it sends its own), then the
     /// scene replay (STREAM.md), ending in EVENT synced. The
     /// mode is set before `synced`, so the replay carries what it made.
     fn attach(self: *Session, scale: i32, scale_120: i32, decorations_server: bool) void {

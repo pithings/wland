@@ -266,6 +266,16 @@ const Surface = struct {
     /// pending popup size from the positioner (0 = client decides)
     popup_w: i32 = 0,
     popup_h: i32 = 0,
+    /// role .popup: the positioner it was placed by (get_popup, its last
+    /// reposition) — a reactive one is placed again when the conditions
+    /// change (replaceReactive)
+    rules: Positioner = .{},
+    /// role .toplevel: where its window-geometry origin sits in the
+    /// output, logical px, as the embedder last said (setWindowPosition);
+    /// null = unknown (popups are then placed without constraint
+    /// adjustment). The embedder's: reset when the xdg_toplevel goes and
+    /// at a new embedder (resetEmbedderWindows).
+    win_pos: ?[2]i32 = null,
     /// xdg_toplevel size hints (0 = unset), window geometry px; resize
     /// requests are clamped. set_min_size / set_max_size are double-
     /// buffered: they write the pending pair, wl_surface.commit latches it
@@ -509,7 +519,9 @@ pub const Region = struct {
     }
 };
 
-/// Minimal xdg_positioner state — enough for GTK menus.
+/// xdg_positioner state: the placement rules of a popup (set_parent_size
+/// and set_parent_configure, v3 hints for a parent mid-resize, are not
+/// kept: placement uses the parent as it is).
 const Positioner = struct {
     anchor_x: i32 = 0,
     anchor_y: i32 = 0,
@@ -521,6 +533,19 @@ const Positioner = struct {
     dy: i32 = 0,
     w: i32 = 0,
     h: i32 = 0,
+    /// set_constraint_adjustment bits (adjust_*)
+    adjust: u32 = 0,
+    /// set_reactive (v3): placed again when the parent's window moves or
+    /// the output changes
+    reactive: bool = false,
+
+    // xdg_positioner.constraint_adjustment
+    const adjust_slide_x: u32 = 1;
+    const adjust_slide_y: u32 = 2;
+    const adjust_flip_x: u32 = 4;
+    const adjust_flip_y: u32 = 8;
+    const adjust_resize_x: u32 = 16;
+    const adjust_resize_y: u32 = 32;
 
     // xdg_positioner.anchor/gravity enum: 0 none, 1 top, 2 bottom, 3 left,
     // 4 right, 5 top_left, 6 bottom_left, 7 top_right, 8 bottom_right
@@ -540,8 +565,8 @@ const Positioner = struct {
     /// Popup position: the top-left of the popup's window geometry from the
     /// parent's window geometry (xdg-shell; the anchor rect counts from it
     /// too) — what xdg_popup.configure says. Where that puts the surfaces
-    /// is surfaceAbs's. No constraint adjustment: window positions are the
-    /// embedder's, so the core can't tell where the output's edges are.
+    /// is surfaceAbs's. Without constraint adjustment: placeWithin adds
+    /// it once the embedder said where the window is (setWindowPosition).
     /// Every input is a client's i32, so the sums saturate (as does every
     /// step of the placement chain: surfaceAbs, windowGeometry).
     fn place(p: *const Positioner) struct { x: i32, y: i32 } {
@@ -551,7 +576,95 @@ const Positioner = struct {
         const y = (ay +| p.dy) -| (if (isTop(p.gravity)) p.h else if (isBottom(p.gravity)) 0 else @divTrunc(p.h, 2));
         return .{ .x = x, .y = y };
     }
+
+    // anchor/gravity mirrored on one axis (flip_x / flip_y)
+    fn invertX(v: u32) u32 {
+        return switch (v) {
+            3 => 4, 4 => 3, 5 => 7, 7 => 5, 6 => 8, 8 => 6,
+            else => v,
+        };
+    }
+    fn invertY(v: u32) u32 {
+        return switch (v) {
+            1 => 2, 2 => 1, 5 => 6, 6 => 5, 7 => 8, 8 => 7,
+            else => v,
+        };
+    }
+
+    /// place() with xdg-shell's constraint adjustment against `bounds` —
+    /// the output as x0, y0, x1, y1 (exclusive) in the same space as the
+    /// placement (from the parent's window geometry). Per axis, only when
+    /// the popup leaves the bounds on it, in the spec's order: flip
+    /// (anchor and gravity mirrored, the offset too as mutter does; kept
+    /// only if the flipped box fits on that axis), then slide (toward the
+    /// gravity first, then back, never past the edge it came from), then
+    /// resize (cut to the bounds). The size is the positioner's unless a
+    /// resize cut it. An invalid positioner (no size) is placed as is.
+    fn placeWithin(p: *const Positioner, bounds: [4]i32) Placed {
+        const at = p.place();
+        var r: Placed = .{ .x = at.x, .y = at.y, .w = p.w, .h = p.h };
+        if (p.w <= 0 or p.h <= 0) return r;
+        p.adjustAxis(&r.x, &r.w, bounds[0], bounds[2], true);
+        p.adjustAxis(&r.y, &r.h, bounds[1], bounds[3], false);
+        return r;
+    }
+
+    fn outside(pos: i32, len: i32, lo: i32, hi: i32) bool {
+        return pos < lo or pos +| len > hi;
+    }
+
+    fn adjustAxis(p: *const Positioner, pos: *i32, len: *i32, lo: i32, hi: i32, comptime x_axis: bool) void {
+        if (!outside(pos.*, len.*, lo, hi)) return;
+        const flip = if (x_axis) adjust_flip_x else adjust_flip_y;
+        const slide = if (x_axis) adjust_slide_x else adjust_slide_y;
+        const resize = if (x_axis) adjust_resize_x else adjust_resize_y;
+        if (p.adjust & flip != 0) {
+            var q = p.*;
+            if (x_axis) {
+                q.anchor = invertX(q.anchor);
+                q.gravity = invertX(q.gravity);
+                q.dx = 0 -| q.dx;
+            } else {
+                q.anchor = invertY(q.anchor);
+                q.gravity = invertY(q.gravity);
+                q.dy = 0 -| q.dy;
+            }
+            const f = q.place();
+            const fpos = if (x_axis) f.x else f.y;
+            if (!outside(fpos, len.*, lo, hi)) {
+                pos.* = fpos;
+                return;
+            }
+        }
+        if (p.adjust & slide != 0) {
+            // the gravity's direction first: toward lo for left/top
+            // gravity, toward hi otherwise (centred too)
+            const low_first = if (x_axis) isLeft(p.gravity) else isTop(p.gravity);
+            for (0..2) |pass| {
+                const toward_hi = (pass == 0) != low_first;
+                const end = pos.* +| len.*;
+                if (toward_hi) {
+                    // until the low edge is in, or the high edge would leave
+                    if (pos.* < lo and end < hi) pos.* +|= @min(lo -| pos.*, hi -| end);
+                } else {
+                    if (end > hi and pos.* > lo) pos.* -|= @min(end -| hi, pos.* -| lo);
+                }
+            }
+            if (!outside(pos.*, len.*, lo, hi)) return;
+        }
+        if (p.adjust & resize != 0) {
+            const a = @max(pos.*, lo);
+            const e = @min(pos.* +| len.*, hi);
+            if (e > a) {
+                pos.* = a;
+                len.* = e -| a;
+            }
+        }
+    }
 };
+
+/// A popup's placement: its configure's x, y, width, height.
+const Placed = struct { x: i32, y: i32, w: i32, h: i32 };
 
 /// The selection: which conn's wl_data_source currently owns the clipboard.
 /// conn 0 (no relay conn has it) = the embedder's own selection
@@ -1726,6 +1839,10 @@ pub const Compositor = struct {
                 } else if (std.mem.eql(u8, msg.name, "set_offset")) {
                     pos.dx = args[0].int;
                     pos.dy = args[1].int;
+                } else if (std.mem.eql(u8, msg.name, "set_constraint_adjustment")) {
+                    pos.adjust = args[0].uint;
+                } else if (std.mem.eql(u8, msg.name, "set_reactive")) {
+                    pos.reactive = true;
                 } else if (std.mem.eql(u8, msg.name, "destroy")) {
                     _ = conn.positioners.remove(header.object_id);
                 }
@@ -1742,11 +1859,12 @@ pub const Compositor = struct {
                     }
                 }
                 if (conn.positioners.get(args[2].object)) |pos| {
-                    const placed = pos.place();
+                    surface.rules = pos;
+                    const placed = self.placePopup(conn, surface.parent_id, &pos);
                     surface.x = placed.x;
                     surface.y = placed.y;
-                    surface.popup_w = pos.w;
-                    surface.popup_h = pos.h;
+                    surface.popup_w = placed.w;
+                    surface.popup_h = placed.h;
                 }
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_popup") and std.mem.eql(u8, msg.name, "reposition")) {
@@ -2173,6 +2291,7 @@ pub const Compositor = struct {
                         surface.minimized = false;
                         surface.hidden = false;
                         surface.tiled = 0;
+                        surface.win_pos = null;
                         surface.cfg_len = 0;
                         surface.ack_pending = null;
                         surface.acked = null;
@@ -3022,14 +3141,16 @@ pub const Compositor = struct {
 
     /// A new embedder takes over (a session viewer's init): what the last
     /// one set per window for its own window manager goes — hidden windows
-    /// are shown (setVisible true), tiled ones untiled (setTiled 0). The
-    /// new one sets its own.
+    /// are shown (setVisible true), tiled ones untiled (setTiled 0), window
+    /// positions unknown again (open popups stay where they are). The new
+    /// one sets its own.
     pub fn resetEmbedderWindows(self: *Compositor) void {
         var it = self.conns.iterator();
         while (it.next()) |kv| {
             var sit = kv.value_ptr.*.surfaces.iterator();
             while (sit.next()) |skv| {
                 if (skv.value_ptr.role != .toplevel) continue;
+                skv.value_ptr.win_pos = null;
                 if (skv.value_ptr.hidden) self.setVisible(kv.key_ptr.*, skv.key_ptr.*, true);
                 if (skv.value_ptr.tiled != 0) self.setTiled(kv.key_ptr.*, skv.key_ptr.*, 0, 0, 0);
             }
@@ -3175,11 +3296,12 @@ pub const Compositor = struct {
     fn repositionPopup(self: *Compositor, conn_id: u32, conn: *Conn, popup_id: u32, positioner_id: u32, token: u32) void {
         const surface = surfaceByPopupId(conn, popup_id) orelse return;
         const pos = conn.positioners.get(positioner_id) orelse return;
-        const placed = pos.place();
+        surface.rules = pos;
+        const placed = self.placePopup(conn, surface.parent_id, &pos);
         surface.x = placed.x;
         surface.y = placed.y;
-        surface.popup_w = pos.w;
-        surface.popup_h = pos.h;
+        surface.popup_w = placed.w;
+        surface.popup_h = placed.h;
         self.positions_dirty = true;
         self.sendEvent(conn_id, popup_id, "xdg_popup", "repositioned", &.{.{ .uint = token }});
         self.sendEvent(conn_id, popup_id, "xdg_popup", "configure", &.{
@@ -3189,6 +3311,106 @@ pub const Compositor = struct {
         self.sendEvent(conn_id, surface.xdg_surface_id, "xdg_surface", "configure", &.{
             .{ .uint = nextSerial(conn) },
         });
+    }
+
+    /// Where a popup with these rules goes (its configure): from the
+    /// parent's window geometry, constrained to the output when the
+    /// window's position in it is known (popupParentAt), else exactly as
+    /// the positioner says.
+    fn placePopup(self: *Compositor, conn: *const Conn, parent_id: u32, pos: *const Positioner) Placed {
+        const at = popupParentAt(conn, parent_id) orelse {
+            const p = pos.place();
+            return .{ .x = p.x, .y = p.y, .w = pos.w, .h = pos.h };
+        };
+        // the output in the parent's window-geometry space (saturating:
+        // positions are the embedder's, geometry offsets the client's)
+        return pos.placeWithin(.{ 0 -| at[0], 0 -| at[1], self.desk_w -| at[0], self.desk_h -| at[1] });
+    }
+
+    /// The output position of an xdg surface's window-geometry origin, as
+    /// popups count from it: its toplevel's (setWindowPosition) plus each
+    /// popup's x/y down the chain (a popup's x/y runs from its parent's
+    /// geometry to its own). null while the toplevel's position is unknown
+    /// or the chain has no toplevel (a parentless popup).
+    fn popupParentAt(conn: *const Conn, surface_id: u32) ?[2]i32 {
+        var x: i32 = 0;
+        var y: i32 = 0;
+        var id = surface_id;
+        for (0..8) |_| {
+            const s = conn.surfaces.getPtr(id) orelse return null;
+            switch (s.role) {
+                .toplevel => {
+                    const w = s.win_pos orelse return null;
+                    return .{ x +| w[0], y +| w[1] };
+                },
+                .popup => {
+                    x +|= s.x;
+                    y +|= s.y;
+                    if (s.parent_id == 0) return null;
+                    id = s.parent_id;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Embedder: the toplevel's window-geometry origin is at (x, y) in the
+    /// output, logical px — where its window manager put it, kept up to
+    /// date as it moves. Popups opened from then on (and repositioned) are
+    /// constrained to the output by their positioner's constraint
+    /// adjustment; open ones stay where they are relative to the window
+    /// (they move with it), except reactive ones (set_reactive), which are
+    /// placed again. Unknown until set: no adjustment.
+    pub fn setWindowPosition(self: *Compositor, conn_id: u32, surface_id: u32, x: i32, y: i32) void {
+        const t = self.toplevelSurface(conn_id, surface_id) orelse return;
+        if (t.surface.win_pos) |p| {
+            if (p[0] == x and p[1] == y) return;
+        }
+        t.surface.win_pos = .{ x, y };
+        self.replaceReactive(conn_id, t.conn, surface_id);
+    }
+
+    /// The reactive popups of `root_id`'s window placed again (the window
+    /// moved, the output changed), parents before their children (a
+    /// child counts from its parent's new place): those whose placement
+    /// changed get xdg_popup.configure + xdg_surface.configure (no
+    /// repositioned: that answers a reposition request), and the embedder
+    /// reads positions again.
+    fn replaceReactive(self: *Compositor, conn_id: u32, conn: *Conn, root_id: u32) void {
+        for (1..9) |depth| {
+            var it = conn.surfaces.iterator();
+            while (it.next()) |kv| {
+                const s = kv.value_ptr;
+                if (s.role != .popup or s.popup_id == 0 or !s.rules.reactive) continue;
+                if (popupDepth(conn, kv.key_ptr.*, root_id) != depth) continue;
+                const p = self.placePopup(conn, s.parent_id, &s.rules);
+                if (p.x == s.x and p.y == s.y and p.w == s.popup_w and p.h == s.popup_h) continue;
+                s.x = p.x;
+                s.y = p.y;
+                s.popup_w = p.w;
+                s.popup_h = p.h;
+                self.positions_dirty = true;
+                if (!s.configured) continue; // its initial configure carries it
+                self.sendEvent(conn_id, s.popup_id, "xdg_popup", "configure", &.{
+                    .{ .int = s.x }, .{ .int = s.y }, .{ .int = s.popup_w }, .{ .int = s.popup_h },
+                });
+                self.sendEvent(conn_id, s.xdg_surface_id, "xdg_surface", "configure", &.{.{ .uint = nextSerial(conn) }});
+            }
+        }
+    }
+
+    /// How many popups down from `root_id` a popup hangs (1: the
+    /// toplevel's own), 0 when it is not in that window.
+    fn popupDepth(conn: *const Conn, surface_id: u32, root_id: u32) usize {
+        var id = surface_id;
+        for (0..9) |n| {
+            const s = conn.surfaces.getPtr(id) orelse return 0;
+            if (id == root_id) return n;
+            if (s.role != .popup or s.parent_id == 0) return 0;
+            id = s.parent_id;
+        }
+        return 0;
     }
 
     /// Embedder saw an outside-click while this popup was up.
@@ -3464,6 +3686,11 @@ pub const Compositor = struct {
                 if (!surface.maximized and !surface.fullscreen) continue;
                 self.sendBounds(conn_id, conn, surface);
                 self.sendCurrentConfigure(conn_id, conn, surface);
+            }
+            // the bounds popups are constrained to changed
+            var rit = conn.surfaces.iterator();
+            while (rit.next()) |skv| {
+                if (skv.value_ptr.role == .toplevel and skv.value_ptr.win_pos != null) self.replaceReactive(conn_id, conn, skv.key_ptr.*);
             }
         }
     }
@@ -7956,6 +8183,20 @@ const PopupTest = struct {
         try T.send(comp, s + 1, comptime xs.requestIndex("get_popup").?, &.{ .{ .new_id = s + 2 }, .{ .object = parent }, .{ .object = positioner_id } });
         try T.send(comp, s, T.commit_op, &.{});
     }
+    fn adjust(comp: *Compositor, id: u32, bits: u32) !void {
+        try WinTest.send(comp, id, comptime pos.requestIndex("set_constraint_adjustment").?, &.{.{ .uint = bits }});
+    }
+    /// x, y, w, h of the last xdg_popup.configure to `popup_id`
+    fn configuredBox(sink: *TestSink, popup_id: u32) ![4]i32 {
+        var vals: [wire.max_args]wire.Value = undefined;
+        var last: ?[4]i32 = null;
+        for (sink.events.items) |ev| {
+            if (ev.object_id != popup_id or ev.opcode != comptime pp.eventIndex("configure").?) continue;
+            const a = try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .int, .int, .int, .int }, &vals);
+            last = .{ a[0].int, a[1].int, a[2].int, a[3].int };
+        }
+        return last orelse error.NoConfigure;
+    }
     /// x, y of the last xdg_popup.configure to `popup_id`
     fn configured(sink: *TestSink, popup_id: u32) ![2]i32 {
         var vals: [wire.max_args]wire.Value = undefined;
@@ -7972,6 +8213,144 @@ const PopupTest = struct {
         return .{ p.x, p.y };
     }
 };
+
+test "positioner constraint adjustment: flip, slide, resize per axis in the spec's order; combinations; offsets mirror on a flip; invalid sizes and huge values" {
+    const B = [4]i32{ 0, 0, 1000, 800 };
+    const A = Positioner;
+    // anchor rect 10×10 at (x, y), anchor/gravity, size, adjust bits
+    const mk = struct {
+        fn f(x: i32, y: i32, anchor: u32, gravity: u32, w: i32, h: i32, adjust: u32) Positioner {
+            return .{ .anchor_x = x, .anchor_y = y, .anchor_w = 10, .anchor_h = 10, .anchor = anchor, .gravity = gravity, .w = w, .h = h, .adjust = adjust };
+        }
+    }.f;
+    const eq = std.testing.expectEqual;
+    // fits: as placed
+    try eq(Placed{ .x = 110, .y = 110, .w = 100, .h = 50 }, mk(100, 100, 8, 8, 100, 50, 63).placeWithin(B));
+    // past the right edge, nothing allowed: as placed
+    try eq(Placed{ .x = 960, .y = 80, .w = 100, .h = 50 }, mk(950, 100, 4, 4, 100, 50, 0).placeWithin(B));
+    // flip_x: to the anchor's other side
+    try eq(Placed{ .x = 850, .y = 80, .w = 100, .h = 50 }, mk(950, 100, 4, 4, 100, 50, A.adjust_flip_x).placeWithin(B));
+    // flip_x that does not fit either: kept as before the flip
+    try eq(Placed{ .x = 960, .y = 80, .w = 960, .h = 50 }, mk(950, 100, 4, 4, 960, 50, A.adjust_flip_x).placeWithin(B));
+    // the offset mirrors with it (a submenu's overlap stays an overlap)
+    var off = mk(950, 100, 4, 4, 100, 50, A.adjust_flip_x);
+    off.dx = 5;
+    try eq(@as(i32, 845), off.placeWithin(B).x);
+    // slide_x: right gravity slides back left until it fits
+    try eq(Placed{ .x = 900, .y = 80, .w = 100, .h = 50 }, mk(950, 100, 4, 4, 100, 50, A.adjust_slide_x).placeWithin(B));
+    // left gravity past the left edge: slides right
+    try eq(Placed{ .x = 0, .y = 80, .w = 100, .h = 50 }, mk(20, 100, 3, 3, 100, 50, A.adjust_slide_x).placeWithin(B));
+    // wider than the output: slid to the low edge (right gravity), then
+    // resize_x cuts it to the output
+    try eq(Placed{ .x = 0, .y = 80, .w = 1200, .h = 50 }, mk(100, 100, 3, 4, 1200, 50, A.adjust_slide_x).placeWithin(B));
+    try eq(Placed{ .x = 0, .y = 80, .w = 1000, .h = 50 }, mk(100, 100, 3, 4, 1200, 50, A.adjust_slide_x | A.adjust_resize_x).placeWithin(B));
+    // left gravity, wider than the output: slid to the high edge
+    try eq(Placed{ .x = -200, .y = 80, .w = 1200, .h = 50 }, mk(900, 100, 4, 3, 1200, 50, A.adjust_slide_x).placeWithin(B));
+    // resize_x alone: cut at the edge
+    try eq(Placed{ .x = 960, .y = 80, .w = 40, .h = 50 }, mk(950, 100, 4, 4, 100, 50, A.adjust_resize_x).placeWithin(B));
+    // flip first, slide when the flip does not fit
+    try eq(Placed{ .x = 200, .y = 80, .w = 800, .h = 50 }, mk(700, 100, 4, 4, 800, 50, A.adjust_flip_x | A.adjust_slide_x).placeWithin(B));
+    try eq(Placed{ .x = 600, .y = 80, .w = 100, .h = 50 }, mk(700, 100, 3, 3, 100, 50, A.adjust_flip_x | A.adjust_slide_x).placeWithin(B)); // fits: untouched
+    // the y axis alike: flip_y over the anchor, slide_y up, resize_y
+    try eq(Placed{ .x = 55, .y = 720, .w = 100, .h = 50 }, mk(100, 770, 2, 2, 100, 50, A.adjust_flip_y).placeWithin(B));
+    try eq(Placed{ .x = 55, .y = 750, .w = 100, .h = 50 }, mk(100, 770, 2, 2, 100, 50, A.adjust_slide_y).placeWithin(B));
+    try eq(Placed{ .x = 55, .y = 780, .w = 100, .h = 20 }, mk(100, 770, 2, 2, 100, 50, A.adjust_resize_y).placeWithin(B));
+    try eq(Placed{ .x = 55, .y = 0, .w = 100, .h = 50 }, mk(100, 10, 1, 1, 100, 50, A.adjust_slide_y).placeWithin(B));
+    // each axis on its own: x flips, y slides; a corner anchor flips both
+    try eq(Placed{ .x = 855, .y = 750, .w = 100, .h = 50 }, mk(950, 770, 2, 8, 100, 50, A.adjust_flip_x | A.adjust_slide_y).placeWithin(B));
+    try eq(Placed{ .x = 850, .y = 720, .w = 100, .h = 50 }, mk(950, 770, 8, 8, 100, 50, A.adjust_flip_x | A.adjust_flip_y).placeWithin(B));
+    // a flip only on the axis that is out: y stays below the anchor
+    try eq(Placed{ .x = 850, .y = 110, .w = 100, .h = 50 }, mk(950, 100, 8, 8, 100, 50, A.adjust_flip_x | A.adjust_flip_y).placeWithin(B));
+    // no size (an invalid positioner): placed as is
+    try eq(Placed{ .x = 960, .y = 80, .w = 0, .h = 50 }, mk(950, 100, 4, 4, 0, 50, 63).placeWithin(B));
+    // client i32s at the limits: saturate, never overflow
+    const max = std.math.maxInt(i32);
+    var huge = mk(max - 5, -max, 8, 8, max, max, 63);
+    huge.dx = max;
+    _ = huge.placeWithin(B);
+    _ = huge.placeWithin(.{ -max, -max, max, max });
+}
+
+test "popups constrained once the window's position is known: unknown = as the positioner says; flip / slide / resize in the configure, the resized size too; nested popups add up; reposition; reactive ones placed again as the window moves or the output changes, others not; a new embedder forgets positions" {
+    const T = WinTest;
+    const P = PopupTest;
+    const A = Positioner;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink); // 800×600 on a 1500×950 desktop
+    const br = [2]u32{ 8, 8 }; // anchor bottom_right, gravity bottom_right
+
+    // a menu at the window's right edge, flip_x allowed: position unknown,
+    // so placed as the positioner says
+    try P.positioner(&comp, 20, 780, 100, br, 200, 150);
+    try P.adjust(&comp, 20, A.adjust_flip_x | A.adjust_slide_y | A.adjust_resize_y);
+    try P.popup(&comp, 21, 7, 20);
+    try std.testing.expectEqual([4]i32{ 781, 101, 200, 150 }, try P.configuredBox(&sink, 23));
+    try T.send(&comp, 23, 0, &.{});
+    try T.send(&comp, 22, 0, &.{});
+
+    // the window at (650, 700): its right edge at 1450, bottom at 1300
+    // (past the output's 950); the menu flips left of the anchor and is
+    // cut at the output's bottom (slide would leave its top edge, resize)
+    comp.setWindowPosition(1, 6, 650, 700);
+    sink.events.clearRetainingCapacity();
+    try P.popup(&comp, 31, 7, 20);
+    // x: 780 + 1 = 781 → 781 + 200 + 650 > 1500: flipped to 780 − 200 = 580
+    // y: 101 + 700 = 801, + 150 = 951 > 950: slid up by 1 to 100
+    try std.testing.expectEqual([4]i32{ 580, 100, 200, 150 }, try P.configuredBox(&sink, 33));
+    try std.testing.expectEqual([2]i32{ 580, 100 }, P.at(&comp, 31));
+    // a submenu of it near the bottom: nested positions add up — its parent
+    // geometry is at (650 + 580, 700 + 100) = (1230, 800); anchor at (190,
+    // 140) of the menu → y 940, 100 tall → past 950: resize_y cuts it to 10
+    try P.positioner(&comp, 40, 190, 140, .{ 4, 8 }, 150, 100);
+    try P.adjust(&comp, 40, A.adjust_slide_x | A.adjust_resize_y);
+    try P.popup(&comp, 41, 32, 40);
+    // x: 1230 + 191 + 150 = 1571 > 1500: slid left by 71 → 120
+    try std.testing.expectEqual([4]i32{ 120, 140, 150, 10 }, try P.configuredBox(&sink, 43));
+    // reposition: constrained the same way
+    try P.positioner(&comp, 50, 10, 250, br, 200, 150);
+    try P.adjust(&comp, 50, A.adjust_flip_x | A.adjust_flip_y);
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 33, comptime P.pp.requestIndex("reposition").?, &.{ .{ .object = 50 }, .{ .uint = 1 } });
+    // the menu at (650 + 11, 700 + 251): past 950 → flipped above the anchor
+    try std.testing.expectEqual([4]i32{ 11, 250 - 150, 200, 150 }, try P.configuredBox(&sink, 33));
+
+    // the window moves: open non-reactive popups stay as they are
+    sink.events.clearRetainingCapacity();
+    _ = comp.takePositionsDirty();
+    comp.setWindowPosition(1, 6, 100, 100);
+    comp.setWindowPosition(1, 6, 100, 100); // the same: nothing
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    try std.testing.expect(!comp.takePositionsDirty());
+
+    // a reactive one is placed again: configure, no repositioned
+    try P.positioner(&comp, 60, 780, 100, br, 200, 150);
+    try P.adjust(&comp, 60, A.adjust_flip_x);
+    try T.send(&comp, 60, comptime P.pos.requestIndex("set_reactive").?, &.{});
+    try P.popup(&comp, 61, 7, 60);
+    try std.testing.expectEqual([4]i32{ 781, 101, 200, 150 }, try P.configuredBox(&sink, 63)); // fits at x 100
+    sink.events.clearRetainingCapacity();
+    _ = comp.takePositionsDirty();
+    comp.setWindowPosition(1, 6, 600, 100); // now 600 + 981 > 1500
+    try std.testing.expectEqual(@as(usize, 2), sink.events.items.len); // xdg_popup + xdg_surface configure
+    try std.testing.expectEqual([4]i32{ 580, 101, 200, 150 }, try P.configuredBox(&sink, 63));
+    try std.testing.expectEqual(@as(u32, 62), sink.events.items[1].object_id);
+    try std.testing.expect(comp.takePositionsDirty());
+    // the output grows: placed again (it fits unflipped now)
+    sink.events.clearRetainingCapacity();
+    comp.setDesktopSize(1700, 950);
+    try std.testing.expectEqual([4]i32{ 781, 101, 200, 150 }, try P.configuredBox(&sink, 63));
+
+    // a new embedder: positions unknown again — a new popup as placed
+    comp.resetEmbedderWindows();
+    sink.events.clearRetainingCapacity();
+    try P.positioner(&comp, 70, 780, 900, br, 200, 150);
+    try P.adjust(&comp, 70, 63);
+    try P.popup(&comp, 71, 7, 70);
+    try std.testing.expectEqual([4]i32{ 781, 901, 200, 150 }, try P.configuredBox(&sink, 73));
+}
 
 test "popups: placed from the parent's window geometry to their own (GTK CSD shadows) — nested and repositioned alike" {
     const T = WinTest;

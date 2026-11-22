@@ -755,6 +755,66 @@ test "session: set_tiled (with a size, a cause) — the app's configure, EVENT c
     try std.testing.expectEqualSlices(u32, &.{}, try statesAfter(&rig, c, w.toplevel, n + 5, &states));
 }
 
+/// A popup of `w` from a positioner: a 1×1 anchor rect at (x, y),
+/// anchor and gravity bottom_right, 200×150, flip_x allowed; committed.
+/// Its xdg_popup's id.
+fn openPopup(rig: *Rig, c: *Client, w: V6Window, x: i32, y: i32) !u32 {
+    const registry = c.newId();
+    try c.send(1, comptime op("wl_display", .request, "get_registry"), &.{.{ .new_id = registry }});
+    try rig.roundtrip(c);
+    const compositor = try bind(c, registry, "wl_compositor", 6);
+    const pos = c.newId();
+    try c.send(w.wm, comptime op("xdg_wm_base", .request, "create_positioner"), &.{.{ .new_id = pos }});
+    try c.send(pos, comptime op("xdg_positioner", .request, "set_size"), &.{ .{ .int = 200 }, .{ .int = 150 } });
+    try c.send(pos, comptime op("xdg_positioner", .request, "set_anchor_rect"), &.{ .{ .int = x }, .{ .int = y }, .{ .int = 1 }, .{ .int = 1 } });
+    try c.send(pos, comptime op("xdg_positioner", .request, "set_anchor"), &.{.{ .uint = 8 }});
+    try c.send(pos, comptime op("xdg_positioner", .request, "set_gravity"), &.{.{ .uint = 8 }});
+    try c.send(pos, comptime op("xdg_positioner", .request, "set_constraint_adjustment"), &.{.{ .uint = 4 }}); // flip_x
+    const surface = c.newId();
+    try c.send(compositor, comptime op("wl_compositor", .request, "create_surface"), &.{.{ .new_id = surface }});
+    const xdg = c.newId();
+    try c.send(w.wm, comptime op("xdg_wm_base", .request, "get_xdg_surface"), &.{ .{ .new_id = xdg }, .{ .object = surface } });
+    const popup = c.newId();
+    try c.send(xdg, comptime op("xdg_surface", .request, "get_popup"), &.{ .{ .new_id = popup }, .{ .object = w.xdg_surface }, .{ .object = pos } });
+    try c.send(surface, comptime op("wl_surface", .request, "commit"), &.{});
+    try rig.roundtrip(c);
+    return popup;
+}
+
+fn popupX(c: *Client, popup: u32) !i32 {
+    const e = c.last(popup, comptime op("xdg_popup", .event, "configure")) orelse return error.NoConfigure;
+    return std.mem.readInt(i32, e.body[0..4], .little);
+}
+
+test "session: set_window_position constrains the app's popups to the output (flip_x near the right edge); the next viewer's init forgets the position" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    const c = try rig.connect();
+    const w = try openToplevel(&rig, c, 6);
+    const conn: u32 = 1;
+
+    const a = try rig.viewer();
+    try a.init();
+    try rig.synced(a);
+    // the window's geometry at x 1200 of the 1280 px output: a menu at its
+    // x 50 would run off the right edge, so it flips left of the anchor
+    try a.call(.set_window_position, &(le(conn) ++ le(w.surface) ++ leI(1200) ++ leI(10)));
+    // (a CALL after it the app sees: the viewer's CALLs apply in order)
+    var states: [8]u32 = undefined;
+    const n = c.count(w.toplevel, toplevel_configure);
+    try a.call(.request_resize, &(le(conn) ++ le(w.surface) ++ leI(64) ++ leI(48)));
+    _ = try statesAfter(&rig, c, w.toplevel, n + 1, &states);
+    try std.testing.expectEqual(@as(i32, 50 - 200), try popupX(c, try openPopup(&rig, c, w, 50, 20)));
+    a.close();
+
+    const b = try rig.viewer();
+    try b.init();
+    try rig.synced(b);
+    try std.testing.expectEqual(@as(i32, 51), try popupX(c, try openPopup(&rig, c, w, 50, 20)));
+}
+
 fn writeAll(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
