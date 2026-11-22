@@ -7,7 +7,12 @@ import { defineBuildConfig } from 'obuild/config';
 // `obuild` (npm run build) builds the whole package:
 //  1. start: the zig builds — the native wlandr and the core wasm (which
 //     lands in lib/), plus `zig build release`: the static linux x64/arm64
-//     wlandr binaries the package ships (zig-out/release/).
+//     wlandr binaries (zig-out/release/). The package ships the full ones
+//     (wlandr-linux-<arch>); the --link-only guest build next to them
+//     (wlandr-link-linux-<arch>) goes to the GitHub release only: nothing
+//     in the package runs it (`npx wland` needs HTTP; `startRelay` runs
+//     the full one with --link fd:3), and a guest image fetches
+//     its tarball.
 //  2. lib/ → dist/ file by file (oxc transform + isolated declarations), so
 //     dist/engine.mjs finds wland.wasm next to itself via
 //     import.meta.url exactly as lib/engine.ts does.

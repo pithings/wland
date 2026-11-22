@@ -41,9 +41,16 @@ with it. New findings go in the matching section.
   commit it with any `core/` change, or the page ships a stale core.
   `npm run build` (obuild; its start hook in `build.config.ts` runs the
   zig builds) ships `zig build release`: wlandr for linux x64 + arm64 with an
-  explicit target (the native default targets the host CPU's features — not
-  portable; no libc is linked, so they are static whatever the ABI), which
-  its end hook brotli-compresses into `dist/wlandr-linux-<arch>.br`.
+  explicit target and `.cpu_model = .baseline` (the native default targets
+  the host CPU's features — not portable; baseline is aarch64 `generic` =
+  ARMv8.0+NEON, atomics as LL/SC, no LSE/CRC/crypto — and x86-64 v1; no libc
+  is linked, so they are static whatever the ABI), which its end hook
+  brotli-compresses into `dist/wlandr-linux-<arch>.br`. The same step builds
+  `wlandr-link-linux-<arch>` (`-Dhttp=false` ReleaseSmall, the guest build):
+  release.yml attaches it to the GitHub release, the npm package leaves it
+  out (nothing in it runs a --link-only relay). To check the baseline:
+  `llvm-objdump -d --mattr=-all,+v8a,+neon,+fp-armv8` on the arm64 binaries
+  must print no `<unknown>`.
   `serverBinary()` unpacks the one it needs into `~/.cache/wland/`, named by
   content hash (a checkout's `zig-out/bin/wlandr` wins over it).
 - `startRelay()` hands wlandr its link as fd 3 with a plain `'pipe'` stdio
@@ -124,6 +131,11 @@ with it. New findings go in the matching section.
   browser round trip, loopback drains instantly and apps spin unbounded
   (~470 frames for one menu dismiss), which tripped a nautilus GMenu
   double-free. The sleep runs on the app's own thread (it waits for `done`).
+- **A link dropping is `info`, not `err`.** Stream links are re-awaited
+  (page suspend/resume, vsock reset at snapshot restore): `serveLink` logs
+  `LinkGone` as "engine link dropped" at info, and peer-gone errnos /
+  mid-record EOF are not errors; what really is (a bad record length, a WS
+  protocol violation) is logged as `err` where it is detected.
 - **`serveLink` returns only when `link.users == 0`.** Anything calling into a
   link from another thread (a takeover kick) holds a `users` ref under
   `relay.mutex`.
@@ -161,9 +173,84 @@ with it. New findings go in the matching section.
   ioctl skipped after. It needs the copy buffer backend: a handle backend
   would export the dmabuf fd as procfd/kwshm memory, which a dmabuf isn't
   (main.zig refuses the combination).
+- **virtgpu: GEM handles are per object, not per import.**
+  `DRM_IOCTL_PRIME_FD_TO_HANDLE` on one DRM fd returns the SAME handle for
+  the same dmabuf object, however often (two wl_buffers over one dmabuf, or
+  two apps), and the kernel doesn't count imports: one GEM_CLOSE kills it
+  for every holder. So `virtgpu.Importer` counts holders per handle
+  relay-wide (each buffer + each un-ACKed COMMIT), with the ioctls inside
+  its mutex — an import racing the last unref would otherwise get a handle
+  that is being closed. The COMMIT's own reference (Pending `.gem`) is what
+  keeps the resource past `wl_buffer.destroy` until the ACK; the
+  dmabuf.Buffer (and its plane fds) goes at destroy as before. A conn
+  ending drops its Pending references in `AppConn.deinit`.
+- **virtgpu COMMITs need the ACK path whatever `--buffers` says.** The
+  conn's eventfd (`AppLink.ack_fd`) used to exist only for handle
+  backends; with copy buffers an ACK for a virtgpu COMMIT was dropped as
+  "never sent" and the buffer never released. `serveApp` creates it when
+  the dmabuf backend `sendsCommits()` too. The serial counter moved from
+  the handle backend to `AppConn.next_serial` (one space per conn, STREAM.md):
+  backends get `Commit.serial` and the relay advances it on `.busy`.
+- **A surface's full-buffer rect follows its content KIND, not just its
+  size.** `SurfaceState` remembers dims and kind (pixels / resource) of
+  what the engine last showed; a change of either forces one full rect. A
+  GTK3 window moving between cairo/shm and GL at one size otherwise kept
+  the GPU image (copy mode: the shadow trimmed the next shm commit to
+  nothing) or showed black outside the damage (handle modes: the GL
+  presenter blanks its texture when pixels follow an image). The copy
+  backend's shadow is dropped when a resource COMMIT goes out — not at the
+  switch back, since an unshown commit in between forgets the kind.
+  Swapchain resources alternating are ONE kind: damage is relative to the
+  previous commit's content, and each buffer holds the whole surface.
+- **virtgpu: the render node is open only while a GEM handle is held.**
+  Without VIRTIO_GPU_F_CONTEXT_INIT (unkernel offers only VIRGL) the guest
+  creates a host virgl context for a DRM file at its first PRIME import
+  (`virtio_gpu_gem_object_open`) and destroys it only at file close — one
+  more renderer context in the page, and unkernel refuses snapshots while
+  any exists. So `Importer` opens the node at the first import and closes
+  it when `refs` empties (both under its mutex; handles are per file, so
+  that is exactly when closing loses nothing), reopening at the next.
+  Startup only validates it (open, DRM_IOCTL_VERSION == "virtio_gpu",
+  close; `main_device` from stat). Device-open logs are `warn`: the test
+  runner fails a test on any `err` line, and startup prints the fatal one.
+- **virtgpu: a client's width/height/stride are a CLAIM.** Checked
+  against RESOURCE_INFO.size (the GEM size, page-rounded — 0 only becomes
+  PAGE_SIZE, never "unknown") plus a 16384 px side cap
+  (`dmabuf.virtgpuBounds`); refused buffers drop their handle. That size
+  is the layout's total only for PIPE_BIND_SHARED resources (GBM, EGL-
+  Wayland: always): Mesa's virgl_resource_create_front asks for 1 byte
+  (staging-capable textures) or 0 (MSAA) otherwise, so a non-shared
+  texture exported as a dmabuf is refused though valid on the host — kept
+  (the safe side); its log line says so (`refusalText`, one page).
+- **virtgpu once-logs are per class**: refusals (a client can mint kinds
+  at will) can't crowd out the accepted-buffer lines (≤ 16 kinds exist);
+  the fence-timeout warning is a per-conn flag. A device that won't open
+  is no buffer's property and repeats at every import (a resize storm):
+  `Device.open` logs nothing, the importer logs it at most once a minute
+  with the count since (`open_log_interval_ms`; reason + errno carried in
+  `Failure`), startup's `check` logs its own.
+- **virtgpu ordering is the emitter's** (STREAM.md "wlandr's emitter"):
+  the page's renderer must have executed the client's GPU work when the
+  COMMIT is processed, and STREAM carries no fence. What wlandr guarantees:
+  the COMMIT is built while handling the client's `wl_surface.commit`, after
+  its WIRE, never queued or deferred (Mesa submitted before it sent the
+  request), plus a bounded poll on the dmabuf for its implicit write fences
+  (100 ms, then sent anyway, logged once per conn). Don't move COMMIT emission off
+  the commit path (batching across bursts, a sender thread) without
+  re-deriving this.
+- **virtgpu's ioctl seam** is `virtgpu.Device.fake` (a runtime pointer, not
+  kwshm's comptime swap) so the shipped binary can run the stand-in:
+  `--dmabuf virtgpu:@fake` is TEST-ONLY and kept out of the usage text —
+  the E2Es' only way to drive the backend with no /dev/dri. Its "dmabufs"
+  are memfds (any regular file); nothing real can allocate on it.
 - **FEATURE goes out before the link is attached** (serveLink, before
   `relay.link = link`), so it precedes every CONN_OPEN and the core never
-  answers a registry without knowing about dmabuf.
+  answers a registry without knowing about dmabuf. One message
+  (`dmabuf.Config.featureFrames`): with virtgpu, dmabuf_kind (virtgpu)
+  first, then linux_dmabuf — the core decides at linux_dmabuf whether to
+  offer it, so a GPU-less page never advertises a global whose commits it
+  can't show. linux_dmabuf's bytes can't grow (the table's length is the
+  frame's), so a new fact is a new feature kind, not appended bytes.
 
 - **X11 = xwayland-satellite, launched by wlandr** (`xwayland.zig`). The
   display is claimed like an X server does (pid in `/tmp/.X<n>-lock`, written
@@ -220,6 +307,59 @@ with it. New findings go in the matching section.
   offer's source was destroyed — `orphanOffers` zeroes it, since the client may
   reuse the id — or its conn is gone) goes back as an FDMSG pipe with no wire
   message, and the relay closes the parked fd so the receiver reads EOF.
+  The embedder's own selection (setSelection; `Selection.conn == 0`,
+  `source` = its generation) answers with its bytes instead — as FDMSG
+  own_pipe, each payload's bytes only the first time on the link (the
+  relay keeps them, `Relay.own_cache`, until a newer generation's arrive,
+  the core's gen-0 drop, or detach). **Own selections and pipe_read exist
+  only on a link whose relay sent FEATURE selection_cache**
+  (`Compositor.selection_bridge`; wasm `wland_selection_bridged`, JS
+  `Engine.selectionBridged()`): wlandr 0.1.0 rejects pipe_read ("unsupported
+  fdmsg kind 5": the read never answers) and the pipe-with-bytes form
+  ("bad aux len": the receiver's pipe stays parked and its paste blocks
+  in read). So without the FEATURE setOwnSelection is error.Unsupported
+  and readSelection false — never "offer it and hope". A missing FEATURE
+  is only known at the link's first non-FEATURE frame (wasm.zig
+  `features_settled`; the engine caches the answer after each run of
+  frames, so `selectionBridged()` never calls into the core — the clipboard
+  bridge asks it while a commit's pixels are being read). The relay writes them on ONE writer
+  thread (`pipe_writer.zig`: poll + non-blocking writes, 5 s, EPIPE ends
+  it — SIGPIPE is ignored by Io.Threaded) with 4 transfers per conn and 32
+  in all; past a cap the fd closes at once (EOF). A detached thread per
+  receive, each with its own copy, let one client pin 64 threads × the
+  selection and every receive re-crossed the link. Only the writer thread
+  closes its fds (number reuse under its poll); conn close and link
+  detach mark transfers cancelled, and dropConn leaves a tombstone (a
+  ring of recent conn ids) so a receive the link thread found live just
+  before its conn closed is still closed at once. A stale own offer (an
+  older generation) reads EOF like an orphaned one.
+- **A receive's fd must be a pipe** (`interceptPipeReceive`, checked with
+  F_GETPIPE_SZ — it never calls into a filesystem, fstat on FUSE can).
+  O_NONBLOCK doesn't make every write()/close() return: a FUSE file whose
+  server never answers blocks both (close sends FLUSH), so does a hung
+  NFS file or a draining tty. Parked fds are closed on the link thread
+  (even under relay.mutex at detach) or written by the writer, so a
+  non-pipe parked there froze every app; refused on the receiver's own
+  app thread instead, it can only stall that conn. The writer also never
+  holds its mutex across a write or close (it copies fd/blob/offset out;
+  only it removes transfers, so indices stay put) and writes with
+  RWF_NOWAIT, since O_NONBLOCK is on the description the receiver shares
+  and can clear. Its start() refuses non-pipes too (a backstop). Still
+  open: an app thread stuck in such a syscall (a stray FUSE fd closed at
+  conn teardown, a FUSE-backed shm pool faulting) keeps its `link.users`
+  reference, so that link's serveLink never returns — a stream link then
+  never reconnects.
+- **The engine reads a selection through FDMSG pipe_read (kind 5)**, not
+  through an offer: the relay makes the pipe, hands the source app the
+  write end with the core's `send` event, and its reader thread holds a
+  `link.users` reference until it answers (polling in 100 ms slices so a
+  detach never waits the 5 s deadline out). No answer is owed to a link that
+  detached; the engine resolves its pending reads null at close. EOF is
+  `ok` whatever became of the source's conn: it is every receiver's only
+  completion signal, and `wl-copy --paste-once` hands the write to a
+  child and exits before it (a "source gone at EOF → failed" rule lost
+  every such paste; a source killed mid-write is a truncation any
+  receiver would see too).
   Dropping the token instead leaves the reader blocked until the link detaches
   (xwayland-satellite blocks its whole X display on that read).
 - **Frame callbacks fire on exactly one side, chosen per link:** WS = relay
@@ -285,14 +425,43 @@ with it. New findings go in the matching section.
   silently empties).
 - **Every wasm export that can make the compositor send events calls
   `flushOut()` before returning**, or those events stall until the next tick.
-- `sendEvent` encodes into a fixed 1024-byte stack buffer with no bounds check:
-  clamp client-or-browser-sized strings (`clampUtf8`, text-input uses 800 B).
+- **Client-sized strings meet fixed encode buffers.** `wire.encode` refuses
+  a message over its buffer (ReleaseFast — the wasm — checks no slice
+  bounds: a 1500-byte mime once overran sendEvent's 1024 B into linear
+  memory); `encodeMessage` is for fixed args and panics instead. The
+  backstop is not the cap: strings echoed in events are capped where they
+  enter — mime types at `max_mime_len` (256; a longer source `offer` is
+  ignored, a `receive` or dnd `accept` naming one reads EOF / revokes),
+  composition text by `clampUtf8` (800 B).
+- **Client coordinates saturate.** Positions, window geometry, positioner
+  rects/offsets/sizes are any i32: the placement chain (`Positioner.place`,
+  `surfaceAbs`, `windowGeometry`) sums with `+|`/`-|` (INT32_MAX geometry
+  + a −10 popup overflowed: a Debug panic, UB in wasm).
+- **Selection requests need focus or a fresh serial** (`maySetSelection`):
+  set_selection (clipboard and primary, clears too) is honoured from the
+  keyboard-focused client, or one naming one of its last 8 input serials
+  (key, button, keyboard/pointer enter) while no other client had a key,
+  button or keyboard focus since (`last_input_conn`) — a slow client's
+  Ctrl+C after a focus change. Else ignored: a background client could
+  replace the clipboard at will, and the page bridge mirrors it to the
+  host. wl-copy (no data-control protocol here) maps a 1×1 toplevel and
+  sets the selection at its keyboard enter — the headless embedder and
+  the wm focus new toplevels; the `copy` fixture does the same.
+  start_drag needs a held press of the client's (`pressHeld`).
 - `xdg_surface.get_popup`'s parent is nullable — id 0 must not match a surface.
 - **Mesa's Wayland EGL/Vulkan find their GPU through linux-dmabuf v4
   feedback** (`main_device` → drmGetDeviceFromDevId); Mesa 26 has no wl_drm
   client code. A device it can't open (no /dev/dri, or a non-DRM dev_t)
   makes it fall back to swrast over wl_shm — harmless, which is how a
   container without a GPU still runs EGL apps with dmabuf advertised.
+  The reverse is not harmless: dmabuf advertised in front of a virtgpu
+  relay to a page with no GPU source = Mesa renders on the GPU and every
+  window is blank. So `Compositor.applyFeature` leaves linux-dmabuf off
+  when FEATURE dmabuf_kind names a kind it can't show (virtgpu without
+  `gpu_source`, set by `wland_set_gpu_source`, which outlives wland_init;
+  default true for embedders that never say). Without the global Mesa
+  falls back to wl_shm. FEATUREs go through `applyFeature` in wasm.zig and
+  the native harness alike.
 - Things GTK/foot require: wl_data_device_manager v3 (foot exits below it); dnd
   v3 action negotiation (`set_actions`/`source_actions`/`action`) — accept alone
   never completes a GTK drop; configure_bounds + wm_capabilities ride the
@@ -330,8 +499,26 @@ with it. New findings go in the matching section.
   `requestResize` and the unmaximize restore size (`last_w/h`, taken at
   `set_maximized`) are the box's. The core learns surface sizes only from
   the embedder (`noteBufferSize`, every presented buffer), so the geometry
-  is read after it, per commit event. Popups are NOT placed against it
-  (plan.md, the satellite entry).
+  is read after it, per commit event.
+- **A popup's x/y is its configure's: from the parent's window geometry to
+  its own** (xdg-shell; the anchor rect counts from the parent's geometry
+  too). Where that puts the surface is `surfaceAbs`'s: + parent geometry
+  offset − own (`popupGeomOffset`), so the commit's `x`/`y`, the view's
+  canvas and hit-testing all follow. GTK3/4 CSD windows AND menus hang
+  shadows outside their geometry: placing from surface origins put
+  l3afpad's menus ~20 px up-left. Only a SET geometry counts there: a
+  default one (bounds with subsurfaces) is the surface origin, for
+  xwayland-satellite (plan.md, the satellite entry). No constraint
+  adjustment (flip/slide/resize): window positions are the embedder's.
+- **Interactive move/resize needs a press still held on the window**
+  (`inImplicitGrab`): its serial must be one of the current implicit
+  grab's presses (first…latest, buttons tracked per conn in
+  `pointerButton`), the first of them on the toplevel or a subsurface of
+  it; a release of the last button, an enter or a leave ends the grab. A
+  slow client's request that arrives after a quick click's release is
+  IGNORED: honouring it started an embedder grab that followed a pointer
+  with no button down until the next click (foot's border). The wm gates
+  it again on the DOM's own button state (engine behind a link or worker).
 - **Window states are the core's; the embedder only reacts and asks.**
   maximized, fullscreen, minimized are `Surface` flags (reset when the
   xdg_toplevel goes) changed by the app's requests or the embedder's
@@ -409,6 +596,49 @@ with it. New findings go in the matching section.
   clicks at "window + offset into the buffer" wants the origin. Any commit
   in a window can move the origin (a subsurface mapping above the toplevel):
   the box stays where it was placed, the content shifts.
+- **Another surface's commit moves subsurfaces and popups**: a popup's
+  root-local position includes its parent's window-geometry offset (a CSD
+  window maximizing drops its 24 px shadow under an open menu), a
+  subsurface's its parent popup's position. The engine keeps every
+  subsurface/popup's last x/y/z (`placed`) and re-reads them after a link
+  message that may have moved one: a change is a 'position' event (view
+  and headless move or restack it). "May have" is the core's
+  `positions_dirty` (`wland_take_positions_dirty`, read-and-clear), raised
+  wherever an offset, a window-geometry offset, a stack, a role or a
+  parent changes or a placed surface goes — a new site that moves one
+  must raise it, or its 'position' never comes (the core test "positions
+  dirty" lists them). Re-reading on every message was O(placed) wasm
+  calls per message (345 µs at 200 subsurfaces), and gating on commits
+  is wrong: set_position and a popup's reposition apply with no commit
+  of their own. Stacking inside a window is `stackOrder` (engine.ts) over
+  CommitEvent.parent (`wland_surface_parent`) and CommitEvent.z
+  (`wland_surface_z`): a surface's subsurfaces with z < 0 under it (each
+  with its own subtree), then it, then z > 0, then its popups (by seq) —
+  the view as canvas z-indexes (hit elements copy them; the toplevel's
+  canvas gets one only when something is placed under it), headless as
+  `layers()`.
+- **Subsurface z-order is the parent's double-buffered state.** The core
+  keeps an ordering key per subsurface (`Surface.z`, parent = 0, gaps
+  allowed) and a pending one: place_above/below shift the pending keys on
+  the side the surface lands, the PARENT's commit latches them
+  (`stack_pending` on the parent, `latchStack`) — a child's own commit
+  doesn't, so a 'position' with the new z follows the parent's commit.
+  A new subsurface goes on top of both stacks at get_subsurface. The
+  export is a dense rank (±1, ±2, … from the parent), so an unrelated
+  key shift never reads as a restack; it is cached (`Surface.z_rank`),
+  recomputed for the conn in one sort after `restacked` marks it stale. set_position is still applied at
+  once, not at the parent's commit (the scripted tests position a
+  subsurface and paint it with no parent commit).
+- **The relay thinks every COMMIT was shown.** One the engine ACKs
+  without showing anything new (a GPU commit with no image, a failed or
+  refused read, a broken handle, an invalid notice) leaves consumers'
+  content stale while the relay's next damage is relative to it: the
+  engine marks the surface (`stale` in engine.ts) and presents its next
+  COMMIT whole — damage replaced before the source/resolver is asked, so
+  reads, resolver and the commit event all see one full rect. Copy-mode
+  BUFFER frames can't be widened (their pixels are packed per rect); they
+  are always shown anyway. First commit and resize need nothing: the
+  relay sends a full rect for those.
 - **A GPU commit's `image` lives for its dispatch**: the engine resolves
   (`EngineOptions.gpu`), dispatches the 'gpu' commit, calls release(image),
   then ACKs — the emitter then releases the wl_buffer and the guest may
@@ -427,6 +657,57 @@ with it. New findings go in the matching section.
 - **A HandleSource read can't write into wasm memory it was handed earlier**:
   a pending async read can outlive a `memory.grow`. Hence the engine stages
   reads in a JS buffer.
+- **HandleSource shapes, per COMMIT: view → readv → read.** `view()` is
+  synchronous; ONE view goes out as the commit's `pixels` uncopied (so
+  `pixels` may be a SharedArrayBuffer), several are gathered (damaged spans
+  only) into the staging buffer; null falls back. `readv()` gets the
+  merged spans in one call (one promise; the pending-read/close-wait
+  machinery is shared, `pendingRead`). A shared `pixels` is fine for the
+  view's presenters: 2D swizzles bgra/bgrx into its own buffer (ImageData
+  refuses shared views in every browser; 'rgba' never comes from a view:
+  the core swizzles out of it into wasm memory), GL's texSubImage2D takes
+  the shared view as is; `slice()` (a Worker adapter's copy) is ordinary
+  memory. Browser-checked by handle-demo `sab=1` (SharedArrayBuffer pools)
+  through `test/support/isolated.ts`, a COOP/COEP mirror (wlandr sends
+  neither header, so its pages can't make one): Chromium 2D + software
+  WebGL (run-poc handle-demo), Firefox 2D (firefox-smoke; headless Gecko
+  has no WebGL). present.ts's retry-with-a-copy on a TypeError is
+  defensive: no tested browser has thrown there.
+- **A link reset during a pending buffer-source or gpu promise**: the
+  promise's commit belongs to the dead link (`gen` check: never presented,
+  never ACKed on the next one), its read keeps writing into the staging
+  buffer it was given (so halt() hands the next link a fresh one), its
+  settle removes only its own record from `reading` (a Set: the next link's
+  read may be pending too, and its token must not be closed under it), and
+  a gpu image resolved late is still released.
+- **watchOutput ignores a container with no size** (display: none, not
+  attached): the core clamps a 0 desk to 1×1 and would configure every
+  maximized/fullscreen window to it. `setSize`/`setScale` pin (the
+  ResizeObserver / the resolution query then do nothing; null resumes and
+  re-sends what the page says now); embedders must not call
+  engine.setOutput/setScale beside it. Invalid sizes (rounding below 1 px,
+  NaN, Infinity) and scales throw before anything changes; a stopped watch
+  (createWland disposed) ignores both. createWland checks `scale` before
+  creating anything and tears down whatever exists if construction throws.
+- **The evdev key table lives twice** (`input.ts` and `headless.ts`
+  `EVDEV`): the keypad and the rest of a full keyboard are in both, all
+  keys the canned keymap (`core/src/us.xkb`, xkb = evdev + 8) has.
+- **Keypad digits need NumLock in `locked`** (Mod2, 1 << 4: us.xkb's
+  `modifier_map Mod2 { <NMLK> }`; KEYPAD type: digits only with NumLock and
+  no Shift). The core's lock state is seat-wide (`Compositor.mods_locked`),
+  NumLock on from the start, toggled by keys 58/69, set by
+  `wland_keyboard_locks` (engine.keyboardLocks). Across a link reopen the
+  engine carries the CORE's state (read with `wland_keyboard_locks_state`
+  as the link closes — the keys' toggles included; a keyboardLocks while
+  closed overrides it), not the embedder's last call: the toggles happen
+  in the core only (and only for a conn with a keyboard), so JS can't
+  mirror them.
+  input.ts syncs it from `getModifierState` before every key and before a
+  keyboard enter, except on the lock keys' own events (the core toggles;
+  browsers differ on pre/post state there, and macOS Caps Lock sends only
+  keydown when it goes on, keyup when off). macOS has no NumLock
+  (getModifierState false, keypad types digits): a false NumLock is never
+  believed except from a keypad key whose `key` shows navigation.
 - **In-memory links deliver asynchronously**: the engine sends from inside a
   core call (`js_send` during `flushOut`); a synchronous answer re-enters the
   core (the demo page's `web/src/wayland/links.ts` uses microtasks).
@@ -436,6 +717,72 @@ with it. New findings go in the matching section.
   it only a page reload recovers — impossible in unkernel.
 - **`chunk.slice(...).buffer` of a chunk you didn't make** is the whole shared
   pool on a Node Buffer — onMessage gets a copy (`new Uint8Array(subarray)`).
+- **The page clipboard bridge (`lib/clipboard.ts`) lives on input's
+  hooks**: a paste chord's keydown must NOT be prevented (no paste event
+  otherwise), and from its press every key event queues until the paste
+  event ran (`InputOptions.clipboard`) — the app must see the new selection
+  before the V. Chromium fires paste inside the keydown's task; Firefox
+  later (its parent process runs the shortcut), usually after the keyup,
+  and targets the body (an empty contenteditable holds no caret), so the
+  copy/paste listeners are on the document, gated on the sink having
+  focus. No paste in 300 ms (refused): the keys go anyway. Writes to the
+  page clipboard need a gesture: writeText right after a key or click in
+  the desktop (5 s), else at the next one (Safari wants the call inside the
+  handler) or the next copy event (`setData`). `document.hasFocus()` is
+  false throughout in headless Firefox: don't gate on it — "inside" is
+  tracked from focusin, the window's focus/blur and visibilitychange, and
+  any key/button press in the desktop. Leaving for nothing focusable (a
+  click on plain page text, an embedder's `blur()` — unkernel's
+  setDesktopShown(false) on touch) fires no focusin and no window blur:
+  a focusout whose focus did not land back in the desktop (checked in a
+  microtask: input's sink blur-and-refocus is no leave) is a leave, and so
+  is a press outside the container that is not on a surface (input's
+  `outside` hook: a toolbar button that keeps the focus). Without it, in
+  Safari an app's owed text overwrote what the user copied on the page
+  meanwhile. Newer-side rules (clipboard.ts's
+  table, one test per row in clipboard.test.ts): only a selection set
+  while inside is owed to the page; one set while away, or owed when the
+  user leaves, becomes `verify` — written at the next look at the page
+  (paste event, granted read) only if the page still holds `pageKnown`,
+  else the page's text wins. Writing at the next plain key instead
+  clobbered what the user copied elsewhere and dropped their paste. An app
+  clearing its selection reaches the bridge as its conn with no types (the
+  core's `setSelection(_, 0)` names the client; the owner going — source
+  destroyed, conn closed, link closed — is conn 0 with none): the page is
+  cleared ('' written) only if it holds that app's text as the bridge
+  wrote it; the owner going leaves the page alone (and an owed write
+  still happens) — and a paste of that unchanged page text then makes it
+  the selection again (`wlEmpty`: the Wayland side holds nothing; also
+  after an app's clear over the bridge's own, and after every link
+  reconnect, which empties the selection — unkernel), never over an app's
+  newer non-text selection. A paste event with no text but other types
+  (an image copied elsewhere: `clipboardData.types`) is a changed page
+  clipboard: `pageKnown` = null, nothing written over it. With
+  clipboard-read already granted, coming back into the desktop is a look
+  too and writes an away copy if the page is unchanged (README says so):
+  the read proves nothing the user copied is lost, so it is kept rather
+  than waiting for a paste. Copy chords in the desktop are prevented unless
+  the bridge owes text (`wantsCopy`), and every copy/cut event while the
+  sink has the focus is cancelled: Firefox keeps a page text selection
+  across the (preventDefault'ed) press into the desktop, and a Ctrl+C
+  there (a terminal's interrupt) copied it over the user's clipboard. A
+  cancelled copy event with nothing set leaves the clipboard as it was
+  (Chromium: run-poc `clipboard` phase; Gecko: firefox-smoke step 4).
+  Everything keyboard-side queues behind a paste chord in order: keys,
+  repeats, releases, lock-state syncs, IME text.
+- **Keys the app has down are input.ts's `pressed`**: a release goes out
+  only for a pressed key, and all of them are released (to the conn they
+  went to) before a keyboard leave of that conn, on the window's blur (DOM
+  focus stays on the sink, but Alt+Tab's Alt release goes to another
+  window) and, on Apple, at the last Cmd's keyup for keys pressed under
+  Cmd (`cmdKeys`; macOS browsers fire no keyup for a key released while
+  Cmd is held). The core's `mods_depressed` is per conn and survives a
+  leave: a lost release left Ctrl/Super depressed in the app's next
+  enter. Apple's clipboard chords Cmd+C/X/V (Ctrl+V fires no paste there)
+  reach the app as a whole Ctrl chord at the press — Super up (if the app
+  has it), Ctrl down, key down, key up, Ctrl up, Super down while Cmd is
+  held (`metaHeld`) — never waiting for the key's release (none may come).
+  Written from the browsers' documented behaviour; never run on a Mac.
 - **An engine embedder focuses new toplevels**: wl-copy waits for keyboard
   focus before setting the selection (the input module does; a headless embedder
   calls `keyboardEnter` itself) or wl-copy hangs.
@@ -513,11 +860,31 @@ with it. New findings go in the matching section.
   it too (a popup grab: GTK's press-drag-release menus). A captured element
   removed from the DOM gets no lostpointercapture (the document does): the
   next press checks `isConnected`.
+- **Touch needs `touch-action: none` on the container, set by the lib**
+  (view.ts `CONTAINER_STYLE`, restored on dispose): without it the browser
+  claims a touch drag as a pan and fires pointercancel, which ends wm
+  grabs — touch drags worked only on web/, whose CSS had it. Same for
+  user-select / the touch callout (long-press) and `isolation: isolate`
+  (window z-indexes grow without bound). The IME sink says `user-select:
+  text` itself: WebKit takes no typing in an editable under `none`.
 - The IME sink keeps `inputmode="none"` (a focused contenteditable pops the
   on-screen keyboard on touch) and switches to `text` only while the focused
   conn's zwp_text_input_v3 is enabled; browsers re-read inputmode on focus,
   so a change refocuses the sink. A client without text-input gets hardware
   keys only — on touch devices no keyboard at all.
+- **A wm grab or drag needs a button down, and ends with it**: `held`
+  (pointerIds from pointerdown to pointerup/pointercancel) gates the
+  'move'/'resize' events (ignored) and 'drag-start' (dragCancel: an
+  unanswered drag wedges the seat); a grab ends at the pointerup, a
+  pointercancel, a pointermove with `buttons === 0` (a release the page
+  never saw: drag → dragCancel) or the window's blur — of ITS pointer
+  only (`grab.pointer` / `dnd.pointer`: the last one pressed): a hovering
+  pen or a mouse moving beside a touch drag used to end it. Not on
+  lostpointercapture: suppress(true) releases input's capture of that very
+  pointer as the grab starts. Alt+drag (pointer
+  capture on the box) ends on pointerup, pointercancel,
+  lostpointercapture or a buttonless move — it used to go on moving the
+  window on hover after a lost capture.
 - A move/resize grab starts at the WM's `lastPointer`, which `pointerdown`
   must update too: touch has no hover moves, so `pointermove` alone leaves it
   where the previous touch ended (the window jumps, then drags relatively).
@@ -538,7 +905,9 @@ with it. New findings go in the matching section.
 - **WebGL is used only on real hardware**: a GL context in a headless browser
   deadlocks headless compositing at retina sizes (software GL), and even a
   probe racing a reload hangs it. Real browsers probe once (sessionStorage)
-  and need a non-software renderer name. Context loss → swap in a fresh 2D
+  and need a non-software renderer name. WebKit masks it as "Apple GPU"
+  everywhere (WebKitGTK on llvmpipe too): GL is picked there regardless
+  (it works, software included); Firefox's sanitized names still match. Context loss → swap in a fresh 2D
   canvas (a GL canvas can't get a 2D context).
 - **The 2D presenter accepts bgra/bgrx** (`swizzleRect`): in GL mode popups
   and subsurfaces are 2D, and after a GL context loss toplevels too.
@@ -579,7 +948,9 @@ with it. New findings go in the matching section.
 ## Demo page (`web/`)
 
 - **`#desktop` belongs to the lib** (canvases, windows, the IME sink); React
-  renders nothing into it. Its clientWidth/Height IS the wl_output size: the
+  renders nothing into it. The view sets what the lib relies on itself
+  (touch-action none, user-select none, isolation: isolate; restored on
+  dispose): the page's CSS only sizes and dresses it. Its clientWidth/Height IS the wl_output size: the
   page sizes it in `index.css` (absolute, inset 0), since an unlayered rule
   there beats Tailwind classes on the element (a `relative` rule gave it 0
   height and the apps negative buffer sizes).

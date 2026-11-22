@@ -184,14 +184,108 @@ import { createWland, createWsLink } from 'wland/client';
 await createWland({
   container,
   link: createWsLink('wss://example.com/ws'),  // a different relay
-  scale: 2,                   // pin the scale (default: follows devicePixelRatio)
+  scale: 2,                   // pin the scale, 1.5 works too (default: follows devicePixelRatio)
   webgl: 'never',             // 'auto' | 'always' | 'never'
   browserFullscreen: true,    // fullscreen windows also go browser-fullscreen
   shortcuts: false,           // turn off Alt+F9/F10/F11
+  clipboard: false,           // keep the Wayland clipboard inside the desktop
 });
 ```
 
 See [`lib/client.ts`](lib/client.ts) for every option.
+
+### Clipboard
+
+By default the Wayland clipboard and the page's clipboard are bridged, for
+plain text, both ways:
+
+- **Paste into an app.** Ctrl+V, Ctrl+Shift+V or Shift+Insert in the desktop
+  makes the browser fire its `paste` event. wland makes that text the
+  clipboard of the focused app before the key reaches it, so the app's own
+  paste reads it. (The key waits for the event: Chromium sends it at once,
+  Firefox a moment later.) The keys themselves reach the app unchanged: in a
+  terminal Ctrl+C is still an interrupt and Ctrl+V literal-next (terminals
+  paste with Ctrl+Shift+V). Ctrl+C in the desktop never copies what the
+  page has selected.
+- **Copy out of an app.** When an app copies, wland reads the text and
+  writes it to the page's clipboard while the browser allows that: right
+  away if you pressed a key or clicked in the desktop within the last 5
+  seconds (Chromium, Firefox), otherwise at your next key or click in the
+  desktop, or your next Ctrl+C there (Safari needs one of those).
+- **macOS, iOS** (not yet tried on a Mac or an iPad: see Current limits).
+  Cmd+C, Cmd+X and Cmd+V are the chords there (Ctrl+V is no paste in a Mac
+  browser: it goes to the app as a plain key). They reach the app as
+  Ctrl+C, Ctrl+X and Ctrl+V, the chords Linux apps know, each sent whole
+  when the chord is pressed (macOS browsers drop the key's release while
+  Cmd is held); so in a terminal Cmd+V is literal-next and Cmd+C an
+  interrupt — paste there with Cmd+Shift+V (Ctrl+Shift+V) where the browser
+  makes it a paste, or Cmd+V once into any other app and then the
+  terminal's Ctrl+Shift+V.
+
+Which side is newer is decided by where you were. You are elsewhere once
+the desktop loses the keyboard focus (another tab or window, page UI, a
+click on plain page text) or you click outside it. An app that copies
+while you are elsewhere (a script's `wl-copy`, a background app) never
+writes the page clipboard while you are away; apps in the desktop paste
+its text. The first look wland gets at the page clipboard after you are
+back decides — your next paste in the desktop, or coming back itself if
+the browser has already granted `clipboard-read`: if the page clipboard is
+what wland last saw there, the app's text is newer — it is written to the
+page (and pasted); if it changed (you copied something meanwhile, text or
+not), yours stays and is pasted. An app clearing the clipboard (a password
+manager's timeout, `wl-copy --clear`) clears the page clipboard too while
+it still holds that app's text — when you are away, at that first look. An
+app that merely exits (or a dropped connection) leaves the page clipboard
+alone, as a clipboard manager would, and its text still pastes into the
+other apps from there.
+
+It never reads the page's clipboard on its own, with one exception: if the
+browser has already granted `clipboard-read` to the page, focusing the
+desktop reads it, so an app's Paste menu sees what you copied elsewhere. An
+app sees the page's text only while it has keyboard focus. Text copied
+inside the desktop and pasted back in stays the app's (no round trip), and
+a page clipboard that is older than an app's copy never replaces it. Text
+over 4 MiB is not bridged. Other types (HTML, images) are not bridged yet;
+the engine API below carries any type. The bridge needs a relay that
+speaks it, and checks on every connection: in front of an older relay
+(`wlandr` 0.1.0) it switches itself off for that connection with one log
+line, and the copy and paste keys go to the apps as plain keys, as with
+`clipboard: false`; apps still copy and paste among themselves.
+
+From code (both `wland/engine` and `wland/headless`):
+
+```js
+import { readSelectionText, setSelectionText } from 'wland/engine';
+
+await readSelectionText(engine);       // the app's clipboard as text, or null
+setSelectionText(engine, 'hello');     // offer text to the focused app
+engine.readSelection('image/png');     // any type, as bytes (Promise)
+engine.setSelection({ 'text/html': '<b>hi</b>', 'text/plain': 'hi' });
+// 'selection' events tell you when it changes: { conn, mimes }
+// (an app's conn with no mimes: it cleared it; conn 0 with none: its owner went)
+engine.selectionBridged();             // false on a relay too old for this:
+// reads then reject (NO_SELECTION_BRIDGE) and setSelection returns false
+```
+
+### Output size and scale
+
+The output apps see follows the container's size (a ResizeObserver: if
+your layout resizes the container, apps get the new size) and the device
+pixel ratio, live. A hidden container (`display: none`) keeps the last
+size. To decide yourself after start, pin either one:
+
+```js
+wl.output.setSize({ width: 1920, height: 1080 }); // apps see this, whatever the container
+wl.output.setScale(1.5);                          // integer or fractional
+wl.output.setSize(null);                          // follow the container again
+wl.output.setScale(null);                         // follow devicePixelRatio again
+wl.output.state();                                // { width, height, scale, sizePinned, scalePinned }
+```
+
+A size is rounded to whole px and each side must round to at least 1; a
+scale must be a finite number above 0. Anything else throws a RangeError
+and changes nothing (an invalid `scale` option rejects `createWland`,
+leaving nothing behind). After `dispose()` these calls do nothing.
 
 ### Start the server from Node
 
@@ -243,7 +337,8 @@ await relay.close();
 ```
 
 The headless desktop also has `windows()`, `focus()`, `move()`, `resize()`,
-`press('ControlLeft', 'KeyC')`, `scroll()` and more. See
+`press('ControlLeft', 'KeyC')`, `scroll()`, `readClipboard()` /
+`writeClipboard(text)` and more. See
 [`lib/headless.ts`](lib/headless.ts).
 
 ### Build your own composition
@@ -255,6 +350,8 @@ one, for example to draw your own window frames.
 - **view** — turns events into canvases and window elements.
 - **input** — turns DOM pointer and keyboard events into engine calls.
 - **wm** — the window manager: move, resize, maximize, popups, drag and drop.
+- **clipboard** — the page clipboard bridge (`createClipboardBridge`; pass
+  its `hooks` to `createInput({ clipboard })` and feed it every event).
 
 ```js
 import {
@@ -296,6 +393,13 @@ const view = createView({
 The default wm expects the default mount. With your own frames, handle the
 `move`, `resize`, `maximize`, `fullscreen` and `minimize` events yourself.
 
+The container is wland's: the view sets `touch-action: none` on it (touch
+drags are window moves and app input, not page pans — without it the
+browser cancels them), turns off text selection and the touch callout, and
+makes it its own stacking context (`isolation: isolate`: window z-indexes
+stay inside it). Dispose puts the old values back. Its size, position and
+`overflow` are yours.
+
 ### Use the engine alone
 
 The engine runs anywhere: a page, a Worker, or Node.
@@ -320,6 +424,12 @@ A few things to know:
   `postMessage`.
 - **Focus new windows.** Call `keyboardEnter` for new toplevels. Some apps
   wait for focus (`wl-copy` does). The input module does this for you.
+- **Lock keys.** NumLock starts on and Caps Lock off; their key presses
+  toggle them. Call `keyboardLocks(capsLock, numLock)` with the browser's
+  state (`getModifierState`) before keys that depend on it, as the input
+  module does (on macOS, which has no NumLock, it infers NumLock from what
+  the keypad typed). The state, toggles included, carries over when the
+  link reconnects.
 
 All events and calls are typed in [`lib/engine.ts`](lib/engine.ts).
 
@@ -354,9 +464,25 @@ const wl = await createWland({
 });
 ```
 
-`open` and `read` may return promises, but sync is faster. The demo page in
+`open` and `read` may return promises, but sync is faster: while one is
+pending, later frames wait. Two optional methods cut the cost:
+
+- `readv(token, reads)` gets every damaged span of a commit in one call
+  (`reads` is `[{ offset, dst }]`), so memory behind a round trip (a
+  worker) costs one round trip per commit and copies only what changed.
+  It may return one promise.
+- `view(token, offset, length)` returns the memory itself, synchronously:
+  one `Uint8Array` (no copy at all: it becomes the commit's pixels) or an
+  array of them for scattered pages. A SharedArrayBuffer is fine (checked
+  in Chromium, 2D and WebGL, and Firefox, 2D, on a cross-origin-isolated
+  page). Return `null` to fall back to `readv`/`read` for that commit.
+
+The engine uses `view`, then `readv`, then `read`. Whatever it is handed is
+only read while the commit is processed. The demo page in
 `web/` runs this whole path in one tab. A small Node example lives in
-[`test/support/handles-procfd.ts`](test/support/handles-procfd.ts).
+[`test/support/handles-procfd.ts`](test/support/handles-procfd.ts); the
+`HandleSource` doc comment in [`lib/engine.ts`](lib/engine.ts) is the full
+contract.
 
 ## 🧩 How it works
 
@@ -401,8 +527,10 @@ The full wire format is in [`protocol/STREAM.md`](protocol/STREAM.md).
 ## 📡 The relay (`wlandr`)
 
 `wlandr` is the server binary behind `npx wland`. It is one static Zig binary
-of about 600K, with no dependencies. It runs on Linux only. The npm package
-ships it for linux-x64 and linux-arm64.
+of about 700K, with no dependencies. It runs on Linux only. The npm package
+ships it for linux-x64 and linux-arm64, and installs on any platform (the
+browser side runs anywhere); `startServer`, `startRelay` and `npx wland`
+fail with a clear error when asked to run the relay elsewhere.
 
 It runs in two shapes:
 
@@ -424,14 +552,31 @@ wlandr --link SPEC [--buffers MODE] [--dmabuf MODE]
 or `kwshm` (VM guest ⇄ host page).
 
 `--dmabuf readback[:NODE]` lets GPU apps in: their buffers are copied like
-shared memory. It is off by default, and experimental.
+shared memory. `--dmabuf virtgpu[:NODE]` (a virtio-gpu guest, e.g. with
+`--buffers kwshm`) names each buffer by its GPU resource instead, for a page
+whose renderer holds it (the `gpu` option of `createWland`); NODE must be a
+virtio_gpu render node, held open only while a GPU buffer exists. A page
+without a `gpu` option doesn't offer GPU buffers to apps on such a relay,
+so they render in software instead of showing blank windows. Both are off
+by default, and experimental.
 
-A relay for a VM guest, with no HTTP:
+A relay for a VM guest, with no HTTP: each
+[GitHub release](https://github.com/pithings/wland/releases) after
+v0.1.0-261121-6b1a8a2 has
+`wlandr-link-linux-arm64.tar.gz` and `wlandr-link-linux-x64.tar.gz`, a
+`--link`-only build (about 300K, built with `-Dhttp=false` and
+ReleaseSmall). Each holds one executable `wlandr`, static, with no libc,
+built for the baseline CPU (ARMv8.0 or x86-64 v1). The full binaries
+(`wlandr-linux-<arch>.tar.gz`, the ones the npm package ships) take the
+same `--link` flags too, but they are twice the size.
 
 ```sh
-zig build -Dtarget=aarch64-linux-musl -Dcpu=generic -Dhttp=false -Doptimize=ReleaseSmall -p out
-out/bin/wlandr --link vsock:2:PORT --buffers kwshm
+tar -xzf wlandr-link-linux-arm64.tar.gz      # → ./wlandr
+./wlandr --link vsock:2:PORT --buffers kwshm                   # shm apps, by handle
+./wlandr --link vsock:2:PORT --buffers kwshm --dmabuf virtgpu  # + GPU apps, by resource
 ```
+
+`zig build release` builds all four into `zig-out/release/`.
 
 ## 🔒 Security
 
@@ -457,8 +602,9 @@ authentication.
 - **Input** — keyboard, pointer, wheel, cursor shapes and app-drawn cursors.
 - **Pointer lock** — for games and 3D apps.
 - **Text input** — dead keys, CJK and the emoji picker.
-- **Clipboard** — `wl-copy`, `wl-paste`, copy/paste between apps, and
-  middle-click paste.
+- **Clipboard** — `wl-copy`, `wl-paste`, copy/paste between apps,
+  middle-click paste, and copy/paste with the page's clipboard (plain text;
+  checked in headless Chromium and Firefox).
 - **HiDPI** — integer and fractional scaling, tracked live.
 - **Frame timing** — presentation feedback with the real refresh rate.
 - **Performance** — up to 120 FPS on a Retina MacBook. Only changed
@@ -466,14 +612,27 @@ authentication.
 
 ## 🚧 Known limits
 
-- Tested in Chromium only so far. Firefox and Safari are untested.
+- Browsers: Chromium is what the full browser E2E runs. Firefox 160 passes
+  a smoke test here, headless (`node tools/firefox-smoke.ts`: windows paint,
+  clicks and keys reach the app, shared-memory and GPU-resource paths);
+  WebKit (Playwright's 27.2 build on Linux) passed the same checks by hand,
+  WebGL presenter included. Safari itself has not run. Not seen in either:
+  Pointer Lock, the browser's fullscreen, IME, cursor images at hi-dpi,
+  and WebGL in Firefox (none headless here). WebKit reports every GPU as
+  "Apple GPU", so the WebGL presenter is always picked there.
 - Apps don't survive a reload or a dropped connection.
 - The keyboard layout is fixed to US. Composed text still works.
-- GPU apps only with `wlandr --dmabuf readback` (experimental). Otherwise GL
-  apps render in software.
+- GPU apps only with `wlandr --dmabuf readback` or `virtgpu` (experimental;
+  neither has run on real GPU hardware yet). Otherwise GL apps render in
+  software.
 - X11 apps need xwayland-satellite and Xwayland installed. They can't be
   maximized.
 - Drag and drop works between wland apps, not with the host page.
+- The page clipboard bridge carries plain text only, not the middle-click
+  (primary) selection, and has not run in Safari. The macOS/iOS keyboard
+  handling (Cmd+C/X/V as Ctrl chords, keys released when Cmd goes up) has
+  not run on a Mac or an iPad in any browser: it follows the browsers'
+  documented key events.
 - Pointer lock needs a click to start. Esc or switching tabs ends it.
 - No server-side decorations. Apps without their own titlebar can be moved
   with Alt+drag, but not resized.
@@ -497,6 +656,7 @@ zig build test                             # native unit tests
 npm test                                   # zig + smoke + typecheck + Node tests
 node tools/headless-e2e-test.ts            # apps through the relay, no browser
 tools/run-poc.sh > /tmp/poc.log 2>&1       # browser E2E with Chromium
+node tools/firefox-smoke.ts                # a smoke test in headless Firefox
 ```
 
 The E2E tests use a small fixture app (`test/fixture/`) that stands in for

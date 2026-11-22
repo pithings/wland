@@ -13,6 +13,24 @@ phase whose app is missing is skipped; relay-e2e requires them all):
 sudo dnf install -y wayland-utils foot wl-clipboard weston-demo nautilus
 ```
 
+Real apps run in a throwaway home (`test/support/apps.ts` `appHome()`;
+run-poc's `WLAND_E2E_HOME`): HOME and the XDG dirs in a temp dir,
+`HISTFILE=/dev/null`, `INPUTRC=/dev/null`, `GSETTINGS_BACKEND=keyfile`, and
+no session bus of the developer's (appHome's `DBUS_SESSION_BUS_ADDRESS`
+names a socket nobody listens on; run-poc's APP_ENV unsets it, so
+tools/wland-run gives nautilus a `dbus-run-session` of its own). A driver
+starting a real app any other way, or a session bus for one, gives it that
+environment too. tools/wland-run starts a private bus only when
+DBUS_SESSION_BUS_ADDRESS is unset — on any desktop it is set, and nautilus
+then ran on the developer's bus and wrote ~/.config/dconf/user through
+their dconf-service despite the throwaway HOME (check: the file's mtime
+and `inotifywait` on ~/.config/dconf across a real `gtk` run).
+Without it the E2Es read and wrote the developer's dotfiles: bash appended
+every typed line to ~/.bash_history, and this container's /etc/inputrc
+binds PgUp/PgDn (the keypad's 9/3 with NumLock off) to history search, so
+the keypad phase's half-typed line was replaced by the previous run's —
+foot's title alternated pass/fail between runs.
+
 What the fixtures don't cover, the real apps do: libwayland-client's own
 checks, xkbcommon compiling our keymap (the fixture only checks it is xkb
 text), GTK's real commit patterns, foot's fractional-scale path, X11 through
@@ -28,9 +46,12 @@ Mesa clients still bind it: `wlandr --dmabuf readback:/dev/null` (any char
 device passes as the "render node") makes `wayland-info` print the feedback
 and `weston-simple-egl` read it, fail to open the device and fall back to
 wl_shm. A client really rendering into a dmabuf needs a host with a GPU.
-COMMIT kind 2 (GPU resources) has no emitter in wlandr: only the JS test
-relay sends it (the handle demo's `gpu=1` mode names kwshm exports as
-resources).
+COMMIT kind 2 (GPU resources): wlandr emits it with `--dmabuf virtgpu`,
+which here only runs against the test-only stand-in device
+`--dmabuf virtgpu:@fake` (`virtgpu.Fake`: memfds as dmabufs; the `dmabuf`
+fixture in both Node E2Es); the JS test relay sends it too (the handle
+demo's `gpu=1` mode names kwshm exports as resources). No real
+virtio-gpu node exists here.
 
 Real clients that set cursor surfaces (`wl_pointer.set_cursor`, no
 cursor-shape): weston's toytoolkit apps (`weston-flower`; it loads its
@@ -92,7 +113,7 @@ apps do through the compositor is checked without a browser, by
 | `server/` relay: WS path, wire handling, copy buffers | `zig build test` + `node tools/headless-e2e-test.ts` |
 | `server/src/xwayland.zig`, the X11 launch path | `zig build test` + `node --test test/relay.test.ts` (a stand-in satellite) + `WLAND_E2E_APPS=real node tools/headless-e2e-test.ts` with `xwayland-satellite`, `Xwayland`, `xeyes` on PATH (the x11 phase skips otherwise) |
 | `server/` relay: `--link`, STREAM framing, handle backends | `zig build test` + `node tools/relay-e2e-test.ts` |
-| linux-dmabuf (`dmabuf.zig`, the dmabuf paths in relay/core) | `zig build test` (memfds stand in for dmabufs) + both Node E2Es for the shm paths it shares; a real GPU client is a human check (see Setup) |
+| linux-dmabuf (`dmabuf.zig`, `virtgpu.zig`, the dmabuf paths in relay/core) | `zig build test` (also Debug; memfds stand in for dmabufs, `virtgpu.Fake` for a virtio-gpu node) + both Node E2Es (their GPU phases: the `dmabuf` fixture over the test-only `--dmabuf virtgpu:@fake`, fixtures only — skipped with `WLAND_E2E_APPS=real`); a real GPU client is a human check (see Setup), a real virtio-gpu node unkernel's |
 | GPU commits in the engine/view/headless (`EngineOptions.gpu`, format 'gpu') | `node --test test/handles.test.ts test/client.test.ts test/headless.test.ts` + run-poc `handle-demo` (its `gpu=1` modes, 2D and GL) |
 | `lib/engine.ts`, links, handles | `npm run typecheck` + `node --test test/*.test.ts` + both Node E2Es |
 | `lib/index.ts` (`startServer`, `startRelay`, `serverBinary`) | `node --test test/relay.test.ts` (real wlandr on an fd link + headless + fixtures) + `tools/smoke.sh` |
@@ -100,12 +121,14 @@ apps do through the compositor is checked without a browser, by
 | Presentation feedback (core `Feedback`, PRESENTED in relay/wasm/engine, the frame loop's refresh) | `zig build test` (also Debug) + `node --test test/engine.test.ts test/client.test.ts test/handle-demo.test.ts` + both Node E2Es (weston-presentation-shm on each link) + run-poc `handle-demo` (its synthetic clients check every presented time in the browser) |
 | `lib/view.ts`, `lib/present.ts` | run-poc `foot retina handle-demo`; GL code: `bun tools/browser-e2e.ts webgl` |
 | Pointer images (cursor surfaces/shapes: core, `view.ts`, headless) | `zig build test` + `node --test test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (weston-flower) + run-poc `cursor` |
-| `lib/input.ts` (DOM events → engine) | run-poc `foot` (its `sweep` phase is the pointer-path check) |
+| `lib/input.ts` (DOM events → engine) | run-poc `foot` (its `sweep` phase is the pointer-path check); keys / lock state: `node --test test/client.test.ts` + `node tools/headless-e2e-test.ts` (its foot phase types keypad digits) |
 | Pointer constraints / relative pointer (core, engine, `input.ts` Pointer Lock, headless) | `zig build test` + `node --test test/engine.test.ts test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (weston-constraints, SDL3) + run-poc `constraints` |
+| Clipboard bridge (core own selection / `readSelection`, relay pipe_read and pipe writes, engine selection API, `lib/clipboard.ts`, input's paste-chord queue) | `zig build test` (also Debug) + `node --test test/clipboard.test.ts` + both Node E2Es (their clipboard phases) + run-poc `foot` (its `clipboard` phase; CDP grants the clipboard permissions) + `node tools/firefox-smoke.ts` (step 3: Gecko's late paste event targets the body; step 4: a page selection Gecko keeps across the click into the desktop is not copied by Ctrl+C or a copy command there) |
 | `lib/wm.ts` (grabs, maximize, popups, dnd) | run-poc `foot gtk` (gtk's `dnd` phase drags in the `files` fixture); real nautilus: `tools/dnd-test.sh` |
 | Window states (fullscreen, minimize, maximize: core, view, wm, input, headless) | `zig build test` (also Debug) + `node --test test/client.test.ts test/headless.test.ts` + both Node E2Es (headless: foot, weston-fullscreen, nautilus's minimize button — fixtures `term`, `fullscreen`, `files`; relay: a minimized simple-shm stops on the stream link) + run-poc `states` |
 | `lib/client.ts`, the server's page serving and takeover | run-poc `foot takeover` |
-| `test/support/`, `test/browser/` | `node --test test/*.test.ts` + run-poc `handle-demo` |
+| Anything browser-facing that may differ in Gecko (input, present, view, client) | also `node tools/firefox-smoke.ts` (headless Firefox, its own port 8951 / BiDi 9351 / socket `wayland-ffsmoke`) |
+| `test/support/`, `test/browser/` | `node --test test/*.test.ts` + run-poc `handle-demo` (its `sab=1` modes load through `test/support/isolated.ts`, a COOP/COEP mirror of wlandr: wlandr's own pages can't make a SharedArrayBuffer) + `node tools/firefox-smoke.ts` |
 | `test/fixture/` (wland-fixture), `test/support/apps.ts` | `zig build` + both Node E2Es + the run-poc groups using the mode changed (`term`: foot, states; `files`: gtk; `cursor`; `constraints`) |
 | `web/` | nothing here: build it and look (`tools/run-poc.sh --demo`) |
 | Before a release, or a change that cuts across the above | all of the above: `npm test`, both Node E2Es, the whole `tools/run-poc.sh`; then the same with `WLAND_E2E_APPS=real` |
@@ -128,6 +151,10 @@ run-poc groups, in run order: `foot gtk cursor constraints states retina takeove
   view/input/wm). With apps: `tools/headless-e2e-test.ts`; a script that
   runs an app to completion must not block the event loop (`spawnSync`
   deadlocks: the compositor serving the app is that loop).
+- Headless Firefox copies its built-in newtab add-on (~3.7 MB) to
+  `$TMPDIR/tmp-XXX.xpi` at every start and removes it only on a clean
+  exit: firefox-smoke points TMPDIR into the profile dir (removed) and
+  closes Firefox over BiDi (`browser.close`) before the SIGKILL.
 - A GTK app's session bus activates services (gvfsd, portals, localsearch,
   at-spi; ~12 processes, each holding an inotify instance, 128 per user)
   that exit only when the bus goes. A signal to `dbus-run-session` leaves its
@@ -199,8 +226,22 @@ run-poc groups, in run order: `foot gtk cursor constraints states retina takeove
   resizes). foot's titlebar is inside the window box, its CSD border just
   outside; GTK's border is just inside.
 - nautilus restores a maximized window from the GSettings keyfile
-  (`~/.config/glib-2.0/settings/keyfile`); run-poc wipes it before the nautilus
-  phase because the tests' click offsets assume a floating start.
+  (`$XDG_CONFIG_HOME/glib-2.0/settings/keyfile`); the tests' click offsets
+  assume a floating start, which the per-run app home gives (run-poc used
+  to delete the developer's own keyfile instead).
+- **Firefox** (`/usr/sbin/firefox`, 160) is driven over WebDriver BiDi:
+  `--remote-debugging-port N` serves `ws://127.0.0.1:N/session` (no
+  geckodriver; Node's WebSocket does). Start it with `MOZ_HEADLESS=1`
+  and without `WAYLAND_DISPLAY`, a fresh `--profile` dir and `--no-remote`.
+  Headless Firefox has no WebGL here at all (Gecko refuses software GL;
+  `webgl.force-enabled` doesn't help), and its UA has no "Headless", so
+  the view's probe runs and finds no context. BiDi key values: `\uE006`
+  is Enter (code `Enter`), `\uE007` is NumpadEnter.
+- **WebKit**: no Safari here, but `~/.cache/ms-playwright/webkit-*` holds
+  Playwright's WebKit MiniBrowser (a Playwright from another project
+  drives it with `executablePath: …/pw_run.sh`; nothing in the repo
+  depends on it). Its WebGL works headless (software) and reports
+  "Apple GPU", so the view picks WebGL there.
 - The WebGL present path is not exercised in E2E (GPU-less container).
   browser-e2e `webgl` forces it on software GL at dpr 1 only (`?webgl=always`);
   real-GPU verification is a human item.
@@ -211,7 +252,11 @@ run-poc groups, in run order: `foot gtk cursor constraints states retina takeove
   `pgrep` also matches defunct zombies; filter them for liveness checks.
 - wl-copy (and `wland-fixture copy` without `--foreground`) forks a server
   for the selection; the fixture detaches it from the caller's stdio so a
-  test waiting for the process to close doesn't wait on the child.
+  test waiting for the process to close doesn't wait on the child. With
+  `--paste-once` (`-o`) each `send` is written by a forked child while
+  the source exits at once (the fixture's child waits 100 ms so the
+  conn is surely gone first): the read sees EOF after its source hung
+  up, which must still count as complete.
 - The `files` fixture's click positions are nautilus's (default floating
   layout, 24 px shadow): `test/fixture/files.zig` lists them. `paste` maps a
   1×1 window first: the core sends selections to the keyboard-focused
@@ -219,6 +264,12 @@ run-poc groups, in run order: `foot gtk cursor constraints states retina takeove
 - Not in run-poc: `tools/dnd-test.sh` (real nautilus dnd, own port/socket;
   coordinates are layout-dependent — re-screenshot with
   `bun tools/browser-e2e.ts shot 9224 x.png` if it misses) and
-  browser-e2e `webgl`. `WLAND_E2E_RELAY="qemu-aarch64 DIR/bin/wlandr"`
-  runs relay-e2e against the guest build (`zig build -Dtarget=aarch64-linux-musl
-  -Dcpu=generic -Dhttp=false -Doptimize=ReleaseSmall -p DIR`).
+  browser-e2e `webgl`. `WLAND_E2E_RELAY="qemu-aarch64 $PWD/zig-out/release/wlandr-link-linux-arm64"`
+  runs relay-e2e against the guest build that releases ship (`zig build
+  release`). Version skew: build an old relay in a scratch dir (`git
+  archive <rev> | tar -x -C DIR`, `zig build` there; no worktree) and
+  point `WLAND_E2E_RELAY` at its `zig-out/bin/wlandr` — relay-e2e and
+  headless-e2e (which honours it too, `PORT` for its own port) skip what
+  that relay can't do with a message (the clipboard bridge without FEATURE
+  selection_cache: they check it is refused at once and that apps'
+  pastes return; `--dmabuf virtgpu`, found by its `--help`).

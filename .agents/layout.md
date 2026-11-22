@@ -15,19 +15,24 @@ Where things live and which file owns what. Details are in the code.
 ## `server/src/` — the relay
 
 - `main.zig` CLI (`--port/--host/--web-root` = HTTP+WS; `--link fd:|unix:|vsock:`;
-  `--buffers copy|procfd|kwshm`; `--dmabuf readback[:NODE]`; `-Dhttp=false`
+  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `-Dhttp=false`
   = a --link-only build).
 - `relay.zig` — app sockets, fd interception, pools, attach/commit tracking,
   the release ledger (`settleRelease`), ACK hand-over, frame-callback
-  interception, pipe tokens, SRVOBJ, presentation timestamps (PRESENTED);
-  `serveLink`/`serveApp`.
+  interception, pipe tokens, SRVOBJ, presentation timestamps (PRESENTED),
+  the kept copy of the engine's own selection (own_pipe);
+  `serveLink`/`serveApp`. `pipe_writer.zig` — the one thread writing the
+  own selection into receivers' pipes (capped, refcounted payloads).
 - `link.zig` Link interface · `ws_link.zig` browser WS · `stream_link.zig`
   u32-length records.
 - `buffers.zig` backend interface · `copy_backend.zig` snapshot/swizzle/trim/LZ4 ·
   `handle_backend.zig` one handle per wl_buffer + procfd/kwshm exporter ·
   `kwshm.zig` /dev/kwshm UAPI (+ `kwshm.fake` in tests) · `dmabuf.zig`
-  linux-dmabuf relay side: params planes, dmabuf buffers, the dmabuf backend
-  (readback: map + copy path), FEATURE bytes.
+  linux-dmabuf relay side: params planes, dmabuf buffers, the dmabuf backends
+  (readback: map + copy path; virtgpu: name the resource → COMMIT kind 2),
+  FEATURE bytes · `virtgpu.zig` virtio-gpu DRM UAPI (PRIME import,
+  RESOURCE_INFO, GEM_CLOSE), the relay-wide GEM-handle refcounts, and
+  `Fake`, the test-only stand-in device.
 - `socket.zig` claiming the wayland socket name (flock'd `<name>.lock`,
   first free `wayland-N`, never a live socket; libwayland's scheme) and
   removing both files at exit, signals included.
@@ -57,8 +62,11 @@ import lib/ source, never dist/.
   `wm.ts` move/resize grabs, maximize/fullscreen placement, minimize/restore,
   Alt+F9/F10/F11, the browser's Fullscreen API (browserFullscreen),
   popups, dnd ·
+  `clipboard.ts` the page clipboard bridge (text both ways, on input's
+  paste-chord hooks; engine selection API: `readSelection`/`setSelection`,
+  `readSelectionText`/`setSelectionText` in engine.ts) ·
   `client.ts` (`wland/client`) `createWland()` composes them and re-exports
-  all four (view/input/wm/present have no subpath of their own).
+  all of them (view/input/wm/clipboard/present have no subpath of their own).
 - `headless.ts` (`wland/headless`) `createHeadless()` — the engine plus a
   DOM-free scene (RGBA buffers, positions/z, hit-testing, scripted input,
   screenshots, `encodePNG`, the current pointer image, a scripted pointer
@@ -95,18 +103,22 @@ import lib/ source, never dist/.
   wland-run, `browser-e2e.ts` (every CDP check, one phase each),
   `headless-e2e-test.ts` (apps ⇄ wland/headless over WS),
   `relay-e2e-test.ts` (stream link, handle backends), `dnd-test.sh` (real
-  nautilus only).
+  nautilus only), `firefox-smoke.ts` (headless Firefox over WebDriver BiDi:
+  the handle demo + wlandr with the term fixture).
   `test/fixture/` — `wland-fixture` (Zig, built by `zig build`): the E2Es'
   stand-in apps, one mode each (`main.zig` lists them): `wl.zig` the client
   (socket + fds, strict decoding, WAYLAND_DEBUG log), `app.zig` seat and
   toplevels, `simple.zig` shm + presentation, `clip.zig`, `pointer.zig`
-  cursor/constraints/relative, `term.zig` (foot), `files.zig` (nautilus).
+  cursor/constraints/relative, `term.zig` (foot), `files.zig` (nautilus),
+  `dmabuf.zig` (a linux-dmabuf GPU client over memfds).
   `test/support/apps.ts` maps E2E roles to a fixture or the real app.
   `test/support/` — plain-JS Wayland helpers for tests (STREAM encoder, JS
   relay, synthetic clients, kwshm fake), `handles-procfd.ts` (a Node procfd
-  `HandleSource`, not in the package) and `presentation-shm.ts` (reads
-  weston-presentation-shm's output for both E2Es); `test/browser/` — the browser E2E's
-  pages. Nothing under `test/` or `tools/` imports from `web/`.
+  `HandleSource`, not in the package), `presentation-shm.ts` (reads
+  weston-presentation-shm's output for both E2Es) and `isolated.ts` (a
+  COOP/COEP mirror of a web root, for the handle demo's SharedArrayBuffer
+  modes);
+  `test/browser/` — the browser E2E's pages. Nothing under `test/` or `tools/` imports from `web/`.
 - `protocol/` — Wayland XMLs + `STREAM.md`.
 - `docker/` — the demo image (`Dockerfile`: a node+zig builder runs
   `npm run build`; debian:trixie-slim with chromium + pcmanfm + l3afpad, dpkg

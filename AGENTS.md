@@ -9,7 +9,8 @@ DOM-free scene for Node scripts and tests).
 Relay ⇄ engine speak STREAM v2 over a WebSocket or a byte stream; pixels travel in the
 stream (copy) or stay in shared memory by handle (procfd/kwshm — the
 unkernel path); GPU clients' dmabufs are copied like shm (`--dmabuf
-readback`).
+readback`) or named by their virtio-gpu resource for the page's renderer
+(`--dmabuf virtgpu`, COMMIT kind 2 — the unkernel path).
 
 ## Docs — read when relevant, not upfront
 
@@ -26,7 +27,7 @@ readback`).
 
 ```sh
 zig build                     # wlandr + wland-fixture + wasm (ReleaseFast; wasm → lib/, committed: rebuild after core/ changes)
-zig build release             # wlandr for linux x64 + arm64, static → zig-out/release/ (what the package ships)
+zig build release             # static wlandr, linux x64 + arm64 → zig-out/release/: wlandr-linux-* (full, the package ships) + wlandr-link-linux-* (-Dhttp=false ReleaseSmall, guests; GitHub release only)
 zig build -Doptimize=Debug    # symbols + safety; use when chasing UB
 zig build test                # native unit tests; also run with -Doptimize=Debug and -Dhttp=false
 npm test                      # zig test + smoke + typecheck + node --test test/*.test.ts (needs zig build)
@@ -36,6 +37,7 @@ tools/smoke.sh                # fast: build + tests + static serving
 tools/run-poc.sh > /tmp/poc.log 2>&1   # browser E2E: chromium + app fixtures (redirect to a file; a pipe makes it hang)
 tools/run-poc.sh foot gtk     # ...only some groups; all CDP checks live in tools/browser-e2e.ts (pages: test/browser)
 tools/run-poc.sh --demo       # human demo on :8080; then `tools/wland-run foot`
+node tools/firefox-smoke.ts   # headless Firefox (WebDriver BiDi): handle demo + relay/term smoke, not the full E2E
 node tools/relay-e2e-test.ts  # real relay over --link unix: ⇄ Node engine, app fixtures
 node tools/headless-e2e-test.ts  # app fixtures ⇄ wland/headless over the relay's WS, no browser
 WLAND_E2E_APPS=real node tools/headless-e2e-test.ts  # ...with the real apps (foot, nautilus, weston…; any E2E)
@@ -64,6 +66,14 @@ any of them (update this list when it does).
   claim; SIGBUS).
 - Input is role-gated (keyboard → toplevels only, pointer not to cursor
   surfaces) and focus-gated; a leave for a destroyed surface kills the client.
+- xdg_toplevel.move/resize start a grab only for a press still held on
+  that window (core `inImplicitGrab`; wm.ts re-checks the DOM's buttons and
+  ends a grab whose button is up). A popup's x/y counts from the parent's
+  set window geometry to its own (`surfaceAbs`), not from surface origins.
+- The engine re-reads subsurface/popup positions and ranks ('position'
+  events) only after a link message that left the core's `positions_dirty`
+  set (`wland_take_positions_dirty`): core code that moves, restacks,
+  reparents or unmaps one must raise it (`restacked` when ranks change).
 - Pointer constraints: the core owns the state (when a lock/confinement
   applies); the embedder only asks the browser for Pointer Lock when told
   ('pointer-lock') and reports grant/loss — `locked` goes out on the
@@ -73,7 +83,35 @@ any of them (update this list when it does).
   dmabuf `create` wl_buffers named to the relay by DMABUF_CREATED.
 - linux-dmabuf is opt-in (`wlandr --dmabuf`): the relay's FEATURE frame, first
   on a link, is what makes the core advertise it; plane fds stay in the relay.
+  With virtgpu a FEATURE dmabuf_kind goes first, and a core whose embedder
+  has no GPU source (`wland_set_gpu_source`, from `EngineOptions.gpu`)
+  then leaves it off: GPU clients fall back to wl_shm.
+- A conn's COMMITs (shm handles, virtgpu resources) share one serial space
+  (`AppConn.next_serial`) and one Pending/ACK ledger in `relay.zig`; a
+  virtgpu COMMIT holds a GEM-handle reference (`virtgpu.Importer`, counted
+  relay-wide: one handle per object) until its ACK. The render node is open
+  only while a handle is held (each open DRM file costs the page a host
+  virgl context). `--dmabuf virtgpu:@fake` is a test-only stand-in device,
+  never in the usage text.
+- A surface's full-buffer damage rect follows the dims AND the kind
+  (pixels / GPU resource) of what the engine last showed (`SurfaceState`).
+- The embedder's clipboard (pipe_read reads, its own selection offered to
+  apps) exists only on a link whose relay sent FEATURE selection_cache;
+  without it (wlandr 0.1.0) nothing of it is sent or offered and the page
+  bridge is inert (`Engine.selectionBridged()`).
 - Frame callbacks fire on exactly one side per link (WS: relay; stream: engine).
+- Every clipboard pipe fd stays in the relay, the page bridge's too: the
+  embedder's own selection is core state (its bytes in wasm; a receive is
+  answered with them — to a relay that announced FEATURE selection_cache
+  (wlandr) each payload once per link, FDMSG own_pipe — and the relay
+  writes the app's pipe on its one capped writer thread), and the engine
+  reads an app's selection through FDMSG pipe_read (the relay makes and
+  reads the pipe). Offered to the keyboard-focused client only, like any
+  selection; set or cleared (set_selection, primary too) only by the
+  keyboard-focused client, or one naming a recent input serial of its own
+  while no other client had input since; start_drag needs a press still
+  held. In the page, a paste chord's keys wait for the browser's paste
+  event (input's `clipboard` hooks), so the app reads the new selection.
 - Window states (maximized, fullscreen, minimized) are core state: the embedder
   asks (`setMaximized/setFullscreen/setMinimized`) and reacts to the events;
   restoring a minimized window is only ever the embedder's.

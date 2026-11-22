@@ -14,9 +14,13 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   wire over one engine link, intercepts only fd-carrying messages: shm
   create_pool → buffer backend (copy: snapshot + ship pixels; procfd/kwshm:
   name the memory, release on ACK) · linux-dmabuf params.add → dmabuf
-  backend (opt-in `--dmabuf`; readback: map + copy like shm) · keymap and
-  dmabuf format table → memfd · clipboard/primary pipes → token table. No
-  rendering.
+  backend (opt-in `--dmabuf`; readback: map + copy like shm; virtgpu: name
+  the virtio-gpu resource, release on ACK) · keymap and
+  dmabuf format table → memfd · clipboard/primary pipes → token table (and,
+  for the engine's own selection reads and writes, a pipe it makes and
+  reads / the core's bytes it keeps and writes: FDMSG pipe_read and
+  own_pipe, one capped writer thread).
+  No rendering.
 - **Engine (`core/` → wasm + `lib/engine.ts`)**: the real compositor —
   object model, xdg-shell, seat/input. `compositor.zig` never sees an fd or a
   pixel.
@@ -48,6 +52,15 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
 - **Feature candidates** (not started; a rough value order, not a commitment):
   non-US keymaps · surviving a link reset (snapshot restore) · minimized
   windows' frame callbacks held over WS too (see Current limits).
+  Protocols foot warns about on its first unkernel run (2026-11):
+  - `xdg-activation-v1` (staging; foot: urgency/focus requests, launchers
+    handing focus on). FD RULE: no fd args in any request or event (v1) —
+    pure core work: tokens, `activate` → raise/focus by the wm policy.
+  - `xdg-toplevel-icon-v1` (staging; window icons for the embedder's
+    taskbar). FD RULE: no fd args, but `add_buffer` names a wl_shm buffer
+    that is never committed to a surface, so the relay must ship its pixels
+    on a new path (read at add_buffer/set_icon, under the pool SIGBUS guard;
+    a new frame or COMMIT naming the icon) — relay + core + lib work.
 - **Window states**, done: fullscreen and minimize next to maximize, core
   state (`Surface.maximized/fullscreen/minimized`, `applyMaximized/
   applyFullscreen/applyMinimized`), wm_capabilities = maximize, fullscreen,
@@ -59,10 +72,12 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   fullscreen in headless chromium, its exit, Alt+F9, restore). Not seen: a
   GTK app's own fullscreen (nautilus has no F11; gtk3-demo aborts here), X11
   (below), a real browser's Esc/fullscreen banner (human item).
-- **GPU clients**. unkernel's GL is Mesa virgl over vtest (no kernel
-  virtio-gpu driver, no DRM node, no dmabufs): GL apps present through the
-  software winsys as wl_shm clients, which already work (kwshm handles;
-  inferred from Mesa's structure, not run).
+- **GPU clients**. unkernel's guest now has the stock virtio_gpu DRM
+  driver with virgl 3D (`/dev/dri/renderD128`, PRIME import/export, no
+  blob resources): Mesa allocates dmabufs there, and the page's renderer
+  knows each by its resource id (`vm.gl.gpu.texture(id)`). readback can't
+  serve it (an mmap shows the guest's backing pages, not what the host
+  rendered); `--dmabuf virtgpu` names the resource instead.
   - Step 1, done: linux-dmabuf v4 in core + relay. The core owns the
     objects and protocol errors (params planes, formats against the table,
     `create`'s server-id wl_buffer); the relay owns the fds (params.add →
@@ -84,14 +99,125 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
     (`gpu` ref + `image`); the view draws the image (2D clearRect+drawImage
     per damage rect; GL texImage2D of the whole image), headless copies an
     RgbaImage and exposes `HeadlessSurface.gpu`; no resolver = one error,
-    image null, still ACKed. No relay here emits kind 2 (a `--dmabuf
-    virtgpu` backend over a virtio-gpu node was dropped: unkernel has no
-    DRM node); only the JS test relay does (`gpu: true`, kwshm exports as
-    "resources", a stand-in resolver paints them): core/engine/headless/view
-    unit tests, browser-e2e handle-demo `gpu=1` (2D and software GL).
-  - Open: the guest half that names a vtest client's frame as a resource
-    the page's renderer knows (unkernel's to design; the emitter then owns
-    kind 2's ordering guarantee); real-GPU verification of readback.
+    image null, still ACKed. Checked with the JS test relay (`gpu: true`,
+    kwshm exports as "resources", a stand-in resolver paints them):
+    core/engine/headless/view unit tests, browser-e2e handle-demo `gpu=1`
+    (2D and software GL).
+  - Relay half, done: `wlandr --dmabuf virtgpu[:NODE]` (`virtgpu.zig`:
+    PRIME_FD_TO_HANDLE + VIRTGPU_RESOURCE_INFO at create/create_immed, GEM
+    handles refcounted relay-wide — buffers + un-ACKed COMMITs — and closed
+    at the last; `dmabuf.zig` `Backend.virtgpu`: [AX]RGB/[AX]BGR8888 ×
+    {MOD_INVALID, LINEAR}, one plane, refusals and first-of-a-kind logged
+    once). Any `--buffers` mode: kind-2 COMMITs come from `relay.zig`
+    `finishCommit` on the conn's one serial space and Pending/ACK ledger
+    (shared with the handle backends); the conn gets the ACK path under
+    copy too. Before each COMMIT a bounded (100 ms) poll on the dmabuf
+    waits for its implicit write fences (STREAM.md "wlandr's emitter").
+    The core now sends v1/v2 binders a `format` per MOD_INVALID format.
+    Checked through the ioctl seam's stand-in (`virtgpu.Fake`: memfds as
+    dmabufs, one handle per file, resource ids, a host-side `resolve`):
+    unit tests (UAPI numbers/layouts against drm.h + virtgpu_drm.h,
+    importer refcounts, refusals, the fence-wait timeout), harness tests
+    (resource + pixels through the fake, release after the ACK once per
+    busy period, destroy before the ACK, two buffers over one dmabuf,
+    params.create, conn close in flight, beside procfd and kwshm handles,
+    copy on a relay-paced link), headless-e2e and relay-e2e with the
+    `dmabuf` fixture over the test-only `--dmabuf virtgpu:@fake` (WS +
+    copy; stream + procfd beside a wl_shm client). Never run on a real
+    virtio-gpu node or with real Mesa: which formats/modifiers Mesa picks
+    there, whether RESOURCE_INFO works on its imports, and what unkernel's
+    device makes of the fence wait are the first unkernel run's to show
+    (the relay logs the first buffer of each kind and every refusal).
+  - Open: that first run (unkernel's handoff); real-GPU verification of
+    readback.
+- **Embedder asks from unkernel (2026-11-21), lib side**, done:
+  `HandleSource.readv` (all spans of a COMMIT in one call, one promise:
+  one worker round trip per commit, damaged spans only) and
+  `HandleSource.view` (the memory in place, sync; one view is the
+  commit's pixels with no copy, a SharedArrayBuffer included; scattered
+  page runs are gathered) — unit tests (handles.test: sync/async/throw/
+  reject/close-during-readv, view single/scattered/shared/null/short/
+  throw), handle-demo.test and run-poc handle-demo modes `shape=view`
+  (WebGL) and `shape=readv` (async). Not run against unkernel's page yet
+  (its working tree now has the glue — `web/src/wayland.ts` and a guest
+  launcher, `/usr/lib/kw/bin/wland`, running `wlandr --link vsock:2:1023
+  --buffers kwshm`, without `--dmabuf` so far; worker mode would use readv
+  over `ShmFile.read`, inline mode view over `views()`). `createWland().output`
+  (`setSize`/`setScale` pin, null follows; fractional scales; a 0-size
+  container no longer reaches the core as a 1×1 desk) — fake-DOM tests.
+  Firefox: `tools/firefox-smoke.ts` (headless 160 over WebDriver BiDi:
+  handle demo modes incl. readv/view/gpu, wlandr + term typing) passes;
+  WebKit (Playwright's 27.2 MiniBrowser) passed the same by hand, WebGL
+  presenter included. Found and fixed on the way: the keypad (and
+  PrintScreen, Pause, NumLock, ContextMenu, IntlBackslash) had no evdev
+  mapping in any browser; then keypad digits arrived as navigation (the
+  core never locked NumLock): now seat-wide Caps Lock/NumLock state,
+  NumLock on, synced from the browser (`engine.keyboardLocks`) — core
+  test, client.test, headless-e2e keypad step (fixture and real foot).
+  Cross-cutting fixes (2026-11-22): a GPU-less page in front of a virtgpu
+  relay offers no linux-dmabuf (FEATURE 2 dmabuf_kind before linux_dmabuf;
+  `wland_set_gpu_source`), so GPU clients fall back to wl_shm instead of
+  blank windows; a COMMIT ACKed with nothing new shown (no image, failed
+  read) makes the surface's next one whole in the engine (the relay can't
+  know); the lock state carried over a link reopen is the core's
+  (`wland_keyboard_locks_state`), lock-key toggles included — core,
+  relay-harness, engine/handles/headless/core-abi/handle-demo tests,
+  headless-e2e (gpu-less page on the virtgpu relay).
+  Review fixes (2026-11-22): a link reset during a pending read/resolve
+  (stale staging writes, a clobbered pending-read record, unreleased gpu
+  images), output validation/inertness after dispose, createWland
+  teardown on a throw, SharedArrayBuffer pools in a browser (handle-demo
+  `sab=1` via `test/support/isolated.ts`: Chromium 2D + WebGL, Firefox
+  2D), no install-time `os` restriction (serverBinary fails at run time
+  off Linux). Still unseen outside Chromium: Pointer Lock,
+  the Fullscreen API, IME, hi-dpi cursor images, Firefox's WebGL path;
+  real Safari not at all.
+- **Page clipboard bridge** (unkernel's report, 2026-11-22), done for
+  plain text both ways: core `setOwnSelection` (the embedder's own source,
+  `Selection.conn == 0`; the core answers a receive with the bytes, the
+  relay writes them) and `readSelection` (FDMSG pipe_read: the relay makes
+  the pipe, reads it bounded, answers once); engine `selection()` /
+  `setSelection` / `readSelection` + 'selection' events, `readSelectionText`
+  / `setSelectionText`; `lib/clipboard.ts` (createWland `clipboard`, default
+  on) on input's paste-chord hold; headless `readClipboard` /
+  `writeClipboard`; the `term` fixture grew foot's Ctrl+Shift+V / C.
+  Checked: core + relay-harness tests, test/clipboard.test.ts (engine over a
+  scripted link; page side on the fake DOM: paste chord, late paste, refused
+  write, steal guard, granted-only readText, size bound), headless-e2e
+  (wl-copy → readClipboard, writeClipboard → wl-paste, foot fixture both
+  ways), relay-e2e (stream link), run-poc `foot` group's `clipboard` phase
+  in headless Chromium (fixture and real foot, both ways) and
+  `tools/firefox-smoke.ts` step 3 (headless Firefox, term fixture, both
+  ways). Version skew: the bridge is gated on FEATURE selection_cache
+  (`Engine.selectionBridged()`, per link): without it the core sends no
+  pipe_read / own_pipe and offers no own selection, readSelection rejects
+  (NO_SELECTION_BRIDGE), setSelection is false, lib/clipboard.ts goes
+  inert (one log, chords plain keys). Checked 2026-11-22: relay-e2e and
+  headless-e2e (fixtures) against the 12e0e1d relay (WLAND_E2E_RELAY):
+  pass, the bridge checks skip with a message, wl-paste / foot's paste
+  return at once; the 0.1.0 engine in front of a new relay passed its own
+  relay-e2e earlier. Open: other types (text/html, image/png: the engine API carries
+  any mime; the bridge would need ClipboardItem / clipboardData types and
+  a per-browser type list), the primary selection (no page equivalent),
+  Safari/WebKit (not run: the copy-event and in-handler writeText paths are
+  there for it), a human check with a real system clipboard. Review round
+  (2026-11-22): a paste after the copying app went (or a link reconnect)
+  sets the unchanged page text again; focusout to nothing and a press
+  outside the desktop count as leaving; a paste event with only non-text
+  types is a changed page; copy chords are prevented unless text is owed
+  and copy/cut events on the desktop always cancelled (Firefox's stale page
+  selection, firefox-smoke step 4); input's `pressed` keys released on
+  leave / window blur / Cmd up, Apple chords sent whole at the press — all
+  with fake-DOM tests in test/clipboard.test.ts. Relay, final round: a
+  receive's fd must be a pipe (others closed at once: a FUSE/NFS/tty fd
+  could block a close or write the link thread or writer made under a
+  lock), the writer makes no syscall on a receiver's fd under its mutex
+  and writes RWF_NOWAIT, EOF completes a pipe_read even after the source
+  hung up (`wl-copy --paste-once`; fixture `copy -o`, headless-e2e), and
+  a receive racing its conn's close is refused (writer tombstones). Open:
+  an app thread stuck in a syscall on its client's fd (FUSE shm pool,
+  stray FUSE fd closed at teardown) holds `link.users`, so a stream
+  link's serveLink never returns and it never reconnects (gotchas).
 - **Protocol bumps on offer** (`protocol/*.xml` synced with upstream main on
   2026-11-21 — wayland 1.26 / wayland-protocols 1.50; advertised versions
   unchanged, all additions are fd-free). Rough value order:
@@ -123,8 +249,17 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
     relative mode, weston-constraints) — the press that locks, Esc and
     the press that re-locks, the "press Esc" banner, raw movement where the
     platform has it (Windows/macOS/ChromeOS: `unadjustedMovement`), a
-    cursor surface drawn frozen while locked; Firefox untested;
+    cursor surface drawn frozen while locked; Firefox/Safari untested
+    (headless Firefox and WebKit only smoke-tested: no lock tried);
   - input feel: constant resize via CSD, clipboard between two foots, latency;
+  - macOS / iPadOS keyboard (never run on Apple hardware in any browser;
+    written from documented key-event behaviour): Cmd+V / Cmd+C / Cmd+X
+    in foot and a GTK app (Safari, Chrome, Firefox on a Mac) — the chord
+    arrives as Ctrl+V etc. once, nothing left held (Cmd up first, V up
+    first, Cmd+V held for repeat, Cmd+Shift+V in foot), Cmd+A then Cmd up
+    (A released), Cmd+Tab away and back (no Super stuck); Safari's
+    write-at-next-gesture path (the copy reaching the page clipboard at the
+    next key or click, or Cmd+C);
   - cursor-shape hover (CSS cursor changes over foot's text area);
   - cursor surfaces on a real screen: weston-flower's hand / a GTK3 app's
     themed cursors at dpr 1 and 2 (image-set scale, hotspot where it
@@ -201,11 +336,11 @@ approach shows up.
     X client next repaints (satellite's behaviour, on any compositor).
   - popups: satellite sets no window geometry, so its box is toplevel +
     titlebar, origin at y = −25 — and it places menus from the X window's
-    origin, not from that box. Per xdg-shell a popup is positioned against
-    the parent's window geometry; wland still places it against the parent
-    SURFACE, which is what makes satellite's menus land right (and GTK's,
-    whose parent and popup shadow margins roughly cancel). Doing it by the
-    book needs satellite to set its geometry or a quirk for it.
+    origin, not from that box. Popups are placed by the book from a SET
+    geometry (GTK's menus were ~20 px off without it), but a default
+    geometry counts as the surface origin for popups (`popupGeomOffset`),
+    which keeps satellite's menus where they were (unverified since:
+    satellite isn't installed here).
   - fullscreen should now work (satellite maps `_NET_WM_STATE_FULLSCREEN`
     to `xdg_toplevel.set_fullscreen`, which gets its configure since the
     window-states work) — unverified: satellite isn't installed in this
@@ -215,11 +350,10 @@ approach shows up.
   - no xdg_activation → `_NET_ACTIVE_WINDOW` requests are dropped (inferred).
   - untested: X ⇄ Wayland dnd, INCR-sized transfers, pointer-lock apps
     (satellite's own relative-pointer / constraints use).
-- **Deferred, doable if wanted**: xdg-activation,
-  pointer-gestures, idle-inhibit / ext-idle-notify, single-pixel-buffer,
+- **Deferred, doable if wanted** (xdg-activation and xdg-toplevel-icon:
+  feature candidates above): pointer-gestures, idle-inhibit / ext-idle-notify, single-pixel-buffer,
   content-type, tearing-control, xdg_wm_base v7, tablet-v2,
-  foreign-toplevel-list / layer-shell, xdg-toplevel-icon (window icons for
-  the wm; shm buffers, fd-free), xdg-dialog (modal hint), xdg-system-bell
+  foreign-toplevel-list / layer-shell, xdg-dialog (modal hint), xdg-system-bell
   (→ page beep/notification), keyboard-shortcuts-inhibit (pairs with the
   browser Keyboard Lock API), pointer-warp-v1, alpha-modifier, fifo /
   commit-timing, xdg-toplevel-tag, xdg-toplevel-drag, xdg-output, DOM-titlebar SSD for no-CSD apps,
@@ -270,15 +404,25 @@ Any of them is fair game to lift.
 - One engine link at a time: newest tab takes over (old tab gets WS close 4000);
   takeover/reload drops apps; apps never survive a link drop (a stream link is
   redialled and the engine starts empty).
-- GPU clients only with `--dmabuf readback` (copy mode; LINEAR ARGB/XRGB8888;
-  one tranche, `get_surface_feedback` = the default feedback; no y_invert;
-  v1/v2 binders get no formats; a dmabuf the backend can't import is
-  accepted but never shown, released per commit — not a `failed` event;
-  never run against a real GPU). No explicit sync (drm-syncobj): readback
-  waits ≤ 500 ms for implicit fences. X11 apps need `xwayland-satellite` + Xwayland
+- GPU clients only with a `--dmabuf` backend: readback (copy mode; LINEAR
+  ARGB/XRGB8888; no y_invert; v1/v2 binders get no formats) or virtgpu (a
+  virtio-gpu node only; [AX]RGB/[AX]BGR8888, implicit or LINEAR, one
+  plane; the page needs a gpu source, `EngineOptions.gpu`, or the core
+  offers no linux-dmabuf and GPU clients render in software over wl_shm —
+  FEATURE dmabuf_kind). Both: one tranche, `get_surface_feedback` = the default
+  feedback; a dmabuf the backend can't import is accepted but never shown,
+  released per commit — not a `failed` event; never run against a real
+  GPU. No explicit sync (drm-syncobj): readback waits ≤ 500 ms, virtgpu
+  ≤ 100 ms for implicit fences. X11 apps need `xwayland-satellite` + Xwayland
   installed (software rendering, no maximize, fullscreen untested; see the
   satellite entry above); no in-tree Xwayland.
 - dnd works between wland clients only, not to/from the host page.
+- The page clipboard bridge carries text/plain (UTF-8, ≤ 4 MiB) only; an
+  app's copy reaches the page clipboard only around a user gesture in the
+  desktop (5 s window, the next key/click, or a copy event), and the page's
+  clipboard enters only on a paste in the desktop or, with clipboard-read
+  already granted, on focusing it. The primary selection stays inside. The
+  Apple chord handling has not run on a Mac (human item).
 - Pointer constraints: a lock is the browser's Pointer Lock, so it needs a
   user gesture — granted at once only while the page has transient
   activation (the press that made the app ask), else at the next press on
@@ -324,13 +468,27 @@ Any of them is fair game to lift.
   for that: the browser's choice can't be observed). Firefox's limits and
   hotspot scaling are unverified. viewport src-crop of a cursor surface is
   ignored like any surface's.
-- Window geometry is the window's box (placement, sizes, maximize), but
-  popups are placed against the parent surface's origin, not its geometry; a
-  set geometry is not clamped to the surface's bounds.
+- Window geometry is the window's box (placement, sizes, maximize) and
+  what popups are placed from (to their own; a default geometry counts as
+  the surface origin there: satellite); a set geometry is not clamped to
+  the surface's bounds. No positioner constraint adjustment (flip, slide,
+  resize): the core doesn't know where windows are, so a menu near the
+  desk's edge can hang off it.
+- xdg_toplevel.move/resize are honoured only with the serial of a press
+  still held on the window (core and wm), wl_data_device.start_drag only
+  with one of the client's held presses (the wm and headless still cancel
+  a drag that starts with no button down). set_selection (clipboard and
+  primary) only from the keyboard-focused client, or with a recent input
+  serial of the client's while no other client had input since
+  (`maySetSelection`); wl-copy maps a 1×1 window for the focus, like the
+  `copy` fixture now.
 - Input regions are applied (picking passes over a surface outside its
   region, through a hole inside the window geometry too). A region over 32 boxes degrades to a superset (`Region.max`);
   synchronized subsurfaces apply it at their own commit, like all their
   state.
+- Subsurface z-order (place_above/place_below, a subsurface below its
+  parent included) is applied at the parent's commit, as the protocol
+  says; wl_subsurface.set_position is not: it moves the subsurface at once.
 - The implicit grab (a held button keeps the pressed surface) is pointer
   capture; a popup of the pressed client mapping lets it go, as a popup
   grab would — whether or not the client asked for `xdg_popup.grab` (the

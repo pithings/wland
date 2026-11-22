@@ -28,9 +28,6 @@
   "files": [
     "dist"
   ],
-  "os": [
-    "linux"
-  ],
   "engines": {
     "node": ">=18"
   },
