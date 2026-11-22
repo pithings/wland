@@ -260,6 +260,55 @@ test('decorations default (\'client\'): client_side for every toplevel, no \'dec
   engine.dispose();
 });
 
+// An engine whose link has one app with a v6 toplevel mapped: compositor 4,
+// xdg_wm_base 5; surface 6, xdg_surface 7, toplevel 8, initial commit sent
+// (its configure is in link.sent).
+async function withToplevel(options: Partial<Parameters<typeof createEngine>[0]> = {}) {
+  const link = scriptedLink();
+  const events: any[] = [];
+  const engine = await createEngine({
+    wasm, link, ...options,
+    onEvent: (ev) => { if (ev.type !== 'log') events.push(ev.type === 'commit' ? { ...ev, pixels: null } : ev); },
+  });
+  engine.setOutput(1280, 720);
+  engine.start();
+  link.cb!.onOpen();
+  link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, new Uint8Array([...msg(1, 1, 2), ...msg(1, 0, 3)]))));
+  const g = globals(link.sent, 2);
+  link.sent.length = 0;
+  link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+    ...msg(2, 0, g.wl_compositor.name, 'wl_compositor', g.wl_compositor.version, 4),
+    ...msg(2, 0, g.xdg_wm_base.name, 'xdg_wm_base', g.xdg_wm_base.version, 5),
+    ...msg(4, 0, 6), ...msg(5, 2, 7, 6), ...msg(7, 1, 8),
+    ...msg(6, 6),
+  ]))));
+  const send = (...msgs: Uint8Array[]) => {
+    const all = new Uint8Array(msgs.reduce((n, m) => n + m.length, 0));
+    let off = 0;
+    for (const m of msgs) { all.set(m, off); off += m.length; }
+    link.cb!.onMessage(pack(wireFrame(CONN, all)));
+  };
+  // the toplevel configures sent since `from`: [w, h, ...states]
+  const configures = (from = 0) => wireEvents(link.sent.slice(from), CONN).filter((e) => e[0] === 8 && e[1] === 0).map((e) => [e[2], e[3], ...e.slice(5)]);
+  return { link, events, engine, g, send, configures };
+}
+
+test('setVisible: a hidden toplevel is configured suspended (v6) with nothing else changed; shown again it is not; repeats send nothing', async () => {
+  const { link, events, engine, configures } = await withToplevel();
+  link.sent.length = 0;
+  events.length = 0;
+  engine.setVisible(CONN, 8, false); // not a toplevel's surface: ignored
+  assert.equal(link.sent.length, 0);
+  engine.setVisible(CONN, 6, false);
+  assert.deepEqual(configures(), [[0, 0, 9]]); // suspended
+  engine.setVisible(CONN, 6, false);
+  assert.deepEqual(configures(), [[0, 0, 9]]);
+  engine.setVisible(CONN, 6, true);
+  assert.deepEqual(configures(), [[0, 0, 9], [0, 0]]);
+  assert.deepEqual(events.filter((e) => e.type === 'minimize'), [], 'not minimized');
+  engine.dispose();
+});
+
 test('motion is coalesced and held back while the link is backed up', async () => {
   const link = scriptedLink();
   const engine = await createEngine({ wasm, link, onEvent: () => {} });

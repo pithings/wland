@@ -292,6 +292,15 @@ const Surface = struct {
     maximized: bool = false,
     fullscreen: bool = false,
     minimized: bool = false,
+    /// The embedder hides the window (setVisible false: its own window
+    /// manager's reasons — a minimize effect, a compact mode showing one
+    /// window): rendered for like a minimized one (frame callbacks held,
+    /// presentation feedback discarded, v6 `suspended`, its subsurfaces
+    /// and popups alike) without being minimized — no protocol state, no
+    /// focus change, popups kept, input delivered as the embedder routes
+    /// it. Only the embedder sets and clears it; reset when the
+    /// xdg_toplevel goes.
+    hidden: bool = false,
     /// the window's size (its geometry) when it last floated — what the
     /// unmaximize / unfullscreen configure restores (0 = never presented,
     /// client decides)
@@ -1242,8 +1251,9 @@ pub const Compositor = struct {
     /// WebSocket the relay intercepts wl_surface.frame and fires done
     /// itself, so that half is a no-op there — never both, or the app gets a
     /// fatal double done. Presentation feedback is the core's on every link.
-    /// A minimized window's callbacks are held until it is restored — on
-    /// stream links only: the relay's own (WS) keep their 16 ms pace.
+    /// A minimized or hidden window's callbacks are held until it is
+    /// restored or shown — on stream links only: the relay's own (WS) keep
+    /// their 16 ms pace.
     pub fn tick(self: *Compositor, t: Tick) void {
         var it = self.conns.iterator();
         while (it.next()) |kv| {
@@ -1252,10 +1262,11 @@ pub const Compositor = struct {
             if (conn.feedbacks.items.len > 0) self.presentFeedbacks(conn_id, conn, t);
             var keep: usize = 0;
             for (conn.frame_callbacks.items) |cb| {
-                // a minimized window's surfaces are not repainted: their
-                // callbacks wait for the window to come back (the client's
-                // render loop stops, as on any compositor)
-                if (!cb.committed or underMinimized(conn, cb.surface)) {
+                // a minimized (or hidden) window's surfaces are not
+                // repainted: their callbacks wait for the window to come
+                // back (the client's render loop stops, as on any
+                // compositor)
+                if (!cb.committed or underHidden(conn, cb.surface)) {
                     conn.frame_callbacks.items[keep] = cb;
                     keep += 1;
                     continue;
@@ -1373,7 +1384,7 @@ pub const Compositor = struct {
     /// role the embedder shows — a toplevel, popup or dnd icon, the conn's
     /// current cursor image, or a subsurface of a surface that is shown.
     fn surfaceShown(conn: *const Conn, surface_id: u32) bool {
-        if (underMinimized(conn, surface_id)) return false;
+        if (underHidden(conn, surface_id)) return false;
         var id = surface_id;
         // a subsurface chain is acyclic (wl_subcompositor's bad_parent);
         // the bound only guards the walk
@@ -1390,16 +1401,30 @@ pub const Compositor = struct {
         return false;
     }
 
-    /// The surface belongs to a minimized window: the root of its parent
-    /// chain (subsurfaces and popups alike) is a minimized toplevel.
-    fn underMinimized(conn: *const Conn, surface_id: u32) bool {
+    /// The toplevel at the root of a surface's parent chain (subsurfaces
+    /// and popups alike), or null (no toplevel there).
+    fn rootToplevel(conn: *const Conn, surface_id: u32) ?*const Surface {
         var id = surface_id;
         for (0..32) |_| {
-            const surface = conn.surfaces.get(id) orelse return false;
-            if (surface.parent_id == 0) return surface.role == .toplevel and surface.minimized;
+            const surface = conn.surfaces.getPtr(id) orelse return null;
+            if (surface.parent_id == 0) return if (surface.role == .toplevel) surface else null;
             id = surface.parent_id;
         }
-        return false;
+        return null;
+    }
+
+    /// The surface belongs to a minimized window.
+    fn underMinimized(conn: *const Conn, surface_id: u32) bool {
+        const top = rootToplevel(conn, surface_id) orelse return false;
+        return top.minimized;
+    }
+
+    /// The surface belongs to a window that is not on screen: minimized,
+    /// or hidden by the embedder (setVisible). Its frame callbacks wait and
+    /// its presentation feedback is discarded.
+    fn underHidden(conn: *const Conn, surface_id: u32) bool {
+        const top = rootToplevel(conn, surface_id) orelse return false;
+        return top.minimized or top.hidden;
     }
 
     /// Process a batch of whole wire messages from an app.
@@ -2083,6 +2108,7 @@ pub const Compositor = struct {
                         surface.maximized = false;
                         surface.fullscreen = false;
                         surface.minimized = false;
+                        surface.hidden = false;
                         surface.size_serial = null;
                         surface.size_acked = false;
                         // unmapped: its content is gone until the next
@@ -2582,7 +2608,7 @@ pub const Compositor = struct {
             states[n] = state_activated;
             n += 1;
         }
-        if ((self.suspended or surface.minimized) and objVersion(conn, surface.toplevel_id) >= 6) {
+        if ((self.suspended or surface.minimized or surface.hidden) and objVersion(conn, surface.toplevel_id) >= 6) {
             states[n] = state_suspended;
             n += 1;
         }
@@ -2749,8 +2775,8 @@ pub const Compositor = struct {
                 const surface = skv.value_ptr;
                 if (surface.role != .toplevel or !surface.configured or surface.toplevel_id == 0) continue;
                 if (objVersion(conn, surface.toplevel_id) < 6) continue;
-                // a minimized window is suspended either way
-                if (surface.minimized) continue;
+                // a minimized or hidden window is suspended either way
+                if (surface.minimized or surface.hidden) continue;
                 self.refreshFloatingSize(conn_id, conn, surface);
                 self.sendCurrentConfigure(conn_id, conn, surface);
             }
@@ -2879,6 +2905,40 @@ pub const Compositor = struct {
     pub fn setMinimized(self: *Compositor, conn_id: u32, surface_id: u32, on: bool) void {
         const t = self.toplevelSurface(conn_id, surface_id) orelse return;
         self.applyMinimized(conn_id, t.conn, t.surface, on);
+    }
+
+    /// A new embedder takes over (a session viewer's init): what the last
+    /// one set per window for its own window manager goes — hidden windows
+    /// are shown (setVisible true). The new one sets its own.
+    pub fn resetEmbedderWindows(self: *Compositor) void {
+        var it = self.conns.iterator();
+        while (it.next()) |kv| {
+            var sit = kv.value_ptr.*.surfaces.iterator();
+            while (sit.next()) |skv| {
+                if (skv.value_ptr.role != .toplevel) continue;
+                if (skv.value_ptr.hidden) self.setVisible(kv.key_ptr.*, skv.key_ptr.*, true);
+            }
+        }
+    }
+
+    /// Embedder: show or hide a toplevel's window for its own reasons
+    /// (Surface.hidden). Hidden, it is rendered for like a minimized one —
+    /// frame callbacks held (tick), feedback discarded (surfaceShown), a
+    /// v6 client `suspended` — but nothing else changes: not `minimized`,
+    /// not keyboard or pointer focus, not its popups. Shown again, the held
+    /// callbacks fire at the next tick. Only `suspended` reaches the app,
+    /// in a configure repeating its size, and only when it changes (not
+    /// while the window is minimized or the tab hidden). Before the
+    /// initial commit the flag alone: the initial configure carries it.
+    pub fn setVisible(self: *Compositor, conn_id: u32, surface_id: u32, visible: bool) void {
+        const t = self.toplevelSurface(conn_id, surface_id) orelse return;
+        const surface = t.surface;
+        if (surface.hidden == !visible) return;
+        surface.hidden = !visible;
+        if (!surface.configured or surface.minimized or self.suspended) return;
+        if (objVersion(t.conn, surface.toplevel_id) < 6) return;
+        self.refreshFloatingSize(conn_id, t.conn, surface);
+        self.sendCurrentConfigure(conn_id, t.conn, surface);
     }
 
     /// Embedder saw a presented buffer: keep the surface's logical size.
@@ -7420,6 +7480,98 @@ test "minimize: pointer (unlocked first) and keyboard leave, popups dismissed, s
     try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
     comp.setMinimized(1, 6, false);
     try T.expectConfigure(&sink, 1, 800, 600, &.{});
+}
+
+test "hidden by the embedder: suspended, frame callbacks held and feedback discarded (popups too), no focus change, popups kept, input delivered, not minimized; shown again" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+
+    const PTR = 10;
+    const KBD = 11;
+    const FEEDBACK = 19;
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
+    try T.send(&comp, 9, 0, &.{.{ .new_id = PTR }});
+    try T.send(&comp, 9, 1, &.{.{ .new_id = KBD }});
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 18 }, .{ .new_id_dynamic = .{ .interface = "wp_presentation", .version = 1, .id = 13 } } });
+    // a popup of the window (surface 15), mapped
+    try PopupTest.positioner(&comp, 14, 10, 10, .{ 8, 8 }, 50, 40);
+    try PopupTest.popup(&comp, 15, 7, 14);
+    try T.send(&comp, 15, T.attach_op, &.{ .{ .object = 31 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(&comp, 15, T.commit_op, &.{});
+    comp.pointerEnter(1, 6, 10 * 256, 10 * 256);
+    comp.keyboardEnter(1, 6);
+    // frame callbacks on the toplevel and the popup, a feedback, latched
+    try T.send(&comp, 6, T.frame_op, &.{.{ .new_id = 18 }});
+    try T.send(&comp, 15, T.frame_op, &.{.{ .new_id = 20 }});
+    try T.send(&comp, 13, comptime protocol.find("wp_presentation").?.requestIndex("feedback").?, &.{ .{ .object = 6 }, .{ .new_id = FEEDBACK } });
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try T.send(&comp, 15, T.commit_op, &.{});
+    sink.events.clearRetainingCapacity();
+    const inter_calls = sink.inter_calls;
+
+    // hidden: one configure, still activated, now suspended; nothing else
+    comp.setVisible(1, 6, false);
+    try T.expectConfigure(&sink, 1, 800, 600, &.{ T.A, T.S });
+    try std.testing.expectEqual(inter_calls, sink.inter_calls); // no state event
+    try std.testing.expectEqual(@as(u32, 0), comp.toplevelState(1, 6)); // not minimized
+    try std.testing.expectEqual(@as(u32, 6), comp.conns.get(1).?.keyboard_focus);
+    try std.testing.expectEqual(@as(u32, 6), comp.conns.get(1).?.pointer_focus);
+    comp.setVisible(1, 6, false); // again: nothing
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    // the tick: the feedback is discarded, both callbacks wait
+    comp.tick(.{ .time_ms = 100 });
+    try std.testing.expectEqual(@as(usize, 2), sink.events.items.len); // discarded + delete_id
+    try std.testing.expectEqual(@as(u32, FEEDBACK), sink.events.items[0].object_id);
+    sink.events.clearRetainingCapacity();
+    // input still goes where the embedder sends it
+    comp.keyboardKey(1, 0, 30, true);
+    try std.testing.expectEqual(@as(u32, KBD), sink.events.items[0].object_id);
+    comp.keyboardKey(1, 0, 30, false);
+    sink.events.clearRetainingCapacity();
+    // the tab hidden and shown meanwhile: it stays suspended
+    comp.setSuspended(true);
+    comp.setSuspended(false);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+
+    // shown: suspended goes, both held callbacks fire at the next tick
+    comp.setVisible(1, 6, true);
+    try T.expectConfigure(&sink, 1, 800, 600, &.{T.A});
+    comp.tick(.{ .time_ms = 116 });
+    var fired: usize = 0;
+    for (sink.events.items) |ev| {
+        if (ev.object_id == 18 or ev.object_id == 20) fired += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), fired);
+
+    // hidden and minimized: restoring keeps it suspended until it is shown
+    comp.setVisible(1, 6, false);
+    comp.setMinimized(1, 6, true);
+    comp.setMinimized(1, 6, false);
+    sink.events.clearRetainingCapacity();
+    comp.setMinimized(1, 6, true);
+    comp.setMinimized(1, 6, false);
+    try T.expectConfigure(&sink, 2, 800, 600, &.{T.S});
+    // a new embedder (a session viewer's init) shows it
+    comp.resetEmbedderWindows();
+    try T.expectConfigure(&sink, 1, 800, 600, &.{});
+
+    // hidden before its initial commit: the initial configure carries it
+    try wmBaseToplevel(&comp, 2);
+    comp.setVisible(2, 6, false);
+    sink.events.clearRetainingCapacity();
+    var buf: [64]u8 = undefined;
+    try comp.onWire(2, wire.encodeMessage(&buf, 6, T.commit_op, &.{}));
+    var states: ?[]const u8 = null;
+    var vals: [wire.max_args]wire.Value = undefined;
+    for (sink.events.items) |*ev| {
+        if (ev.conn_id != 2 or ev.object_id != 8 or ev.opcode != T.cfg_ev) continue;
+        states = (try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .int, .int, .array }, &vals))[2].array;
+    }
+    try std.testing.expectEqual(Compositor.state_suspended, std.mem.readInt(u32, states.?[0..4], .little));
 }
 
 test "xdg_popup.reposition emits repositioned + configure sequence" {

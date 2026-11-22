@@ -91,6 +91,7 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_drag_cancel: [26, ''],
   wland_close: [29, 'uu'],
   wland_set_bounds: [30, 'iiii'],
+  wland_set_visible: [31, 'uuu'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
 

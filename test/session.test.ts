@@ -247,6 +247,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
   engine.setMinimized(7, 10, true);
   engine.popupDismiss(7, 12);
   engine.close(7, 10);
+  engine.setVisible(7, 10, false);
   engine.requestResize(7, 10, 640.4, 480.6);
   engine.dragMotion(7, 10, 105, 1, 2);
   engine.dragDrop();
@@ -273,6 +274,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
     call(21, u32(7, 10, 1)),
     call(22, u32(7, 12)),
     call(29, u32(7, 10)),
+    call(31, u32(7, 10, 0)),
     call(23, u32(7, 10), i32(640, 481)),
     call(24, u32(7, 10, 105), i32(fx(1), fx(2))),
     call(25),

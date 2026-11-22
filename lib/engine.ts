@@ -469,6 +469,21 @@ export interface Engine {
    *  the embedder's: xdg_toplevel has set_minimized and no way back. A
    *  'minimize' event follows; see MinimizeEvent. */
   setMinimized(conn: number, surface: number, minimized: boolean): void;
+  /** Tell the core whether a toplevel's window is on screen, for an
+   *  embedder whose window manager hides windows for its own reasons (a
+   *  minimize effect still playing, a compact mode showing one window, a
+   *  workspace switched away). Hidden (false), the app is rendered for like
+   *  a minimized one: its frame callbacks wait (stream links; over a
+   *  WebSocket the relay keeps firing them), its presentation feedback is
+   *  discarded, a v6 client is `suspended` — its subsurfaces and popups
+   *  alike. Nothing else changes: it is not minimized (no 'minimize'
+   *  event), keeps keyboard and pointer focus and its popups, and input
+   *  you send it is delivered. Shown again (true), the held callbacks fire
+   *  at the next tick; its content is what it last committed. Showing and
+   *  hiding the window's element is yours (see ViewOptions.manageDisplay).
+   *  Default: shown. On a session link a new viewer's attach shows every
+   *  window the last one hid. */
+  setVisible(conn: number, surface: number, visible: boolean): void;
   /** Ask a toplevel to close (xdg_toplevel.close: a close button, a
    *  taskbar's "close window"). Nothing else happens here: the app decides
    *  — it destroys the window ('surface' role none / 'destroy' events
@@ -1925,6 +1940,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     setFullscreen: call((conn, surface, on) => ex.wland_set_fullscreen(conn, surface, on ? 1 : 0)),
     // minimizing sends a pointer leave: after any pending motion
     setMinimized: call((conn, surface, on) => ex.wland_set_minimized(conn, surface, on ? 1 : 0), true),
+    setVisible: call((conn, surface, on) => ex.wland_set_visible(conn, surface, on ? 1 : 0)),
     close: call((conn, surface) => ex.wland_close(conn, surface)),
     dragMotion: call((conn, surface, time, x, y) =>
       ex.wland_drag_motion(conn, surface, time >>> 0, fixed(x), fixed(y)), true),

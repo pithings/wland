@@ -633,6 +633,70 @@ test "session: init carries the viewer's decorations — apps' toplevels are ans
     try rig.roundtrip(c); // still connected
 }
 
+const V6Window = struct { surface: u32, xdg_surface: u32, toplevel: u32, wm: u32 };
+
+/// A toplevel on xdg_wm_base `version`, configured and acked.
+fn openToplevel(rig: *Rig, c: *Client, version: u32) !V6Window {
+    const registry = c.newId();
+    try c.send(1, comptime op("wl_display", .request, "get_registry"), &.{.{ .new_id = registry }});
+    try rig.roundtrip(c);
+    const compositor = try bind(c, registry, "wl_compositor", 6);
+    var w: V6Window = .{ .surface = c.newId(), .xdg_surface = undefined, .toplevel = undefined, .wm = try bind(c, registry, "xdg_wm_base", version) };
+    try c.send(compositor, comptime op("wl_compositor", .request, "create_surface"), &.{.{ .new_id = w.surface }});
+    w.xdg_surface = c.newId();
+    try c.send(w.wm, comptime op("xdg_wm_base", .request, "get_xdg_surface"), &.{ .{ .new_id = w.xdg_surface }, .{ .object = w.surface } });
+    w.toplevel = c.newId();
+    try c.send(w.xdg_surface, comptime op("xdg_surface", .request, "get_toplevel"), &.{.{ .new_id = w.toplevel }});
+    try c.send(w.surface, comptime op("wl_surface", .request, "commit"), &.{});
+    try rig.roundtrip(c);
+    const configure = c.last(w.xdg_surface, comptime op("xdg_surface", .event, "configure")) orelse return error.NoConfigure;
+    try c.send(w.xdg_surface, comptime op("xdg_surface", .request, "ack_configure"), &.{.{ .uint = std.mem.readInt(u32, configure.body[0..4], .little) }});
+    return w;
+}
+
+const toplevel_configure = op("xdg_toplevel", .event, "configure");
+
+/// Wait until the app has had `n` toplevel configures; the last one's states.
+fn statesAfter(rig: *Rig, c: *Client, toplevel: u32, n: usize, out: []u32) ![]u32 {
+    const Tc = struct { c: *Client, t: u32, n: usize };
+    try rig.until(Tc{ .c = c, .t = toplevel, .n = n }, struct {
+        fn pred(x: Tc) bool {
+            return x.c.count(x.t, toplevel_configure) >= x.n;
+        }
+    }.pred);
+    const body = c.last(toplevel, toplevel_configure).?.body;
+    const len = std.mem.readInt(u32, body[8..12], .little) / 4;
+    for (0..len) |i| out[i] = std.mem.readInt(u32, body[12 + i * 4 ..][0..4], .little);
+    return out[0..len];
+}
+
+test "session: set_visible hides a window for the viewer (suspended), the next viewer's init shows it again" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    const c = try rig.connect();
+    const w = try openToplevel(&rig, c, 6);
+    const conn: u32 = 1;
+    var states: [8]u32 = undefined;
+
+    const a = try rig.viewer();
+    try a.init();
+    try rig.synced(a);
+    const n = c.count(w.toplevel, toplevel_configure);
+    try a.call(.set_visible, &(le(conn) ++ le(w.surface) ++ le(0)));
+    try std.testing.expectEqualSlices(u32, &.{9}, try statesAfter(&rig, c, w.toplevel, n + 1, &states)); // suspended
+    a.close();
+
+    // (the viewer's going suspends every window; a hidden one already is)
+    const b = try rig.viewer();
+    try b.init();
+    try rig.synced(b);
+    try std.testing.expectEqualSlices(u32, &.{}, try statesAfter(&rig, c, w.toplevel, n + 2, &states));
+    try rig.roundtrip(c);
+    try std.testing.expectEqual(n + 2, c.count(w.toplevel, toplevel_configure));
+}
+
 fn writeAll(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {

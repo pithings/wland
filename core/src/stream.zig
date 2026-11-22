@@ -744,6 +744,7 @@ pub const CallOp = enum(u16) {
     read_selection = 28,
     close = 29,
     set_bounds = 30,
+    set_visible = 31,
     _,
 };
 

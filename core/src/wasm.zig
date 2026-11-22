@@ -331,6 +331,15 @@ export fn wland_set_minimized(conn_id: u32, surface_id: u32, on: u32) void {
     flushOut();
 }
 
+/// Show (visible 1) or hide (0) a toplevel's window for the embedder's own
+/// reasons: hidden, it is rendered for like a minimized one (frame
+/// callbacks held, feedback discarded, v6 `suspended`) without being
+/// minimized or losing focus (Compositor.setVisible).
+export fn wland_set_visible(conn_id: u32, surface_id: u32, visible: u32) void {
+    compositor.setVisible(conn_id, surface_id, visible != 0);
+    flushOut();
+}
+
 /// Ask a toplevel to close (xdg_toplevel.close); the app decides what to do.
 export fn wland_close(conn_id: u32, surface_id: u32) void {
     compositor.closeToplevel(conn_id, surface_id);

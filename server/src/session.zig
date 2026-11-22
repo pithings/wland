@@ -854,6 +854,7 @@ pub const Session = struct {
             .popup_dismiss => c.popupDismiss(try a.u32_(), try a.u32_()),
             .close => c.closeToplevel(try a.u32_(), try a.u32_()),
             .set_bounds => c.setBounds(try a.i32_(), try a.i32_(), try a.i32_(), try a.i32_()),
+            .set_visible => c.setVisible(try a.u32_(), try a.u32_(), try a.u32_() != 0),
             .request_resize => c.requestResize(try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_motion => c.dragMotion(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_drop => c.dragDrop(),
@@ -883,8 +884,9 @@ pub const Session = struct {
 
     /// CALL init: the viewer attaches — the scale as set_dpr, un-suspended,
     /// its decorations mode (toplevels it changes answered again: apps
-    /// outlive viewers) and no bounds of the last viewer's (it sends its
-    /// own), then the scene replay (STREAM.md), ending in EVENT synced. The
+    /// outlive viewers), no bounds of the last viewer's and none of its
+    /// per-window state (hidden windows shown: it sends its own), then the
+    /// scene replay (STREAM.md), ending in EVENT synced. The
     /// mode is set before `synced`, so the replay carries what it made.
     fn attach(self: *Session, scale: i32, scale_120: i32, decorations_server: bool) void {
         const c = &self.comp;
@@ -892,6 +894,7 @@ pub const Session = struct {
         c.setSuspended(false);
         c.setDecorations(decorations_server);
         c.setBounds(0, 0, 0, 0);
+        c.resetEmbedderWindows();
         self.synced = true;
         self.records.clearRetainingCapacity();
         self.locks_sent = null;

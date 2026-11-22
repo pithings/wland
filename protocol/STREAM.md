@@ -1113,7 +1113,8 @@ not asked), a viewer before EVENTs 14–15 has no app ids or size hints. An
 op's arguments may grow at the end the same way: init's `decorations` is
 ignored by a relay that predates it (toplevels stay client-side), and a
 viewer that predates it sends none (read as 0); a relay before CALL 30 /
-EVENT 16 keeps the output's size as the bounds and tells no decoration.
+EVENT 16 keeps the output's size as the bounds and tells no decoration; a
+relay before CALL 31 renders for windows the viewer hides.
 
 ### 0x0f CALL — an embedder call, viewer→relay only (session)
 
@@ -1156,6 +1157,7 @@ u8  args[len]
 | 28 | read_selection | bytes mime, u32 read_id, u32 max_bytes |
 | 29 | close | u32 conn, u32 surface (xdg_toplevel.close to that toplevel) |
 | 30 | set_bounds | i32 w, i32 h, i32 decorated_w, i32 decorated_h (the work area: configure_bounds and the maximized size; 0×0 = the desktop's size, decorated 0×0 = w×h) |
+| 31 | set_visible | u32 conn, u32 surface, u32 visible (0: the viewer hides the toplevel's window — frame callbacks held, feedback discarded, v6 `suspended`, nothing else changed; 1: shown) |
 
 **init is the attach.** A viewer sends it once, first, when it has seen
 FEATURE session (followed by its set_gpu_source / desktop_size /
@@ -1165,7 +1167,8 @@ sets the decorations mode (apps outlive viewers: running toplevels whose
 mode it changes are answered again — their decoration configure, a
 configure — before the replay, which then carries the new state), drops
 the bounds a previous viewer set (the viewer sends its own set_bounds after
-init when it has any) and answers with the **scene replay** — for every app conn a CONN_OPEN, for
+init when it has any) and the per-window state it set (windows it hid with
+set_visible are shown: the new viewer hides its own) and answers with the **scene replay** — for every app conn a CONN_OPEN, for
 every surface its SURFACE and the EVENTs that describe it now
 (surface_event with its role, set_title, set_app_id, input_region,
 size_limits unless all 0, decoration when decorated, the interactive state
