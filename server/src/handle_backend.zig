@@ -104,8 +104,6 @@ pub const Conn = struct {
     exporter: Exporter,
     /// relay-wide: handle ids are never reused within a run
     next_handle_id: *std.atomic.Value(u32),
-    /// COMMIT serials of this conn: 1, 2, 3, … (never 0)
-    next_serial: u32 = 1,
     /// live wl_buffer id → its handle id; 0 = the export failed (the buffer
     /// stays unpresentable for its life — no retry per commit)
     by_buffer: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -162,9 +160,7 @@ pub const Conn = struct {
         const handle_id = gop.value_ptr.*;
         if (handle_id == 0) return .unshown;
 
-        const serial = self.next_serial;
-        self.next_serial +%= 1;
-        if (self.next_serial == 0) self.next_serial = 1;
+        const serial = c.serial; // the conn's serial space (relay.zig)
         try batch.shmCommit(self.gpa, c.conn_id, c.surface_id, serial, .{
             .handle_id = handle_id,
             .offset = @intCast(b.offset - start),

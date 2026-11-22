@@ -18,7 +18,9 @@
 //!   b.poolCreated(pool) ![]const u8  storage for a new pool; returns the
 //!                                    FDMSG(shm_pool) aux bytes (always none)
 //!   b.poolResized(pool, batch) !void pool.size already updated
-//!   b.surfaceDestroyed(surface_id)   drop per-surface state
+//!   b.surfaceDestroyed(surface_id)   drop per-surface state (the surface went, or
+//!                                    the engine now shows content this backend
+//!                                    did not make: a GPU resource)
 //!   b.commit(commit, batch) !Settle  ship the commit's pixels (or a notice)
 //!                                    into `batch`, after the commit's WIRE
 //!                                    frame, and say when its buffer may be
@@ -61,6 +63,10 @@ pub const Commit = struct {
     /// First commit on this surface or the buffer dims changed: the engine's
     /// copy of the surface is gone, everything ships.
     resized: bool,
+    /// The serial a COMMIT notice for this commit carries (the conn's one
+    /// serial space, shared with dmabuf virtgpu COMMITs; relay.zig owns
+    /// it and advances it only when the backend answers `.busy`).
+    serial: u32,
 };
 
 /// What became of a commit's buffer, and when its wl_buffer.release may go
@@ -73,7 +79,8 @@ pub const Settle = union(enum) {
     /// now; the engine has no current copy of the surface.
     unshown,
     /// A COMMIT notice went out: the engine reads the client's buffer until
-    /// it ACKs `serial`. `token` is handed back to `acked` then.
+    /// it ACKs `serial` (= `Commit.serial`). `token` is handed back to
+    /// `acked` then.
     busy: struct { serial: u32, token: u32 },
 };
 

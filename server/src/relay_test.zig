@@ -484,6 +484,8 @@ test "an app waits for an engine; a new link takes over and drops the old link's
     var link_a: StreamLink = undefined;
     link_a.init(io, a[0], .engine);
     const a_thread = try std.Thread.spawn(.{}, relay_mod.serveLink, .{ &relay, &link_a.link });
+    try harness.readRecord(gpa, a[1], &rec); // first on every link: what the relay can do
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.selection_cache)), (try stream.parse(rec.items)).feature.feature);
     try harness.readRecord(gpa, a[1], &rec);
     try std.testing.expectEqual(@as(u32, 1), (try stream.parse(rec.items)).conn_open);
 
@@ -505,6 +507,8 @@ test "an app waits for an engine; a new link takes over and drops the old link's
     const app2 = try harness.socketpair();
     defer _ = linux.close(app2[1]);
     const app2_thread = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &relay, appStream(app2[0]) });
+    try harness.readRecord(gpa, b[1], &rec);
+    try std.testing.expectEqual(stream.FrameType.feature, std.meta.activeTag(try stream.parse(rec.items)));
     try harness.readRecord(gpa, b[1], &rec);
     try std.testing.expectEqual(@as(u32, 2), (try stream.parse(rec.items)).conn_open);
 
@@ -1029,6 +1033,194 @@ test "SRVOBJ flags: dropped with their offer's destroy, never recorded for a clo
     try std.testing.expectEqual(@as(usize, 0), loop.relay.primary_offers.count());
 }
 
+/// The last FDMSG pipe_read answer the engine received: read id, status,
+/// bytes (a slice of the frame).
+fn lastPipeRead(loop: *Loop) ?struct { id: u32, status: u32, bytes: []const u8 } {
+    var i = loop.engine.frames.items.len;
+    while (i > 0) {
+        i -= 1;
+        const f = loop.engine.frames.items[i];
+        if (f.type != .fdmsg) continue;
+        const m = f.parse().fdmsg;
+        if (m.kind != @intFromEnum(stream.FdMsgKind.pipe_read) or m.aux.len < 8) continue;
+        return .{ .id = std.mem.readInt(u32, m.aux[0..4], .little), .status = std.mem.readInt(u32, m.aux[4..8], .little), .bytes = m.aux[8..] };
+    }
+    return null;
+}
+
+fn waitPipeRead(loop: *Loop, id: u32) !void {
+    const Ctx = struct { loop: *Loop, id: u32 };
+    try loop.until(Ctx{ .loop = loop, .id = id }, struct {
+        fn pred(x: Ctx) bool {
+            const r = lastPipeRead(x.loop) orelse return false;
+            return r.id == x.id;
+        }
+    }.pred);
+}
+
+/// Serve the next wl_data_source.send the client got: write `text` into its
+/// fd and close it (wl-copy's part).
+fn serveSend(loop: *Loop, c: *Client, source: u32, text: []const u8) !void {
+    const send_ev = comptime op("wl_data_source", .event, "send");
+    const before = c.count(source, send_ev);
+    const Ctx = struct { c: *Client, source: u32, n: usize };
+    try loop.until(Ctx{ .c = c, .source = source, .n = before }, struct {
+        fn pred(x: Ctx) bool {
+            return x.c.count(x.source, comptime op("wl_data_source", .event, "send")) > x.n;
+        }
+    }.pred);
+    const fd = c.fds.pop() orelse return error.NoSendFd;
+    defer _ = linux.close(fd);
+    _ = linux.write(fd, text.ptr, text.len);
+}
+
+/// A wl-copy shaped source on conn `conn_id` offering text/plain: like
+/// wl-copy, a window that takes keyboard focus and sets the selection with
+/// its enter's serial (a client without focus is ignored); focus goes again.
+fn copyClient(loop: *Loop, conn_id: u32) !struct { c: *Client, source: u32 } {
+    const c1 = try loop.connect();
+    const w1 = try openWindow(loop, c1);
+    const seat1 = try bind(c1, w1.registry, "wl_seat", 5);
+    const ddm1 = try bind(c1, w1.registry, "wl_data_device_manager", 3);
+    const kbd1 = c1.newId();
+    try c1.send(seat1, comptime op("wl_seat", .request, "get_keyboard"), &.{.{ .new_id = kbd1 }});
+    const source = c1.newId();
+    try c1.send(ddm1, comptime op("wl_data_device_manager", .request, "create_data_source"), &.{.{ .new_id = source }});
+    try c1.send(source, comptime op("wl_data_source", .request, "offer"), &.{.{ .string = "text/plain" }});
+    const dev1 = c1.newId();
+    try c1.send(ddm1, comptime op("wl_data_device_manager", .request, "get_data_device"), &.{ .{ .new_id = dev1 }, .{ .object = seat1 } });
+    try loop.roundtrip(c1);
+    loop.engine.comp.keyboardEnter(conn_id, w1.surface);
+    try loop.engine.flush();
+    try loop.roundtrip(c1);
+    while (c1.fds.pop()) |fd| _ = linux.close(fd); // the keymap
+    const enter = c1.last(kbd1, comptime op("wl_keyboard", .event, "enter")) orelse return error.NoEnter;
+    try c1.send(dev1, comptime op("wl_data_device", .request, "set_selection"), &.{ .{ .object = source }, .{ .uint = std.mem.readInt(u32, enter.body[0..4], .little) } });
+    try loop.roundtrip(c1);
+    loop.engine.comp.keyboardLeave(conn_id);
+    try loop.engine.flush();
+    return .{ .c = c1, .source = source };
+}
+
+test "clipboard bridge: the engine reads a client's selection through a relay pipe (bounded); its own selection is written into a focused client's pipe" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{});
+    defer loop.stop();
+
+    // conn 1: a wl-copy shaped source offering text/plain
+    const src1 = try copyClient(&loop, 1);
+    const c1 = src1.c;
+    const source = src1.source;
+
+    // the engine reads it: the source gets send(mime, fd), the bytes come back
+    try std.testing.expect(loop.engine.comp.readSelection("text/plain", 7, 1024));
+    try loop.engine.flush();
+    try serveSend(&loop, c1, source, "from the app");
+    try waitPipeRead(&loop, 7);
+    var r = lastPipeRead(&loop).?;
+    try std.testing.expectEqual(@intFromEnum(stream.PipeReadStatus.ok), r.status);
+    try std.testing.expectEqualStrings("from the app", r.bytes);
+    // over the engine's bound: too_large, no bytes
+    try std.testing.expect(loop.engine.comp.readSelection("text/plain", 8, 4));
+    try loop.engine.flush();
+    try serveSend(&loop, c1, source, "from the app");
+    try waitPipeRead(&loop, 8);
+    r = lastPipeRead(&loop).?;
+    try std.testing.expectEqual(@intFromEnum(stream.PipeReadStatus.too_large), r.status);
+    try std.testing.expectEqual(@as(usize, 0), r.bytes.len);
+
+    // conn 2: a focused window with a data device
+    const c2 = try loop.connect();
+    const w = try openWindow(&loop, c2);
+    const seat2 = try bind(c2, w.registry, "wl_seat", 5);
+    const ddm2 = try bind(c2, w.registry, "wl_data_device_manager", 3);
+    try c2.send(seat2, comptime op("wl_seat", .request, "get_keyboard"), &.{.{ .new_id = c2.newId() }});
+    const dev2 = c2.newId();
+    try c2.send(ddm2, comptime op("wl_data_device_manager", .request, "get_data_device"), &.{ .{ .new_id = dev2 }, .{ .object = seat2 } });
+    try loop.roundtrip(c2);
+    loop.engine.comp.keyboardEnter(2, w.surface);
+    try loop.engine.flush();
+    try loop.roundtrip(c2);
+    // its fds so far (the keymap) are not the test's
+    while (c2.fds.pop()) |fd| _ = linux.close(fd);
+
+    // the engine's own selection: offered to conn 2, cancelling conn 1's source
+    var pack: [64]u8 = undefined;
+    const mime = "text/plain;charset=utf-8";
+    const text = "from the page";
+    std.mem.writeInt(u32, pack[0..4], mime.len, .little);
+    @memcpy(pack[4..][0..mime.len], mime);
+    std.mem.writeInt(u32, pack[4 + mime.len ..][0..4], text.len, .little);
+    @memcpy(pack[8 + mime.len ..][0..text.len], text);
+    try loop.engine.comp.setOwnSelection(pack[0 .. 8 + mime.len + text.len]);
+    try loop.engine.flush();
+    try loop.roundtrip(c2);
+    try loop.roundtrip(c1);
+    try std.testing.expectEqual(@as(usize, 1), c1.count(source, comptime op("wl_data_source", .event, "cancelled")));
+    const sel = c2.last(dev2, comptime op("wl_data_device", .event, "selection")) orelse return error.NoSelection;
+    const offer = std.mem.readInt(u32, sel.body[0..4], .little);
+    try std.testing.expect(offer >= core.objects.server_id_base);
+
+    // receive: the relay writes the core's bytes into the pipe, then closes it
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&fds, .{ .CLOEXEC = true }));
+    defer _ = linux.close(fds[0]);
+    try c2.sendFd(offer, comptime op("wl_data_offer", .request, "receive"), &.{ .{ .string = mime }, .fd }, fds[1]);
+    _ = linux.close(fds[1]);
+    try loop.roundtrip(c2);
+    var got: [64]u8 = undefined;
+    var n: usize = 0;
+    while (true) {
+        try harness.waitReadable(fds[0]);
+        const rc = linux.read(fds[0], got[n..].ptr, got.len - n);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        if (rc == 0) break;
+        n += rc;
+    }
+    try std.testing.expectEqualStrings(text, got[0..n]);
+    // a mime it does not have reads EOF at once
+    var fds2: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&fds2, .{ .CLOEXEC = true }));
+    defer _ = linux.close(fds2[0]);
+    try c2.sendFd(offer, comptime op("wl_data_offer", .request, "receive"), &.{ .{ .string = "image/png" }, .fd }, fds2[1]);
+    _ = linux.close(fds2[1]);
+    try loop.roundtrip(c2);
+    try harness.waitReadable(fds2[0]);
+    try std.testing.expectEqual(@as(usize, 0), linux.read(fds2[0], &got, got.len));
+}
+
+test "clipboard bridge: EOF completes a read even after its source hung up (wl-copy --paste-once: a child writes, the parent has left)" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{});
+    defer loop.stop();
+    const src = try copyClient(&loop, 1);
+    try std.testing.expect(loop.engine.comp.readSelection("text/plain", 9, 1024));
+    try loop.engine.flush();
+    const send_ev = comptime op("wl_data_source", .event, "send");
+    const Ctx = struct { c: *Client, source: u32 };
+    try loop.until(Ctx{ .c = src.c, .source = src.source }, struct {
+        fn pred(x: Ctx) bool {
+            return x.c.count(x.source, send_ev) > 0;
+        }
+    }.pred);
+    const fd = src.c.fds.pop() orelse return error.NoSendFd;
+    _ = linux.write(fd, "part", 4);
+    src.c.close(); // the source's connection goes first...
+    try loop.until(&loop, struct {
+        fn pred(l: *Loop) bool {
+            l.relay.mutex.lockUncancelable(l.relay.io);
+            defer l.relay.mutex.unlock(l.relay.io);
+            return !l.relay.conns.contains(1);
+        }
+    }.pred);
+    _ = linux.write(fd, "-rest", 5); // ...the pipe's holder finishes later
+    _ = linux.close(fd);
+    try waitPipeRead(&loop, 9);
+    const r = lastPipeRead(&loop).?;
+    try std.testing.expectEqual(@intFromEnum(stream.PipeReadStatus.ok), r.status);
+    try std.testing.expectEqualStrings("part-rest", r.bytes);
+}
+
 // ---------------------------------------------------------------------------
 // linux-dmabuf (memfds stand in for dmabufs: no /dev/dri here; the readback
 // backend treats a memfd like a LINEAR dmabuf, DMA_BUF_IOCTL_SYNC → ENOTTY)
@@ -1214,7 +1406,9 @@ test "dmabuf: without a backend the global is absent, and a client adding a plan
     const c = try loop.connect();
     const w = try openWindow(&loop, c);
     try std.testing.expectEqual(@as(?u32, null), c.globalName(w.registry, "zwp_linux_dmabuf_v1"));
-    try std.testing.expectEqual(@as(usize, 0), loop.engine.count(.feature));
+    // the one FEATURE is selection_cache, nothing dmabuf
+    try std.testing.expectEqual(@as(usize, 1), loop.engine.count(.feature));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.selection_cache)), loop.engine.frames.items[0].parse().feature.feature);
 
     // bound by name regardless: the compositor answers with a protocol error
     // (which may lose the race), the relay drops the conn at the first fd it
@@ -1310,4 +1504,943 @@ test "loop: presentation feedback passes the relay stamped on CLOCK_MONOTONIC le
         try std.testing.expectEqual(@as(usize, 1), c.count(fb2, discarded_ev));
         try std.testing.expectEqual(@as(usize, 0), c.count(fb2, presented_ev));
     }
+}
+
+// ---------------------------------------------------------------------------
+// dmabuf virtgpu: dmabufs named as resources (COMMIT kind virtgpu) through
+// virtgpu.Fake, the ioctl seam's stand-in for a virtio-gpu render node.
+// ---------------------------------------------------------------------------
+
+const virtgpu = @import("virtgpu.zig");
+
+/// A virtgpu backend on the fake device, outliving the Loop that uses it.
+const Gpu = struct {
+    threaded: std.Io.Threaded,
+    fake: virtgpu.Fake = .{},
+    imp: virtgpu.Importer = undefined,
+
+    fn init(self: *Gpu) void {
+        self.* = .{ .threaded = .init(std.testing.allocator, .{}) };
+        self.imp = .init(self.threaded.io(), std.testing.allocator, .{ .fd = -1, .fake = &self.fake });
+    }
+
+    fn deinit(self: *Gpu) void {
+        self.imp.deinit();
+        self.fake.deinit();
+        self.threaded.deinit();
+    }
+
+    fn config(self: *Gpu) dmabuf.Config {
+        return .{ .backend = .{ .virtgpu = &self.imp }, .main_device = 0xe280 };
+    }
+};
+
+test "virtgpu: FEATURE dmabuf_kind (virtgpu) then linux_dmabuf, before any CONN_OPEN; an engine without a GPU source offers no linux-dmabuf, wl_shm still shows" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    for ([_]bool{ true, false }) |has_gpu| {
+        var loop: Loop = undefined;
+        try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config(), .gpu_source = has_gpu });
+        defer loop.stop();
+        loop.engine.gpu = &gpu.fake;
+        const c = try loop.connect();
+        const w = try openWindow(&loop, c);
+
+        const frames = loop.engine.frames.items;
+        try std.testing.expectEqual(stream.FrameType.feature, frames[0].type);
+        const k = frames[0].parse().feature;
+        try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.dmabuf_kind)), k.feature);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(stream.BufferKind.virtgpu)), (try stream.DmabufKindFeature.decode(k.bytes)).buffer_kind);
+        try std.testing.expectEqual(stream.FrameType.feature, frames[1].type);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.linux_dmabuf)), frames[1].parse().feature.feature);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.selection_cache)), frames[2].parse().feature.feature);
+        try std.testing.expectEqual(stream.FrameType.conn_open, frames[3].type);
+        try std.testing.expectEqual(@as(usize, 3), loop.engine.count(.feature));
+
+        try std.testing.expectEqual(has_gpu, c.globalName(w.registry, "zwp_linux_dmabuf_v1") != null);
+        // the software path is there either way
+        var pixels: [4 * 3 * 4]u8 = undefined;
+        for (0..12) |i| std.mem.writeInt(u32, pixels[i * 4 ..][0..4], 0xff40_5060 + @as(u32, @intCast(i)), .little); // X = ff: the copy path forces it
+        var memfd: i32 = -1;
+        defer _ = linux.close(memfd);
+        const buffer = try shmBuffer(c, w, &pixels, 4, 3, &memfd);
+        try attach(c, w.surface, buffer);
+        try damageAll(c, w.surface, 4, 3);
+        try commit(c, w.surface);
+        try loop.roundtrip(c);
+        try std.testing.expectEqual(@as(usize, 1), bufferFramesSince(&loop, 0));
+        try expectPixels(&loop, conn1, w.surface, &pixels, 0, 4, 3, 16);
+    }
+}
+
+/// create_params + add(fd as plane 0 at `offset`/`stride`, `modifier`).
+fn dmabufParamsMod(c: *Client, dm: u32, fd: i32, offset: u32, stride: u32, modifier: u64) !u32 {
+    const params = c.newId();
+    try c.send(dm, comptime op("zwp_linux_dmabuf_v1", .request, "create_params"), &.{.{ .new_id = params }});
+    try c.sendFd(params, comptime op("zwp_linux_buffer_params_v1", .request, "add"), &.{
+        .fd, .{ .uint = 0 }, .{ .uint = offset }, .{ .uint = stride }, .{ .uint = @truncate(modifier >> 32) }, .{ .uint = @truncate(modifier) },
+    }, fd);
+    return params;
+}
+
+fn dmabufImmedFlags(c: *Client, params: u32, w: i32, h: i32, format: u32, flags: u32) !u32 {
+    const buffer = c.newId();
+    try c.send(params, comptime op("zwp_linux_buffer_params_v1", .request, "create_immed"), &.{
+        .{ .new_id = buffer }, .{ .int = w }, .{ .int = h }, .{ .uint = format }, .{ .uint = flags },
+    });
+    try c.send(params, comptime op("zwp_linux_buffer_params_v1", .request, "destroy"), &.{});
+    return buffer;
+}
+
+/// The engine's copy of a surface equals `width`×`height` rows of `mem`
+/// from `offset` at `stride` (read through the resource, `Engine.gpu`).
+fn expectGpuPixels(loop: *Loop, conn_id: u32, surface: u32, mem: []const u8, offset: usize, width: u32, height: u32, stride: usize) !void {
+    try expectPixels(loop, conn_id, surface, mem, offset, width, height, stride);
+}
+
+test "virtgpu: FEATURE offers implicit + LINEAR 8888s; create_immed names the resource, COMMIT kind virtgpu after its WIRE, no pixels in the stream; release after the ACK, once per attach; GEM closed at destroy" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config() }); // --buffers copy
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+
+    // frames[0] is dmabuf_kind (the next test), then linux_dmabuf
+    const feat = try stream.DmabufFeature.decode(loop.engine.frames.items[1].parse().feature.bytes);
+    try std.testing.expectEqual(@as(usize, 8), feat.count());
+    try std.testing.expectEqual(dmabuf.fourcc_argb8888, feat.entry(0).format);
+    try std.testing.expectEqual(dmabuf.mod_invalid, feat.entry(0).modifier);
+    try std.testing.expectEqual(dmabuf.fourcc_xbgr8888, feat.entry(7).format);
+    try std.testing.expectEqual(dmabuf.mod_linear, feat.entry(7).modifier);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+
+    // 4×3 XRGB at offset 32, stride 20 (padded, as a GPU allocator would)
+    var mem: [32 + 3 * 20]u8 = undefined;
+    const fd = try patternMemfd("wland-vg-basic", &mem);
+    defer _ = linux.close(fd);
+    const buffer = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 32, 20, dmabuf.mod_invalid), 4, 3, dmabuf.fourcc_xrgb8888, 1);
+    try loop.roundtrip(c);
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.live()); // named at create, not at commit
+
+    const from = loop.engine.frames.items.len;
+    try attach(c, w.surface, buffer);
+    try damageAll(c, w.surface, 4, 3);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), framesSince(&loop, from, .commit));
+    try std.testing.expectEqual(@as(usize, 0), framesSince(&loop, from, .buffer) + framesSince(&loop, from, .buffer_lz) + framesSince(&loop, from, .handle_open));
+    const frames = loop.engine.frames.items;
+    var ci: usize = from;
+    while (frames[ci].type != .commit) ci += 1;
+    try std.testing.expectEqual(stream.FrameType.wire, frames[ci - 1].type); // the commit request's
+    const seen = loop.engine.gpu_commits.items[0];
+    try std.testing.expectEqual(@as(u32, 1), seen.serial);
+    try std.testing.expectEqual(w.surface, seen.surface_id);
+    try std.testing.expectEqual(stream.VirtgpuRef{ .resource = 1, .width = 4, .height = 3, .format = dmabuf.fourcc_xrgb8888, .flags = 1, .offset = 32, .stride = 20, .modifier = dmabuf.mod_invalid }, seen.ref);
+    try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 4, .h = 3 }, seen.first_rect);
+    try expectGpuPixels(&loop, conn1, w.surface, &mem, 32, 4, 3, 20);
+
+    // withheld until the ACK; then exactly one
+    try std.testing.expectEqual(@as(usize, 0), c.count(buffer, release_ev));
+    try loop.engine.ack(conn1, 1);
+    try waitReleases(&loop, c, buffer, 1);
+
+    // a commit without attach (damage only): a COMMIT that owes nothing;
+    // one with neither: nothing
+    try damage(c, w.surface, 1, 1, 2, 1);
+    try commit(c, w.surface);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.gpu_commits.items.len);
+    try std.testing.expectEqual(stream.Rect{ .x = 1, .y = 1, .w = 2, .h = 1 }, loop.engine.gpu_commits.items[1].first_rect);
+    try loop.engine.ack(conn1, 2);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), c.count(buffer, release_ev));
+
+    // re-attach: the same resource, one more release after its ACK
+    try attach(c, w.surface, buffer);
+    try damageAll(c, w.surface, 4, 3);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(u32, 1), loop.engine.gpu_commits.items[2].ref.resource);
+    try loop.engine.ack(conn1, 3);
+    try waitReleases(&loop, c, buffer, 2);
+
+    // fds on the memfd: the test's, the relay's plane fd, the fake GEM's
+    try std.testing.expectEqual(@as(usize, 3), harness.countMemfds("wland-vg-basic"));
+    try c.send(buffer, comptime op("wl_buffer", .request, "destroy"), &.{});
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.live());
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.closes);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.bad_closes);
+    try std.testing.expectEqual(@as(usize, 1), harness.countMemfds("wland-vg-basic"));
+    try std.testing.expectEqual(@as(usize, 2), c.count(buffer, release_ev));
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "virtgpu: wl_buffer.destroy before the ACK keeps the resource alive until it; two buffers over one dmabuf share one GEM handle, closed once; params.create works too" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    var mem: [2 * 2 * 4]u8 = undefined;
+    const fd = try patternMemfd("wland-vg-share", &mem);
+    defer _ = linux.close(fd);
+
+    // destroyed with its COMMIT in flight: no release, the engine still
+    // resolves the resource (Engine.gpu counts an error otherwise)
+    const b1 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 8, dmabuf.mod_linear), 2, 2, dmabuf.fourcc_argb8888, 0);
+    try attach(c, w.surface, b1);
+    try damageAll(c, w.surface, 2, 2);
+    try commit(c, w.surface); // serial 1
+    try c.send(b1, comptime op("wl_buffer", .request, "destroy"), &.{});
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.live()); // the COMMIT holds it
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+
+    // a second buffer over the SAME dmabuf (create, server id): same GEM
+    // handle, same resource; the first's ACK must not close it
+    const params = try dmabufParamsMod(c, dm, fd, 0, 8, dmabuf.mod_linear);
+    try c.send(params, comptime op("zwp_linux_buffer_params_v1", .request, "create"), &.{
+        .{ .int = 2 }, .{ .int = 2 }, .{ .uint = dmabuf.fourcc_argb8888 }, .{ .uint = 0 },
+    });
+    try loop.roundtrip(c);
+    const created = c.last(params, comptime op("zwp_linux_buffer_params_v1", .event, "created")) orelse return error.NotCreated;
+    const b2 = std.mem.readInt(u32, created.body[0..4], .little);
+    try std.testing.expect(b2 >= core.objects.server_id_base);
+    try c.send(params, comptime op("zwp_linux_buffer_params_v1", .request, "destroy"), &.{});
+    try attach(c, w.surface, b2);
+    try damageAll(c, w.surface, 2, 2);
+    try commit(c, w.surface); // serial 2
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.gpu_commits.items.len);
+    try std.testing.expectEqual(loop.engine.gpu_commits.items[0].ref.resource, loop.engine.gpu_commits.items[1].ref.resource);
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.live());
+    try std.testing.expectEqual(@as(u32, 3), gpu.imp.refsOf(1)); // COMMIT 1, b2, COMMIT 2
+
+    try loop.engine.ack(conn1, 1);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 0), c.count(b1, release_ev)); // forgotten: never
+    try std.testing.expectEqual(@as(usize, 0), c.count(b2, release_ev)); // busy with serial 2
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.live());
+    try loop.engine.ack(conn1, 2);
+    try waitReleases(&loop, c, b2, 1);
+    try std.testing.expectEqual(@as(u32, 1), gpu.imp.refsOf(1)); // b2 alone
+
+    // the server-id buffer destroyed: the handle goes, closed exactly once
+    try c.send(b2, comptime op("wl_buffer", .request, "destroy"), &.{});
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.live());
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.closes);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.bad_closes);
+    try std.testing.expectEqual(@as(usize, 1), harness.countMemfds("wland-vg-share"));
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "virtgpu: what it can't name (interlaced, a failed import) is released unshown, logged once; offered-but-odd layouts the compositor refuses never reach it" {
+    std.testing.log_level = .err; // the refusals are warnings
+    defer std.testing.log_level = .warn;
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    var mem: [4 * 4 * 4]u8 = undefined;
+    const fd = try patternMemfd("wland-vg-refuse", &mem);
+    defer _ = linux.close(fd);
+
+    // interlaced: the compositor takes it (flags are the backend's), the
+    // relay does not name it
+    const b1 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xbgr8888, 2);
+    // the device refuses the import
+    gpu.fake.fail_import = .INVAL;
+    const b2 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_abgr8888, 0);
+    for ([_]u32{ b1, b2, b1, b2 }, 1..) |b, i| {
+        try attach(c, w.surface, b);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface);
+        try waitReleases(&loop, c, b, (i + 1) / 2);
+    }
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.gpu_commits.items.len);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.live());
+    try std.testing.expectEqual(@as(usize, 2), gpu.imp.n_logged[@intFromEnum(virtgpu.Importer.LogClass.refused)]); // one per kind, not per commit
+
+    // a modifier the table lacks (X-tiled): the compositor answers with
+    // invalid_format (a protocol error); the relay names nothing for it
+    const closes_before = gpu.fake.closes;
+    _ = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 16, 0x0100000000000001), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+    const error_ev = comptime op("wl_display", .event, "error");
+    try loop.until(c, struct {
+        fn pred(x: *Client) bool {
+            return x.count(1, error_ev) == 1;
+        }
+    }.pred);
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, c.last(1, error_ev).?.body[4..8], .little)); // invalid_format
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.live());
+    try std.testing.expectEqual(closes_before, gpu.fake.closes);
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "virtgpu: conn close with COMMITs in flight drops every GEM reference; late ACKs ignored; the next app is served" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    var mem: [4 * 4 * 4]u8 = undefined;
+    const fd1 = try patternMemfd("wland-vg-close", &mem);
+    defer _ = linux.close(fd1);
+    const fd2 = try patternMemfd("wland-vg-close", &mem);
+    defer _ = linux.close(fd2);
+    const b1 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd1, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+    const b2 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd2, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+    for ([_]u32{ b1, b2 }) |b| {
+        try attach(c, w.surface, b);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface);
+    }
+    try c.send(b1, comptime op("wl_buffer", .request, "destroy"), &.{}); // held by its COMMIT only
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), gpu.fake.live());
+
+    const closes = loop.engine.count(.conn_close);
+    c.close();
+    const Ctx = struct { e: *harness.Engine, n: usize };
+    try loop.until(Ctx{ .e = &loop.engine, .n = closes }, struct {
+        fn pred(x: Ctx) bool {
+            return x.e.count(.conn_close) > x.n;
+        }
+    }.pred);
+    // the relay tore the conn down before CONN_CLOSE: nothing held
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.live());
+    try std.testing.expectEqual(@as(usize, 0), gpu.imp.live());
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.bad_closes);
+    try std.testing.expectEqual(@as(usize, 2), harness.countMemfds("wland-vg-close")); // the test's two
+
+    try loop.engine.ack(conn1, 1);
+    try loop.engine.ack(conn1, 2);
+    loop.engine.auto_ack = true;
+    const c2 = try loop.connect();
+    const w2 = try openWindow(&loop, c2);
+    const dm2 = try bind(c2, w2.registry, "zwp_linux_dmabuf_v1", 4);
+    const b3 = try dmabufImmedFlags(c2, try dmabufParamsMod(c2, dm2, fd1, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+    try attach(c2, w2.surface, b3);
+    try damageAll(c2, w2.surface, 4, 4);
+    try commit(c2, w2.surface);
+    try waitReleases(&loop, c2, b3, 1);
+    try std.testing.expectEqual(@as(u32, 1), loop.engine.gpu_commits.items[2].serial); // a new conn: its own serials
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "virtgpu beside handle buffers (procfd, kwshm): shm by handle, dmabuf by resource on one conn, one serial space, ACKs in any order" {
+    const dev: i32 = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
+    defer _ = linux.close(dev);
+    for ([_]@import("buffers.zig").Backend{ .procfd, .{ .kwshm = dev } }) |backend| {
+        var gpu: Gpu = undefined;
+        gpu.init();
+        defer gpu.deinit();
+        var loop: Loop = undefined;
+        try loop.start(std.testing.allocator, .{ .backend = backend, .dmabuf = gpu.config() });
+        defer loop.stop();
+        loop.engine.auto_ack = false;
+        loop.engine.gpu = &gpu.fake;
+        const c = try loop.connect();
+        const w = try openWindow(&loop, c);
+        const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+
+        // a second surface for the GPU client half (a subsurface would do too)
+        const gs = c.newId();
+        try c.send(w.compositor, comptime op("wl_compositor", .request, "create_surface"), &.{.{ .new_id = gs }});
+        var shm_px: [4 * 4 * 4]u8 = undefined;
+        @memset(&shm_px, 0x33);
+        var shm_fd: i32 = -1;
+        defer _ = linux.close(shm_fd);
+        const sb = try shmBuffer(c, w, &shm_px, 4, 4, &shm_fd);
+        var gmem: [2 * 2 * 4]u8 = undefined;
+        const gfd = try patternMemfd("wland-vg-mixed", &gmem);
+        defer _ = linux.close(gfd);
+        const gb = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, gfd, 0, 8, dmabuf.mod_invalid), 2, 2, dmabuf.fourcc_argb8888, 0);
+
+        try attach(c, w.surface, sb);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface); // serial 1: shm
+        try attach(c, gs, gb);
+        try damageAll(c, gs, 2, 2);
+        try commit(c, gs); // serial 2: virtgpu
+        try attach(c, w.surface, sb);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface); // serial 3: shm again
+        try loop.settle(c);
+        try std.testing.expectEqual(@as(usize, 2), loop.engine.commits.items.len);
+        try std.testing.expectEqual(@as(usize, 1), loop.engine.gpu_commits.items.len);
+        try std.testing.expectEqual(@as(u32, 1), loop.engine.commits.items[0].serial);
+        try std.testing.expectEqual(@as(u32, 2), loop.engine.gpu_commits.items[0].serial);
+        try std.testing.expectEqual(@as(u32, 3), loop.engine.commits.items[1].serial);
+        try expectGpuPixels(&loop, conn1, gs, &gmem, 0, 2, 2, 8);
+
+        // the GPU commit's ACK first: its buffer alone is released
+        try loop.engine.ack(conn1, 2);
+        try waitReleases(&loop, c, gb, 1);
+        try std.testing.expectEqual(@as(usize, 0), c.count(sb, release_ev));
+        try loop.engine.ack(conn1, 3);
+        try loop.engine.ack(conn1, 1);
+        try waitReleases(&loop, c, sb, 1); // one release for both busy shm COMMITs
+        try loop.settle(c);
+        try std.testing.expectEqual(@as(usize, 1), c.count(gb, release_ev));
+        try expectHandlesBalanced(&loop);
+        try std.testing.expectEqual(@as(usize, 1), gpu.fake.live()); // gb lives
+        try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+    }
+}
+
+test "virtgpu with --buffers copy on a relay-paced (WebSocket) link: COMMIT/ACK both ways, frame callbacks fired once by the relay" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .frame_callbacks = .relay, .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.gpu = &gpu.fake; // auto-ACK, as the reference engine does
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    var mem: [2 * 2 * 4]u8 = undefined;
+    const fd = try patternMemfd("wland-vg-ws", &mem);
+    defer _ = linux.close(fd);
+    const b = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 8, dmabuf.mod_invalid), 2, 2, dmabuf.fourcc_xrgb8888, 0);
+    var pixels: [4]u8 = .{ 9, 9, 9, 9 };
+    var shm_fd: i32 = -1;
+    defer _ = linux.close(shm_fd);
+    const sb = try shmBuffer(c, w, &pixels, 1, 1, &shm_fd);
+
+    for (0..3) |i| {
+        const cb = c.newId();
+        try c.send(w.surface, comptime op("wl_surface", .request, "frame"), &.{.{ .new_id = cb }});
+        try attach(c, w.surface, b);
+        try damageAll(c, w.surface, 2, 2);
+        try commit(c, w.surface);
+        try waitReleases(&loop, c, b, i + 1); // the ACK came back and was settled
+        const Ctx = struct { c: *Client, cb: u32 };
+        try loop.until(Ctx{ .c = c, .cb = cb }, struct {
+            fn pred(x: Ctx) bool {
+                return x.c.count(x.cb, done_ev) == 1;
+            }
+        }.pred);
+    }
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 3), loop.engine.gpu_commits.items.len);
+    try std.testing.expectEqual(@as(usize, 3), c.count(b, release_ev));
+    // the engine never saw a frame request (it would fire a second done)
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.comp.conns.get(conn1).?.frame_callbacks.items.len);
+
+    // a wl_shm buffer on the same conn still travels as pixels
+    try attach(c, w.surface, sb);
+    try damageAll(c, w.surface, 1, 1);
+    try commit(c, w.surface);
+    try waitReleases(&loop, c, sb, 1);
+    // copy mode releases before the burst goes out: the engine may not
+    // have read the BUFFER yet
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), bufferFramesSince(&loop, 0));
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+/// The engine shows `mem`'s rows (as `expectPixels`), alpha/X bytes not
+/// compared: copy mode ships XRGB with X forced to 0xff.
+fn expectRgb(loop: *Loop, conn_id: u32, surface: u32, mem: []const u8, offset: usize, width: u32, height: u32, stride: usize) !void {
+    const px = loop.engine.pixels(conn_id, surface) orelse return error.NoPixels;
+    try std.testing.expectEqual(width, px.width);
+    try std.testing.expectEqual(height, px.height);
+    for (0..height) |y| for (0..width) |x| {
+        const want = mem[offset + y * stride + x * 4 ..][0..3];
+        const got = px.bytes[(y * width + x) * 4 ..][0..3];
+        try std.testing.expectEqualSlices(u8, want, got);
+    };
+}
+
+test "virtgpu ⇄ pixels on one surface at the same size: each switch of kind ships the whole buffer, the engine shows the new content (copy, procfd, kwshm)" {
+    const dev: i32 = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
+    defer _ = linux.close(dev);
+    for ([_]@import("buffers.zig").Backend{ .copy, .procfd, .{ .kwshm = dev } }) |backend| {
+        var gpu: Gpu = undefined;
+        gpu.init();
+        defer gpu.deinit();
+        var loop: Loop = undefined;
+        try loop.start(std.testing.allocator, .{ .backend = backend, .dmabuf = gpu.config() });
+        defer loop.stop();
+        loop.engine.gpu = &gpu.fake; // auto-ACK
+        const c = try loop.connect();
+        const w = try openWindow(&loop, c);
+        const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+        // 4×4 each, different content everywhere
+        var px: [4 * 4 * 4]u8 = undefined;
+        for (&px, 0..) |*b, i| b.* = @truncate(0x80 + i);
+        var shm_fd: i32 = -1;
+        defer _ = linux.close(shm_fd);
+        const sb = try shmBuffer(c, w, &px, 4, 4, &shm_fd);
+        var gmem: [4 * 4 * 4]u8 = undefined;
+        const gfd = try patternMemfd("wland-vg-switch", &gmem);
+        defer _ = linux.close(gfd);
+        const gb = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, gfd, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+
+        const Step = struct { buffer: u32, rect: [4]i32, gpu: bool };
+        const steps = [_]Step{
+            .{ .buffer = sb, .rect = .{ 0, 0, 4, 4 }, .gpu = false },
+            // shm → gpu: the client damages one pixel (the rest of its
+            // buffer holds the same picture as the shm one did, for all
+            // the client knows): the engine must still get all of it
+            .{ .buffer = gb, .rect = .{ 1, 1, 1, 1 }, .gpu = true },
+            // gpu → shm, partial damage: a GL presenter blanked the
+            // texture for the GPU image; the copy backend's shadow is stale
+            .{ .buffer = sb, .rect = .{ 2, 2, 1, 1 }, .gpu = false },
+            .{ .buffer = gb, .rect = .{ 0, 0, 1, 1 }, .gpu = true },
+            // the reviewer's case: full damage after a GPU image
+            .{ .buffer = sb, .rect = .{ 0, 0, 4, 4 }, .gpu = false },
+        };
+        for (steps) |st| {
+            const commits_before = loop.engine.commits.items.len;
+            const gpu_before = loop.engine.gpu_commits.items.len;
+            const from = loop.engine.frames.items.len;
+            try attach(c, w.surface, st.buffer);
+            try damage(c, w.surface, st.rect[0], st.rect[1], st.rect[2], st.rect[3]);
+            try commit(c, w.surface);
+            try loop.settle(c);
+            if (st.gpu) {
+                try std.testing.expectEqual(gpu_before + 1, loop.engine.gpu_commits.items.len);
+                try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 4, .h = 4 }, loop.engine.gpu_commits.items[gpu_before].first_rect);
+                try expectRgb(&loop, conn1, w.surface, &gmem, 0, 4, 4, 16);
+            } else {
+                if (backend == .copy) {
+                    try std.testing.expectEqual(@as(usize, 1), bufferFramesSince(&loop, from));
+                } else {
+                    try std.testing.expectEqual(commits_before + 1, loop.engine.commits.items.len);
+                    try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 4, .h = 4 }, loop.engine.commits.items[commits_before].first_rect);
+                }
+                try expectRgb(&loop, conn1, w.surface, &px, 0, 4, 4, 16);
+            }
+        }
+        // same kind again: the client's damage alone (no forced full rect)
+        const gpu_before = loop.engine.gpu_commits.items.len;
+        try attach(c, w.surface, gb);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface);
+        try damage(c, w.surface, 3, 0, 1, 2);
+        try commit(c, w.surface);
+        try loop.settle(c);
+        try std.testing.expectEqual(gpu_before + 2, loop.engine.gpu_commits.items.len);
+        try std.testing.expectEqual(stream.Rect{ .x = 3, .y = 0, .w = 1, .h = 2 }, loop.engine.gpu_commits.items[gpu_before + 1].first_rect);
+        try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+    }
+}
+
+test "virtgpu swapchain: three resources in turn with partial damage carry the client's rects; the engine's copy stays the whole picture" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .backend = .procfd, .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.gpu = &gpu.fake; // auto-ACK
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+
+    // A client's frames: frame k changes one rect of the picture; the
+    // buffer it renders frame k into holds the whole picture as of frame k
+    // (buffer age: it repaired what changed since that buffer's last use),
+    // as wl_surface.attach requires.
+    const W = 6;
+    const H = 4;
+    var picture: [W * H * 4]u8 = @splat(0x10);
+    const rects = [_][4]i32{ .{ 0, 0, W, H }, .{ 1, 1, 2, 2 }, .{ 0, 0, 1, 1 }, .{ 5, 3, 1, 1 }, .{ 2, 0, 3, 1 }, .{ 4, 2, 2, 2 }, .{ 0, 3, 6, 1 } };
+    var fds: [3]i32 = undefined;
+    var bufs: [3]u32 = undefined;
+    for (&fds, &bufs, 0..) |*fd, *b, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrintZ(&name_buf, "wland-vg-swap{d}", .{i});
+        var junk: [W * H * 4]u8 = undefined;
+        fd.* = try patternMemfd(name, &junk);
+        b.* = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd.*, 0, W * 4, dmabuf.mod_invalid), W, H, dmabuf.fourcc_xrgb8888, 0);
+    }
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    for (rects, 0..) |r, k| {
+        // frame k: change rect r of the picture, render it all into buffer k % 3
+        for (0..@intCast(r[3])) |dy| for (0..@intCast(r[2])) |dx| {
+            const at = ((@as(usize, @intCast(r[1])) + dy) * W + @as(usize, @intCast(r[0])) + dx) * 4;
+            @memset(picture[at..][0..4], @as(u8, @intCast(0x20 + k * 0x11)));
+        };
+        const slot = k % 3;
+        try std.testing.expectEqual(picture.len, linux.pwrite(fds[slot], &picture, picture.len, 0));
+        try attach(c, w.surface, bufs[slot]);
+        try damage(c, w.surface, r[0], r[1], r[2], r[3]);
+        try commit(c, w.surface);
+        try loop.settle(c);
+        const seen = loop.engine.gpu_commits.items[k];
+        try std.testing.expectEqual(@as(u32, 1), seen.n_rects);
+        try std.testing.expectEqual(stream.Rect{ .x = r[0], .y = r[1], .w = r[2], .h = r[3] }, seen.first_rect);
+        try std.testing.expectEqual(loop.engine.gpu_commits.items[slot].ref.resource, seen.ref.resource);
+        try expectPixels(&loop, conn1, w.surface, &picture, 0, W, H, W * 4);
+    }
+    try std.testing.expectEqual(@as(usize, 3), gpu.fake.live());
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "virtgpu: the render node is held only while a GPU buffer or its COMMIT is — closed after the last destroy + ACK and at conn close, reopened at the next import" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.opens); // no GPU buffer yet: no host context
+    var mem: [2 * 2 * 4]u8 = undefined;
+    const fd = try patternMemfd("wland-vg-node", &mem);
+    defer _ = linux.close(fd);
+
+    const b1 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 8, dmabuf.mod_invalid), 2, 2, dmabuf.fourcc_xrgb8888, 0);
+    try attach(c, w.surface, b1);
+    try damageAll(c, w.surface, 2, 2);
+    try commit(c, w.surface); // serial 1
+    try c.send(b1, comptime op("wl_buffer", .request, "destroy"), &.{});
+    try loop.settle(c);
+    try std.testing.expect(gpu.fake.is_open); // the COMMIT holds the resource
+    try loop.engine.ack(conn1, 1);
+    try loop.settle(c);
+    try std.testing.expect(!gpu.fake.is_open);
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.opens);
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.dev_closes);
+
+    // the next GPU buffer opens it again; a conn ending with it held closes it
+    const b2 = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, fd, 0, 8, dmabuf.mod_invalid), 2, 2, dmabuf.fourcc_xrgb8888, 0);
+    try attach(c, w.surface, b2);
+    try damageAll(c, w.surface, 2, 2);
+    try commit(c, w.surface); // serial 2, never ACKed
+    try loop.settle(c);
+    try std.testing.expect(gpu.fake.is_open);
+    try std.testing.expectEqual(@as(usize, 2), gpu.fake.opens);
+    const closes = loop.engine.count(.conn_close);
+    c.close();
+    const Ctx = struct { e: *harness.Engine, n: usize };
+    try loop.until(Ctx{ .e = &loop.engine, .n = closes }, struct {
+        fn pred(x: Ctx) bool {
+            return x.e.count(.conn_close) > x.n;
+        }
+    }.pred);
+    try std.testing.expect(!gpu.fake.is_open);
+    try std.testing.expectEqual(@as(usize, 2), gpu.fake.dev_closes);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.closed_with_handles); // handles went first
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.closed_ioctls);
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.bad_closes);
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "a stream link dropping mid-record (page suspend, vsock reset) is a drop, logged at info — no error line" {
+    // the test runner fails a test that logs at .err from any thread
+    for ([_]usize{ 2, 4 + 10 }) |partial| {
+        var loop: Loop = undefined;
+        try loop.start(std.testing.allocator, .{});
+        defer loop.stop();
+        const Attached = struct {
+            fn wait(l: *Loop, want: bool) !void {
+                for (0..500) |_| {
+                    l.relay.mutex.lockUncancelable(l.threaded.io());
+                    const attached = l.relay.link != null;
+                    l.relay.mutex.unlock(l.threaded.io());
+                    if (attached == want) return;
+                    l.threaded.io().sleep(.fromMilliseconds(10), .awake) catch {};
+                }
+                return error.Timeout;
+            }
+        };
+        try Attached.wait(&loop, true);
+        // a record of 100 bytes announced, `partial` bytes of it sent
+        var rec: [4 + 10]u8 = @splat(0);
+        stream.writeRecordHeader(rec[0..4], 100);
+        try std.testing.expectEqual(partial, linux.write(loop.link_fds[1], &rec, partial));
+        _ = linux.shutdown(loop.link_fds[1], linux.SHUT.WR);
+        try Attached.wait(&loop, false);
+    }
+}
+
+test "virtgpu: a params.create the compositor refuses (a protocol error, never `failed`) leaves no GEM handle behind" {
+    std.testing.log_level = .err; // the relay's own refusal is a warning
+    defer std.testing.log_level = .warn;
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .dmabuf = gpu.config() });
+    defer loop.stop();
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    var mem: [2 * 2 * 4]u8 = undefined;
+    const fd = try patternMemfd("wland-vg-refused-create", &mem);
+    defer _ = linux.close(fd);
+    const params = try dmabufParamsMod(c, dm, fd, 0, 8, dmabuf.mod_invalid);
+    try c.send(params, comptime op("zwp_linux_buffer_params_v1", .request, "create"), &.{
+        .{ .int = 0 }, .{ .int = 2 }, .{ .uint = dmabuf.fourcc_xrgb8888 }, .{ .uint = 0 },
+    });
+    const error_ev = comptime op("wl_display", .event, "error");
+    try loop.until(c, struct {
+        fn pred(x: *Client) bool {
+            return x.count(1, error_ev) == 1;
+        }
+    }.pred);
+    try std.testing.expectEqual(@as(usize, 0), c.count(params, comptime op("zwp_linux_buffer_params_v1", .event, "failed")));
+    try std.testing.expectEqual(@as(usize, 0), gpu.fake.opens); // never imported
+    try std.testing.expectEqual(@as(usize, 0), gpu.imp.live());
+}
+
+// ---------------------------------------------------------------------------
+// The engine's own selection (FEATURE selection_cache, FDMSG own_pipe): each
+// payload crosses the link once; receives are written by one capped writer
+// thread (pipe_writer.zig).
+// ---------------------------------------------------------------------------
+
+const pipe_writer = @import("pipe_writer.zig");
+
+fn countThreads() usize {
+    const fd: i32 = @intCast(linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    defer _ = linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    const txt = buf[0..n];
+    const i = std.mem.indexOf(u8, txt, "Threads:") orelse return 0;
+    var j = i + 8;
+    while (txt[j] == ' ' or txt[j] == '\t') j += 1;
+    var k = j;
+    while (txt[k] >= '0' and txt[k] <= '9') k += 1;
+    return std.fmt.parseInt(usize, txt[j..k], 10) catch 0;
+}
+
+fn sleepMs(ms: u64) void {
+    var ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+/// Spin (≤ 5 s) until the writer has `n` transfers in flight.
+fn awaitInFlight(loop: *Loop, n: usize) !void {
+    var spins: usize = 0;
+    while (loop.relay.writer.inFlight(loop.relay.io) != n) : (spins += 1) {
+        if (spins == 500) return error.Timeout;
+        sleepMs(10);
+    }
+}
+
+/// A focused window with a data device on a new conn (`conn_id`); focus
+/// leaves whichever conn had it. Its data device id.
+fn focusedReceiver(loop: *Loop, conn_id: u32, prev: u32) !struct { c: *Client, dev: u32 } {
+    const c = try loop.connect();
+    const w = try openWindow(loop, c);
+    const seat = try bind(c, w.registry, "wl_seat", 5);
+    const ddm = try bind(c, w.registry, "wl_data_device_manager", 3);
+    try c.send(seat, comptime op("wl_seat", .request, "get_keyboard"), &.{.{ .new_id = c.newId() }});
+    const dev = c.newId();
+    try c.send(ddm, comptime op("wl_data_device_manager", .request, "get_data_device"), &.{ .{ .new_id = dev }, .{ .object = seat } });
+    try loop.roundtrip(c);
+    if (prev != 0) loop.engine.comp.keyboardLeave(prev);
+    loop.engine.comp.keyboardEnter(conn_id, w.surface);
+    try loop.engine.flush();
+    try loop.roundtrip(c);
+    while (c.fds.pop()) |fd| _ = linux.close(fd); // the keymap
+    return .{ .c = c, .dev = dev };
+}
+
+/// The engine's own selection: `mime` → `len` bytes of `fill`.
+fn setOwn(loop: *Loop, mime: []const u8, fill: u8, len: usize) !void {
+    const gpa = std.testing.allocator;
+    const pack = try gpa.alloc(u8, 8 + mime.len + len);
+    defer gpa.free(pack);
+    std.mem.writeInt(u32, pack[0..4], @intCast(mime.len), .little);
+    @memcpy(pack[4..][0..mime.len], mime);
+    std.mem.writeInt(u32, pack[4 + mime.len ..][0..4], @intCast(len), .little);
+    @memset(pack[8 + mime.len ..], fill);
+    try loop.engine.comp.setOwnSelection(pack);
+    try loop.engine.flush();
+}
+
+fn lastOffer(c: *Client, dev: u32) !u32 {
+    const sel = c.last(dev, comptime op("wl_data_device", .event, "selection")) orelse return error.NoSelection;
+    return std.mem.readInt(u32, sel.body[0..4], .little);
+}
+
+/// receive(mime) on `offer`; the read end of its pipe.
+fn receive(c: *Client, offer: u32, mime: []const u8) !i32 {
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&fds, .{ .CLOEXEC = true }));
+    try c.sendFd(offer, comptime op("wl_data_offer", .request, "receive"), &.{ .{ .string = mime }, .fd }, fds[1]);
+    _ = linux.close(fds[1]);
+    return fds[0];
+}
+
+/// Read `fd` to EOF: how many bytes, and whether all were `fill`.
+fn drain(fd: i32, fill: u8) !struct { n: usize, uniform: bool } {
+    var buf: [64 * 1024]u8 = undefined;
+    var n: usize = 0;
+    var uniform = true;
+    while (true) {
+        try harness.waitReadable(fd);
+        const rc = linux.read(fd, &buf, buf.len);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        if (rc == 0) break;
+        for (buf[0..rc]) |b| uniform = uniform and b == fill;
+        n += rc;
+    }
+    return .{ .n = n, .uniform = uniform };
+}
+
+test "own selection: a payload crosses the link once; receives never read hold capped slots on one writer thread, the rest read EOF; another conn is still served" {
+    std.testing.log_level = .err; // the writer warns at its cap
+    defer std.testing.log_level = .warn;
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{});
+    defer loop.stop();
+    const io = loop.relay.io;
+    const r2 = try focusedReceiver(&loop, 1, 0);
+    const mime = "text/plain";
+    const size: usize = 1 << 20; // more than a pipe holds
+    try setOwn(&loop, mime, 'x', size);
+    try loop.roundtrip(r2.c);
+    const offer = try lastOffer(r2.c, r2.dev);
+
+    const threads = countThreads();
+    const N = 64;
+    var readers: [N]i32 = undefined;
+    for (&readers) |*r| r.* = try receive(r2.c, offer, mime);
+    defer for (readers) |r| {
+        _ = linux.close(r);
+    };
+    try loop.roundtrip(r2.c);
+    try awaitInFlight(&loop, pipe_writer.per_conn_max);
+    try std.testing.expectEqual(@as(usize, 1), loop.relay.own_payloads_received);
+    try std.testing.expect(countThreads() <= threads + 1); // the writer, once
+    try std.testing.expectEqual(@as(usize, N - pipe_writer.per_conn_max), loop.relay.writer.refused);
+    // past the cap: EOF at once
+    try std.testing.expectEqual(@as(usize, 0), (try drain(readers[N - 1], 'x')).n);
+
+    // another conn: same generation, no bytes cross again, all of it arrives
+    const r3 = try focusedReceiver(&loop, 2, 1);
+    const offer3 = try lastOffer(r3.c, r3.dev);
+    const fd3 = try receive(r3.c, offer3, mime);
+    defer _ = linux.close(fd3);
+    try loop.roundtrip(r3.c);
+    const got = try drain(fd3, 'x');
+    try std.testing.expectEqual(size, got.n);
+    try std.testing.expect(got.uniform);
+    try std.testing.expectEqual(@as(usize, 1), loop.relay.own_payloads_received);
+
+    // readers closing early end their transfers (EPIPE)
+    for (readers[0..pipe_writer.per_conn_max]) |*r| {
+        _ = linux.close(r.*);
+        r.* = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    }
+    try awaitInFlight(&loop, 0);
+    _ = io;
+}
+
+test "own selection replaced mid-transfer: the transfer ends with the bytes it began with, the next receive gets the new ones, a stale offer reads EOF" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{});
+    defer loop.stop();
+    const r = try focusedReceiver(&loop, 1, 0);
+    const mime = "text/plain";
+    try setOwn(&loop, mime, 'a', 1 << 20);
+    try loop.roundtrip(r.c);
+    const old = try lastOffer(r.c, r.dev);
+    const fd_old = try receive(r.c, old, mime);
+    defer _ = linux.close(fd_old);
+    try loop.roundtrip(r.c);
+    try awaitInFlight(&loop, 1);
+
+    try setOwn(&loop, mime, 'b', 1000); // the old copy is dropped (gen 0), then the new one
+    try loop.roundtrip(r.c);
+    const new = try lastOffer(r.c, r.dev);
+    try std.testing.expect(new != old);
+    const a = try drain(fd_old, 'a');
+    try std.testing.expectEqual(@as(usize, 1 << 20), a.n);
+    try std.testing.expect(a.uniform);
+    const fd_new = try receive(r.c, new, mime);
+    defer _ = linux.close(fd_new);
+    const fd_stale = try receive(r.c, old, mime);
+    defer _ = linux.close(fd_stale);
+    try loop.roundtrip(r.c);
+    const b = try drain(fd_new, 'b');
+    try std.testing.expectEqual(@as(usize, 1000), b.n);
+    try std.testing.expect(b.uniform);
+    try std.testing.expectEqual(@as(usize, 0), (try drain(fd_stale, 'a')).n);
+    try std.testing.expectEqual(@as(usize, 2), loop.relay.own_payloads_received);
+    try awaitInFlight(&loop, 0);
+}
+
+test "own selection: a conn closing ends its transfers; the link dropping ends every transfer and drops the relay's copy" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{});
+    defer loop.stop();
+    const mime = "text/plain";
+    const r2 = try focusedReceiver(&loop, 1, 0);
+    try setOwn(&loop, mime, 'x', 1 << 20);
+    try loop.roundtrip(r2.c);
+    const fd2 = try receive(r2.c, try lastOffer(r2.c, r2.dev), mime);
+    defer _ = linux.close(fd2);
+    try loop.roundtrip(r2.c);
+    try awaitInFlight(&loop, 1);
+    r2.c.close(); // the receiving app hangs up mid-transfer
+    try awaitInFlight(&loop, 0);
+    try std.testing.expect((try drain(fd2, 'x')).n < 1 << 20); // cut short, EOF
+
+    const r3 = try focusedReceiver(&loop, 2, 0);
+    const fd3 = try receive(r3.c, try lastOffer(r3.c, r3.dev), mime);
+    defer _ = linux.close(fd3);
+    try loop.roundtrip(r3.c);
+    try awaitInFlight(&loop, 1);
+    loop.link.link.kick(); // the engine goes
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        loop.relay.mutex.lockUncancelable(loop.relay.io);
+        const gone = loop.relay.link == null;
+        const gen = loop.relay.own_cache.gen;
+        loop.relay.mutex.unlock(loop.relay.io);
+        if (gone) {
+            try std.testing.expectEqual(@as(u32, 0), gen);
+            break;
+        }
+        if (spins == 500) return error.Timeout;
+        sleepMs(10);
+    }
+    try awaitInFlight(&loop, 0);
+    try std.testing.expect((try drain(fd3, 'x')).n < 1 << 20);
 }

@@ -13,22 +13,33 @@
 //!     which is what makes the compositor advertise zwp_linux_dmabuf_v1;
 //!   - how a buffer's commits reach the engine (`View`).
 //!
-//! One backend today, `readback`: LINEAR only, plane 0 mapped read-only and
-//! read at commit time into the copy path (BUFFER frames), exactly as a
-//! wl_shm pool — so the engine and the page see no difference. A backend
-//! that names a GPU resource instead of shipping pixels (STREAM.md COMMIT
-//! kind 2) would add a `Backend` tag, its formats and a `View` variant.
-//! Everything here runs on the conn's app thread.
+//! Two backends:
+//!   - `readback`: LINEAR only, plane 0 mapped read-only and read at commit
+//!     time into the copy path (BUFFER frames), exactly as a wl_shm pool —
+//!     so the engine and the page see no difference;
+//!   - `virtgpu`: nothing is read. At create/create_immed plane 0 is named
+//!     as the virtio-gpu resource behind it (virtgpu.zig: PRIME import +
+//!     RESOURCE_INFO) and every commit is a COMMIT of buffer kind virtgpu
+//!     (STREAM.md) the engine ACKs, on the relay's shared COMMIT/ACK
+//!     ledger (relay.zig); any buffer mode, no copy path.
+//! Everything here runs on the conn's app thread (virtgpu's Importer is
+//! the one relay-wide, locked part).
 
 const std = @import("std");
 const linux = std.os.linux;
 const stream = @import("core").stream;
 const shm = @import("shm.zig");
+const virtgpu = @import("virtgpu.zig");
 
 /// DRM fourcc codes (drm_fourcc.h) and modifiers this file names.
 pub const fourcc_argb8888: u32 = 0x34325241; // 'AR24': LE B, G, R, A — wl_shm ARGB8888
 pub const fourcc_xrgb8888: u32 = 0x34325258; // 'XR24': LE B, G, R, X — wl_shm XRGB8888
+pub const fourcc_abgr8888: u32 = 0x34324241; // 'AB24': LE R, G, B, A
+pub const fourcc_xbgr8888: u32 = 0x34324258; // 'XB24': LE R, G, B, X
 pub const mod_linear: u64 = 0;
+/// DRM_FORMAT_MOD_INVALID: no explicit modifier, the driver's implicit
+/// layout (what virgl allocates with: it has no modifiers)
+pub const mod_invalid: u64 = 0x00ff_ffff_ffff_ffff;
 pub const max_planes = 4;
 
 pub const Format = struct { fourcc: u32, modifier: u64 };
@@ -40,16 +51,33 @@ pub const Backend = union(enum) {
     /// ARGB8888/XRGB8888 only: a CPU mapping of a tiled or compressed
     /// buffer is not pixels.
     readback,
+    /// Name each dmabuf by its virtio-gpu resource (COMMIT kind virtgpu):
+    /// the relay-wide importer on the render node. 8888 RGB formats,
+    /// implicit (MOD_INVALID) or LINEAR, one plane: the embedder's
+    /// renderer reads the resource, so the layout only has to be one it
+    /// knows — virgl allocates with the implicit modifier.
+    virtgpu: *virtgpu.Importer,
 
     pub fn formats(self: Backend) []const Format {
         return switch (self) {
             .readback => &readback_formats,
+            .virtgpu => &virtgpu_formats,
         };
     }
 
     pub fn needsCopyPath(self: Backend) bool {
         return switch (self) {
             .readback => true,
+            .virtgpu => false,
+        };
+    }
+
+    /// Its commits are COMMIT frames the engine ACKs (the conn needs the
+    /// ACK path whatever the buffer mode).
+    pub fn sendsCommits(self: Backend) bool {
+        return switch (self) {
+            .readback => false,
+            .virtgpu => true,
         };
     }
 };
@@ -59,25 +87,49 @@ const readback_formats = [_]Format{
     .{ .fourcc = fourcc_xrgb8888, .modifier = mod_linear },
 };
 
+/// Preference order (the one tranche lists them so): implicit first, the
+/// layout Mesa's virgl picks anyway.
+const virtgpu_formats = [_]Format{
+    .{ .fourcc = fourcc_argb8888, .modifier = mod_invalid },
+    .{ .fourcc = fourcc_xrgb8888, .modifier = mod_invalid },
+    .{ .fourcc = fourcc_abgr8888, .modifier = mod_invalid },
+    .{ .fourcc = fourcc_xbgr8888, .modifier = mod_invalid },
+    .{ .fourcc = fourcc_argb8888, .modifier = mod_linear },
+    .{ .fourcc = fourcc_xrgb8888, .modifier = mod_linear },
+    .{ .fourcc = fourcc_abgr8888, .modifier = mod_linear },
+    .{ .fourcc = fourcc_xbgr8888, .modifier = mod_linear },
+};
+
 /// What the relay offers: its backend and the device clients allocate on.
 pub const Config = struct {
     backend: Backend,
     /// dev_t of that device (feedback main_device / tranche_target_device;
-    /// Mesa opens its render node from it). readback: the host's render
-    /// node.
+    /// Mesa opens its render node from it): the render node the backend
+    /// reads (readback) or names resources on (virtgpu).
     main_device: u64,
 
-    pub const max_feature_len = stream.feature_header_len + 8 + 16 * 16;
+    const kind_frame_len = stream.feature_header_len + stream.DmabufKindFeature.len;
+    pub const max_features_len = kind_frame_len + stream.feature_header_len + 8 + 16 * 16;
 
-    /// The FEATURE frame announcing this to the engine.
-    pub fn featureFrame(self: Config, out: *[max_feature_len]u8) []u8 {
+    /// The FEATURE frames announcing this to the engine, as one link
+    /// message: for a backend whose commits are COMMITs (virtgpu) first
+    /// dmabuf_kind naming their buffer kind — an engine that can't show it
+    /// then leaves linux-dmabuf off — then linux_dmabuf (device + formats).
+    pub fn featureFrames(self: Config, out: *[max_features_len]u8) []u8 {
+        var n: usize = 0;
+        if (self.backend.sendsCommits()) {
+            var kb: [stream.DmabufKindFeature.len]u8 = undefined;
+            (stream.DmabufKindFeature{ .buffer_kind = @intFromEnum(stream.BufferKind.virtgpu) }).encode(&kb);
+            n += stream.encodeFeature(out[n..], .dmabuf_kind, &kb).len;
+        }
         const fmts = self.backend.formats();
         var bytes: [8 + 16 * 16]u8 = undefined;
         std.debug.assert(fmts.len <= 16);
         // stream.DmabufFeature layout, built in place
         std.mem.writeInt(u64, bytes[0..8], self.main_device, .little);
         for (fmts, 0..) |f, i| stream.writeFormatEntry(bytes[8 + i * 16 ..][0..16], f.fourcc, f.modifier);
-        return stream.encodeFeature(out, .linux_dmabuf, bytes[0 .. 8 + fmts.len * 16]);
+        n += stream.encodeFeature(out[n..], .linux_dmabuf, bytes[0 .. 8 + fmts.len * 16]).len;
+        return out[0..n];
     }
 };
 
@@ -156,7 +208,8 @@ pub const Buffer = struct {
     height: u32,
     format: u32,
     flags: u32,
-    /// Resolved at the first commit, kept for the buffer's life.
+    /// virtgpu: at create (`prepare`); readback: at the first commit. Kept
+    /// for the buffer's life.
     import: Import = .pending,
     /// readback: plane 0 answers DMA_BUF_IOCTL_SYNC (null = not asked yet;
     /// false = not a dmabuf — a memfd stand-in in tests)
@@ -164,12 +217,22 @@ pub const Buffer = struct {
 
     pub const Import = union(enum) {
         pending,
-        /// The backend can't use this buffer (logged once): never shown;
-        /// its commits still release it, like an unfit wl_shm buffer.
+        /// The backend can't use this buffer (logged once per kind): never
+        /// shown; its commits still release it, like an unfit wl_shm buffer.
         failed,
         /// readback: plane 0 mapped read-only, whole (a shm Pool: the
         /// SIGBUS guard covers a memfd truncated under us).
         mapped: *shm.Pool,
+        /// virtgpu: the resource, and the GEM handle this buffer holds a
+        /// reference on (dropped by deinit; each un-ACKed COMMIT holds its
+        /// own, so the resource outlives wl_buffer.destroy until its ACKs).
+        resource: Resource,
+    };
+
+    pub const Resource = struct {
+        importer: *virtgpu.Importer,
+        gem: u32,
+        id: u32,
     };
 
     pub fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
@@ -178,11 +241,23 @@ pub const Buffer = struct {
                 pool.deinit();
                 gpa.destroy(pool);
             },
+            .resource => |r| r.importer.unref(r.gem),
             .pending, .failed => {},
         }
         for (self.planes) |p| if (p) |plane| {
             _ = linux.close(plane.fd);
         };
+    }
+
+    /// At create/create_immed: a backend that names buffers names this one
+    /// now (virtgpu), so the resource is known — or the refusal logged —
+    /// before the first commit. `label` says which object for the log
+    /// (create's wl_buffer id is not known yet: the params id then).
+    pub fn prepare(self: *Buffer, backend: Backend, conn_id: u32, label: []const u8, id: u32) void {
+        switch (backend) {
+            .readback => {},
+            .virtgpu => |imp| self.import = self.importVirtgpu(imp, conn_id, label, id),
+        }
     }
 
     /// How this buffer's commits reach the engine (importing it on first
@@ -195,6 +270,7 @@ pub const Buffer = struct {
                     std.log.warn("conn {d}: dmabuf buffer {d} ({d}x{d} fourcc 0x{x}): readback import failed: {t}; it will not be shown", .{ conn_id, buffer_id, self.width, self.height, self.format, err });
                     break :blk .failed;
                 },
+                .virtgpu => |imp| self.importVirtgpu(imp, conn_id, "buffer", buffer_id),
             };
         }
         return switch (self.import) {
@@ -207,7 +283,88 @@ pub const Buffer = struct {
                 .stride = self.planes[0].?.stride,
                 .format = if (self.format == fourcc_xrgb8888) stream.shm_format_xrgb8888 else stream.shm_format_argb8888,
             } },
+            .resource => |r| .{ .resource = .{
+                .gem = r.gem,
+                .importer = r.importer,
+                .ref = .{
+                    .resource = r.id,
+                    .width = self.width,
+                    .height = self.height,
+                    .format = self.format,
+                    .flags = self.flags,
+                    .offset = self.planes[0].?.offset,
+                    .stride = self.planes[0].?.stride,
+                    .modifier = self.planes[0].?.modifier,
+                },
+            } },
         };
+    }
+
+    /// virtgpu: one plane of an 8888 RGB format, implicit or LINEAR, no
+    /// interlacing, named through the render node, and the plane inside the
+    /// resource (`bounds`). What is refused, and the first buffer of each
+    /// (format, modifier, flags) accepted, is logged once per relay run:
+    /// the first run on a new guest says what its Mesa allocates.
+    fn importVirtgpu(self: *Buffer, imp: *virtgpu.Importer, conn_id: u32, label: []const u8, id: u32) Import {
+        const plane = self.planes[0] orelse return .failed; // the compositor raises `incomplete`
+        const fcc: [4]u8 = @bitCast(self.format);
+        const kind = struct {
+            fn key(tag: u64, a: u64, b: u64, c: u64) u64 {
+                return std.hash.Wyhash.hash(tag, std.mem.asBytes(&[3]u64{ a, b, c }));
+            }
+        };
+        const refusal: ?[]const u8 = blk: {
+            for (virtgpu_formats) |f| {
+                if (f.fourcc == self.format and f.modifier == plane.modifier) break;
+            } else break :blk "format/modifier not offered";
+            for (self.planes[1..]) |p| if (p != null) break :blk "more than one plane";
+            if (self.flags & ~@as(u32, 1) != 0) break :blk "interlaced flags";
+            if (self.width == 0 or self.height == 0) break :blk "empty size";
+            break :blk null;
+        };
+        if (refusal) |why| {
+            if (imp.once(.refused, kind.key(1, self.format, plane.modifier, self.flags)))
+                std.log.warn("virtgpu: conn {d} {s} {d}: refused ({s}): '{s}' 0x{x:0>8} modifier 0x{x:0>16} flags {d}, {d}x{d}; buffers like it are never shown", .{ conn_id, label, id, why, &fcc, self.format, plane.modifier, self.flags, self.width, self.height });
+            return .failed;
+        }
+        switch (imp.import(plane.fd)) {
+            .failed => |f| {
+                // a device that won't open is logged by the importer, rate-
+                // limited (it is no property of this buffer, and repeats)
+                if (f.step != .open_device and imp.once(.refused, kind.key(2, @intFromEnum(f.step), @intFromEnum(f.errno), 0)))
+                    std.log.warn("virtgpu: conn {d} {s} {d}: cannot name its dmabuf: {t} failed ({t}); buffers like it are never shown", .{ conn_id, label, id, f.step, f.errno });
+                return .failed;
+            },
+            .ok => |r| {
+                if (virtgpuBounds(self.width, self.height, plane.offset, plane.stride, r.size)) |why| {
+                    imp.unref(r.gem);
+                    const text = refusalText(why, r.size);
+                    if (imp.once(.refused, kind.key(4, @intFromEnum(why), @intFromBool(text.ptr != why.text().ptr), 0)))
+                        std.log.warn("virtgpu: conn {d} {s} {d}: refused ({s}): {d}x{d} offset {d} stride {d} on a {d} B resource {d}; buffers like it are never shown", .{ conn_id, label, id, text, self.width, self.height, plane.offset, plane.stride, r.size, r.resource });
+                    return .failed;
+                }
+                if (imp.once(.accepted, kind.key(3, self.format, plane.modifier, self.flags)))
+                    std.log.info("virtgpu: conn {d} {s} {d}: first '{s}' 0x{x:0>8} modifier 0x{x:0>16} flags {d} buffer, {d}x{d} stride {d} → resource {d} ({d} B)", .{ conn_id, label, id, &fcc, self.format, plane.modifier, self.flags, self.width, self.height, plane.stride, r.resource, r.size });
+                return .{ .resource = .{ .importer = imp, .gem = r.gem, .id = r.resource } };
+            },
+        }
+    }
+
+    /// virtgpu, before a COMMIT goes out: wait (at most `timeout_ms`) for
+    /// the writes still pending on the buffer — poll(POLLIN) on a dmabuf
+    /// returns once its implicit write fences (dma_resv) have signalled; a
+    /// regular file (a memfd stand-in) is always ready. False = timed out
+    /// (the caller sends anyway).
+    pub fn awaitWrites(self: *Buffer, timeout_ms: i32) bool {
+        var pfd = [1]linux.pollfd{.{ .fd = self.planes[0].?.fd, .events = linux.POLL.IN, .revents = 0 }};
+        while (true) {
+            const rc = linux.poll(&pfd, 1, timeout_ms);
+            switch (linux.errno(rc)) {
+                .INTR => continue,
+                .SUCCESS => return rc != 0,
+                else => return true, // not pollable: nothing to wait for
+            }
+        }
     }
 
     /// Readback: one LINEAR plane of a 4-byte format, rows inside the
@@ -285,6 +442,57 @@ pub const Buffer = struct {
     }
 };
 
+/// A side of a virtgpu buffer may not exceed this: the page's renderer
+/// holds it as one texture, and GL caps those (MAX_TEXTURE_SIZE, 16384 on
+/// desktop GPUs; WebGL inherits it). The size check below already bounds
+/// the area by memory; this keeps a one-page resource from claiming a
+/// 1×1048576 shape the page would size a canvas from.
+pub const virtgpu_max_side = 16384;
+
+pub const BoundsRefusal = enum {
+    stride_below_width,
+    too_large,
+    past_resource,
+
+    pub fn text(self: BoundsRefusal) []const u8 {
+        return switch (self) {
+            .stride_below_width => "stride below width × 4",
+            .too_large => "a side over 16384 px",
+            .past_resource => "plane past the resource's end",
+        };
+    }
+};
+
+/// A client's claimed size and layout against the resource's real size
+/// (RESOURCE_INFO: the GEM object's size — the guest backing the guest's
+/// Mesa asked for, rounded up to a page by the kernel; virtgpu_ioctl.c
+/// resource_create, virtgpu_object.c). Null = fits. That size is the
+/// layout's total (256-aligned) only for resources created
+/// PIPE_BIND_SHARED, which GBM and EGL-Wayland buffers always are, so a GPU
+/// client's buffers pass. Mesa's virgl_resource_create_front asks for 1
+/// byte for a texture that can use staging transfers and 0 for MSAA, i.e.
+/// one page: such a non-shared texture exported as a dmabuf is refused
+/// here though valid on the host — the safe side, since the relay can't
+/// tell the host's real size (`refusalText` names the case). Every format
+/// offered is 4 bytes a pixel. The last row needs only width × 4 bytes (a
+/// tightly allocated plane is legal).
+pub fn virtgpuBounds(width: u32, height: u32, offset: u32, stride: u32, size: u32) ?BoundsRefusal {
+    if (@as(u64, stride) < @as(u64, width) * 4) return .stride_below_width;
+    if (width > virtgpu_max_side or height > virtgpu_max_side) return .too_large;
+    const end = @as(u64, offset) + @as(u64, stride) * (height - 1) + @as(u64, width) * 4;
+    if (end > size) return .past_resource;
+    return null;
+}
+
+/// The refusal's reason as logged: a plane past a ONE-page resource is
+/// most likely a texture Mesa created without PIPE_BIND_SHARED (guest
+/// backing of 1 or 0 bytes, see virtgpuBounds), not a lying client.
+pub fn refusalText(why: BoundsRefusal, size: u32) []const u8 {
+    if (why == .past_resource and size <= std.heap.pageSize())
+        return "resource has no guest backing of the claimed size (non-shared virgl texture?)";
+    return why.text();
+}
+
 /// A commit's buffer, as the commit path delivers it.
 pub const View = union(enum) {
     /// Not presentable (import failed): nothing shown, release at commit.
@@ -292,6 +500,13 @@ pub const View = union(enum) {
     /// Pixels in a wl_shm-shaped view: the copy backend reads them at
     /// commit time (BUFFER frames) and the buffer is released at once.
     pixels: shm.Buffer,
+    /// A named GPU resource: a COMMIT of kind virtgpu, released on its ACK
+    /// (each COMMIT takes a reference on `gem` until then).
+    resource: struct {
+        ref: stream.VirtgpuRef,
+        gem: u32,
+        importer: *virtgpu.Importer,
+    },
 };
 
 /// How long a commit waits for a dmabuf's pending GPU writes before
@@ -311,10 +526,13 @@ test "makedev matches glibc: renderD128 = 226:128" {
     try std.testing.expectEqual(@as(u32, 0x40086200), dma_buf_ioctl_sync);
 }
 
-test "config feature frame carries the device and the backend's formats" {
+test "config feature frames: readback, linux_dmabuf alone with the device and the backend's formats" {
     const cfg: Config = .{ .backend = .readback, .main_device = 0xe280 };
-    var out: [Config.max_feature_len]u8 = undefined;
-    const f = (try stream.parse(cfg.featureFrame(&out))).feature;
+    var out: [Config.max_features_len]u8 = undefined;
+    const msg = cfg.featureFrames(&out);
+    const p = try stream.parseNext(msg);
+    try std.testing.expectEqual(msg.len, p.consumed); // nothing else: no dmabuf_kind (pixels in the stream)
+    const f = p.frame.feature;
     try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.linux_dmabuf)), f.feature);
     const d = try stream.DmabufFeature.decode(f.bytes);
     try std.testing.expectEqual(@as(u64, 0xe280), d.main_device);
@@ -369,4 +587,148 @@ test "readback import refuses what it can't read: modifiers, formats, flags, sho
     try std.testing.expect(p.add(0, .{ .fd = @intCast(linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0)), .offset = 0, .stride = 16, .modifier = 0 }));
     try std.testing.expect(!p.add(0, .{ .fd = @intCast(linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0)), .offset = 0, .stride = 16, .modifier = 0 }));
     try std.testing.expect(!p.add(4, .{ .fd = @intCast(linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0)), .offset = 0, .stride = 16, .modifier = 0 }));
+}
+
+test "virtgpu import: named at prepare through the fake device; refusals (multi-plane, modifier, format, flags) fail without a handle; view is the kind-virtgpu ref; deinit drops the GEM reference" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var fake: virtgpu.Fake = .{};
+    defer fake.deinit();
+    var imp: virtgpu.Importer = .init(threaded.io(), gpa, .{ .fd = -1, .fake = &fake });
+    defer imp.deinit();
+    const backend: Backend = .{ .virtgpu = &imp };
+    try std.testing.expect(backend.sendsCommits() and !backend.needsCopyPath());
+
+    const cfg: Config = .{ .backend = backend, .main_device = 0xe280 };
+    var out: [Config.max_features_len]u8 = undefined;
+    // dmabuf_kind virtgpu first (an engine without a GPU source then offers
+    // no linux-dmabuf), then linux_dmabuf; one message, nothing else
+    const msg = cfg.featureFrames(&out);
+    const k = try stream.parseNext(msg);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.dmabuf_kind)), k.frame.feature.feature);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.BufferKind.virtgpu)), (try stream.DmabufKindFeature.decode(k.frame.feature.bytes)).buffer_kind);
+    const l = try stream.parseNext(msg[k.consumed..]);
+    try std.testing.expectEqual(msg.len, k.consumed + l.consumed);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FeatureKind.linux_dmabuf)), l.frame.feature.feature);
+    const d = try stream.DmabufFeature.decode(l.frame.feature.bytes);
+    try std.testing.expectEqual(@as(usize, 8), d.count());
+
+    var bytes: [64]u8 = @splat(0);
+    const fd = try shm.createMemfd("virtgpu-import", &bytes);
+    defer _ = linux.close(fd);
+    const make = struct {
+        fn f(src: i32, planes: u32, modifier: u64, format: u32, flags: u32) !Buffer {
+            var p: Params = .{};
+            for (0..planes) |i| {
+                const dup = linux.fcntl(src, linux.F.DUPFD_CLOEXEC, 0);
+                try std.testing.expect(p.add(@intCast(i), .{ .fd = @intCast(dup), .offset = 0, .stride = 16, .modifier = modifier }));
+            }
+            return p.take(4, 4, format, flags);
+        }
+    }.f;
+    const bad = [_]Buffer{
+        try make(fd, 2, mod_invalid, fourcc_xrgb8888, 0), // two planes
+        try make(fd, 1, 0x0100000000000001, fourcc_xrgb8888, 0), // X-tiled
+        try make(fd, 1, mod_invalid, 0x3231564e, 0), // NV12
+        try make(fd, 1, mod_linear, fourcc_argb8888, 4), // bottom_first
+    };
+    std.testing.log_level = .err; // the refusals are warnings
+    defer std.testing.log_level = .warn;
+    for (bad) |b| {
+        var buf = b;
+        defer buf.deinit(gpa);
+        buf.prepare(backend, 1, "buffer", 2);
+        try std.testing.expectEqual(Buffer.Import.failed, buf.import);
+        try std.testing.expectEqual(View.unreadable, buf.view(backend, gpa, 1, 2));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.live());
+
+    var good = try make(fd, 1, mod_invalid, fourcc_abgr8888, 1);
+    good.prepare(backend, 1, "params", 3);
+    const v = good.view(backend, gpa, 1, 2).resource;
+    try std.testing.expectEqual(stream.VirtgpuRef{ .resource = 1, .width = 4, .height = 4, .format = fourcc_abgr8888, .flags = 1, .offset = 0, .stride = 16, .modifier = mod_invalid }, v.ref);
+    try std.testing.expectEqual(@as(u32, 1), imp.refsOf(v.gem));
+    try std.testing.expect(good.awaitWrites(10)); // a memfd: always ready
+    good.deinit(gpa);
+
+    // a plane still being written (poll not readable: a pipe with nothing
+    // in it stands in for a dmabuf with an unsignalled write fence) times
+    // out, bounded, and says so
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&pipe_fds, .{ .CLOEXEC = true }));
+    defer _ = linux.close(pipe_fds[1]);
+    var busy: Buffer = .{ .planes = .{ .{ .fd = pipe_fds[0], .offset = 0, .stride = 16, .modifier = mod_invalid }, null, null, null }, .width = 4, .height = 4, .format = fourcc_xrgb8888, .flags = 0 };
+    defer busy.deinit(gpa);
+    try std.testing.expect(!busy.awaitWrites(5));
+    try std.testing.expectEqual(@as(usize, 0), fake.live());
+    try std.testing.expectEqual(@as(usize, 0), fake.bad_closes);
+}
+
+test "virtgpu bounds: a client's size and stride must fit the resource's real size" {
+    // 64×64 XRGB, stride 256, on a page-rounded 16 KiB resource: fits exactly
+    try std.testing.expectEqual(@as(?BoundsRefusal, null), virtgpuBounds(64, 64, 0, 256, 16384));
+    // the last row needs only width × 4 (no trailing stride padding)
+    try std.testing.expectEqual(@as(?BoundsRefusal, null), virtgpuBounds(60, 64, 0, 256, 63 * 256 + 240));
+    try std.testing.expectEqual(@as(?BoundsRefusal, .past_resource), virtgpuBounds(60, 64, 0, 256, 63 * 256 + 239));
+    try std.testing.expectEqual(@as(?BoundsRefusal, .past_resource), virtgpuBounds(64, 64, 4, 256, 16384));
+    // one page claiming a huge buffer
+    try std.testing.expectEqual(@as(?BoundsRefusal, .past_resource), virtgpuBounds(16384, 16384, 0, 65536, 4096));
+    try std.testing.expectEqual(@as(?BoundsRefusal, .too_large), virtgpuBounds(0x3fff_ffff, 1, 0, 0xffff_fffc, 4096));
+    try std.testing.expectEqual(@as(?BoundsRefusal, .too_large), virtgpuBounds(1, 16385, 0, 4, 0xffff_ffff));
+    try std.testing.expectEqual(@as(?BoundsRefusal, .stride_below_width), virtgpuBounds(64, 64, 0, 255, 16384));
+    // no u32 overflow on the way: offset + stride × (h - 1) + w × 4 in u64
+    try std.testing.expectEqual(@as(?BoundsRefusal, .past_resource), virtgpuBounds(16384, 16384, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff));
+}
+
+test "virtgpu refusal text: a plane past a one-page resource names the non-shared texture case" {
+    const page: u32 = @intCast(std.heap.pageSize());
+    try std.testing.expectEqualStrings("resource has no guest backing of the claimed size (non-shared virgl texture?)", refusalText(.past_resource, page));
+    try std.testing.expectEqualStrings("plane past the resource's end", refusalText(.past_resource, page * 2));
+    try std.testing.expectEqualStrings("a side over 16384 px", refusalText(.too_large, page));
+}
+
+test "virtgpu import: a layout past the resource's real size is refused, its handle closed, the reason logged" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var fake: virtgpu.Fake = .{};
+    defer fake.deinit();
+    var imp: virtgpu.Importer = .init(threaded.io(), gpa, .{ .fake = &fake });
+    defer imp.deinit();
+    const backend: Backend = .{ .virtgpu = &imp };
+    var bytes: [64]u8 = @splat(0);
+    const fd = try shm.createMemfd("virtgpu-bounds", &bytes); // one page as the kernel rounds it
+    defer _ = linux.close(fd);
+    const make = struct {
+        fn f(src: i32, w: i32, h: i32, stride: u32) !Buffer {
+            var p: Params = .{};
+            const dup = linux.fcntl(src, linux.F.DUPFD_CLOEXEC, 0);
+            try std.testing.expect(p.add(0, .{ .fd = @intCast(dup), .offset = 0, .stride = stride, .modifier = mod_invalid }));
+            return p.take(w, h, fourcc_xrgb8888, 0);
+        }
+    }.f;
+    std.testing.log_level = .err; // the refusal is a warning
+    defer std.testing.log_level = .warn;
+    var huge = try make(fd, 16384, 16384, 65536);
+    defer huge.deinit(gpa);
+    huge.prepare(backend, 1, "buffer", 2);
+    try std.testing.expectEqual(Buffer.Import.failed, huge.import);
+    try std.testing.expectEqual(@as(usize, 0), fake.live());
+    try std.testing.expect(!imp.deviceOpen());
+    try std.testing.expectEqual(@as(usize, 1), imp.n_logged[@intFromEnum(virtgpu.Importer.LogClass.refused)]);
+    // a whole page of 32×32 fits
+    var ok = try make(fd, 32, 32, 128);
+    ok.prepare(backend, 1, "buffer", 3);
+    try std.testing.expect(ok.import == .resource);
+    ok.deinit(gpa);
+    // RESOURCE_INFO is what bounds it, not the fd: a resource smaller than
+    // the claim is refused even where the file is larger
+    fake.info_size = 256;
+    var short = try make(fd, 32, 32, 128);
+    defer short.deinit(gpa);
+    short.prepare(backend, 1, "buffer", 4);
+    try std.testing.expectEqual(Buffer.Import.failed, short.import);
+    try std.testing.expectEqual(@as(usize, 0), fake.live());
+    try std.testing.expectEqual(@as(usize, 0), fake.bad_closes);
 }

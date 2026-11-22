@@ -42,32 +42,48 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core_mod }},
     }) }));
 
-    // `zig build release`: the binaries the npm package ships, as
-    // zig-out/release/wlandr-<node platform>-<node arch>. No libc is linked,
-    // so these are static and run on any Linux (glibc, musl or neither); the
-    // explicit target also means the baseline CPU, where the native default
-    // above uses the host's features.
-    const release_step = b.step("release", "Build wlandr for linux x64 + arm64 (zig-out/release/)");
+    // `zig build release`: the release binaries, in zig-out/release/, two
+    // flavours per arch (<arch> is node's name: x64, arm64):
+    //   wlandr-linux-<arch>       the full relay (HTTP + WS and --link), at
+    //                             -Doptimize (ReleaseFast); the npm package
+    //                             ships these.
+    //   wlandr-link-linux-<arch>  -Dhttp=false ReleaseSmall: --link only, the
+    //                             build a VM guest wants (GitHub release only).
+    // No libc is linked, so all are static and run on any Linux (glibc, musl
+    // or neither). The CPU is pinned to the arch's baseline — aarch64:
+    // `generic` (ARMv8.0 + NEON, no LSE/CRC/crypto required; atomics are
+    // LL/SC); x86_64: `x86_64` (v1, SSE2) — where the native default above
+    // uses the host's features.
+    const release_step = b.step("release", "Build wlandr (full + --link-only) for linux x64 + arm64 (zig-out/release/)");
+    const link_options = b.addOptions();
+    link_options.addOption(bool, "http", false);
+    const link_options_mod = link_options.createModule();
     const releases = [_]struct { arch: std.Target.Cpu.Arch, node: []const u8 }{
         .{ .arch = .x86_64, .node = "x64" },
         .{ .arch = .aarch64, .node = "arm64" },
     };
+    const flavours = [_]struct { prefix: []const u8, optimize: std.builtin.OptimizeMode, options: *std.Build.Module }{
+        .{ .prefix = "wlandr", .optimize = optimize, .options = options_mod },
+        .{ .prefix = "wlandr-link", .optimize = .ReleaseSmall, .options = link_options_mod },
+    };
     for (releases) |r| {
-        const rt = b.resolveTargetQuery(.{ .cpu_arch = r.arch, .os_tag = .linux, .abi = .musl });
-        const rcore = b.createModule(.{
-            .root_source_file = b.path("core/src/root.zig"),
-            .target = rt,
-            .optimize = optimize,
-        });
-        const exe = b.addExecutable(.{
-            .name = "wlandr",
-            .root_module = serverModule(b, rt, optimize, strip, rcore, options_mod),
-        });
-        const install = b.addInstallArtifact(exe, .{
-            .dest_dir = .{ .override = .{ .custom = "release" } },
-            .dest_sub_path = b.fmt("wlandr-linux-{s}", .{r.node}),
-        });
-        release_step.dependOn(&install.step);
+        const rt = b.resolveTargetQuery(.{ .cpu_arch = r.arch, .cpu_model = .baseline, .os_tag = .linux, .abi = .musl });
+        for (flavours) |f| {
+            const rcore = b.createModule(.{
+                .root_source_file = b.path("core/src/root.zig"),
+                .target = rt,
+                .optimize = f.optimize,
+            });
+            const exe = b.addExecutable(.{
+                .name = "wlandr",
+                .root_module = serverModule(b, rt, f.optimize, f.optimize != .Debug, rcore, f.options),
+            });
+            const install = b.addInstallArtifact(exe, .{
+                .dest_dir = .{ .override = .{ .custom = "release" } },
+                .dest_sub_path = b.fmt("{s}-linux-{s}", .{ f.prefix, r.node }),
+            });
+            release_step.dependOn(&install.step);
+        }
     }
 
     // core compiled to wasm for the browser client

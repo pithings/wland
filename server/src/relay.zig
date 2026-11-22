@@ -22,8 +22,9 @@
 //!
 //! Locking. A conn's interception state — pools, buffers and their release
 //! ledger, surfaces, the backend's handles — belongs to its app thread alone
-//! and is never locked. The engine's ACKs (handle backends) arrive on the
-//! link thread, which does not touch that state: it appends the serial to the
+//! and is never locked (virtgpu's GEM-handle counts are relay-wide and lock
+//! inside virtgpu.Importer). The engine's ACKs (handle backends, virtgpu
+//! dmabufs) arrive on the link thread, which does not touch that state: it appends the serial to the
 //! conn's AppLink queue (`ack_mutex`, held only for the append/swap) and
 //! signals the conn's eventfd; the app thread, polling the app socket and
 //! that eventfd, takes the queue and settles the ACKs itself. So every
@@ -41,6 +42,8 @@ const stream = core.stream;
 const shm = @import("shm.zig");
 const buffers = @import("buffers.zig");
 const dmabuf = @import("dmabuf.zig");
+const virtgpu = @import("virtgpu.zig");
+const pipe_writer = @import("pipe_writer.zig");
 const Link = @import("link.zig").Link;
 
 pub const Relay = struct {
@@ -50,7 +53,8 @@ pub const Relay = struct {
     backend: buffers.Backend = .copy,
     /// linux-dmabuf (fixed for the relay's life): null = the relay takes no
     /// dmabufs, the compositor never advertises zwp_linux_dmabuf_v1 (it
-    /// does when the relay's FEATURE frame says so, first on every link).
+    /// does when the relay's FEATURE frames say so, first on every link —
+    /// with virtgpu only if its embedder can draw GPU resources).
     /// readback needs `backend == .copy` (main.zig checks).
     dmabuf: ?dmabuf.Config = null,
     /// Handle backends: handle ids are never reused within a run (≥ 1).
@@ -81,10 +85,24 @@ pub const Relay = struct {
     /// link thread, read by app threads. An entry goes with its offer's
     /// destroy, a conn's entries when it closes.
     primary_offers: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The engine's own clipboard selection, as far as it sent it (FDMSG
+    /// own_pipe; FEATURE selection_cache): its generation and the payloads
+    /// received so far. Replaced by a newer generation's first payload,
+    /// dropped at the engine's word (generation 0) and at link detach.
+    own_cache: OwnCache = .{},
+    /// Writes the own selection into receivers' pipes (one thread, capped).
+    writer: pipe_writer.Writer = .{},
+    /// own_pipe frames that carried a payload's bytes (tests: what crossed
+    /// the link).
+    own_payloads_received: usize = 0,
+    /// A selection receive with a non-pipe fd was refused (logged once).
+    non_pipe_logged: std.atomic.Value(bool) = .init(false),
 
     /// Only once every relay thread has finished (tests).
     pub fn deinit(relay: *Relay) void {
         std.debug.assert(relay.conns.count() == 0 and relay.link == null);
+        relay.writer.deinit(relay.io);
+        relay.own_cache.drop();
         var fd_it = relay.pending_fds.valueIterator();
         while (fd_it.next()) |fd| _ = std.os.linux.close(fd.*);
         relay.pending_fds.deinit(relay.gpa);
@@ -116,6 +134,21 @@ pub const Relay = struct {
     }
 };
 
+/// Relay.own_cache: one generation's payloads, by the engine's blob index.
+const OwnCache = struct {
+    gen: u32 = 0,
+    blobs: [core.compositor.own_selection_max_mimes]?*pipe_writer.Blob = @splat(null),
+
+    /// relay.mutex held
+    fn drop(self: *OwnCache) void {
+        for (&self.blobs) |*b| if (b.*) |blob| {
+            blob.unref();
+            b.* = null;
+        };
+        self.gen = 0;
+    }
+};
+
 /// Key for `Relay.primary_offers`.
 fn srvObjKey(conn_id: u32, object_id: u32) u64 {
     return (@as(u64, conn_id) << 32) | object_id;
@@ -133,7 +166,8 @@ const AppLink = struct {
     refs: u32 = 1,
     /// ACK serials the link thread hands to this conn's app thread (see the
     /// file comment). `ack_fd` is an eventfd the app thread polls beside the
-    /// app socket; -1 under the copy backend, which is never ACKed.
+    /// app socket; -1 when this relay sends no COMMIT (copy buffers and no
+    /// virtgpu dmabufs): nothing is ever ACKed.
     ack_mutex: Io.Mutex = .init,
     acks: std.ArrayList(u32) = .empty,
     ack_fd: i32 = -1,
@@ -222,9 +256,13 @@ pub fn serveLink(relay: *Relay, link: *Link) void {
     const io = relay.io;
     // what the relay can do, before anything else on this link (before any
     // CONN_OPEN): the engine's compositor offers dmabuf from it
-    if (relay.dmabuf) |cfg| {
-        var out: [dmabuf.Config.max_feature_len]u8 = undefined;
-        link.send(cfg.featureFrame(&out)) catch {}; // a dead link fails its recv below
+    {
+        // the dmabuf backend's (if any), then selection_cache: own-selection
+        // payloads cross once (FDMSG own_pipe)
+        var out: [dmabuf.Config.max_features_len + stream.feature_header_len]u8 = undefined;
+        const n = if (relay.dmabuf) |cfg| cfg.featureFrames(out[0..dmabuf.Config.max_features_len]).len else 0;
+        const cache = stream.encodeFeature(out[n..], .selection_cache, &.{});
+        link.send(out[0 .. n + cache.len]) catch {}; // a dead link fails its recv below
     }
     relay.mutex.lockUncancelable(io);
     while (relay.link) |old| {
@@ -245,7 +283,15 @@ pub fn serveLink(relay: *Relay, link: *Link) void {
     defer msg.deinit(relay.gpa);
     while (true) {
         link.recv(relay.gpa, &msg) catch |err| {
-            if (err != error.EndOfStream) std.log.err("engine link: {t}", .{err});
+            switch (err) {
+                error.EndOfStream => {},
+                // the peer went away (a page suspended or reloaded, a vsock
+                // reset at snapshot restore): expected on a link that is
+                // re-awaited. What is a real error (a bad record, a WS
+                // protocol violation) was logged as one where it was seen.
+                error.LinkGone => std.log.info("engine link dropped", .{}),
+                error.OutOfMemory => std.log.err("engine link: {t}", .{err}),
+            }
             break;
         };
         handleEngineMessage(relay, msg.items);
@@ -253,10 +299,12 @@ pub fn serveLink(relay: *Relay, link: *Link) void {
 
     relay.mutex.lockUncancelable(io);
     relay.link = null;
-    // routing state died with the engine: close parked clipboard fds
+    // routing state died with the engine: close parked clipboard fds, drop
+    // its own selection's payloads (transfers of them end below)
     var fd_it = relay.pending_fds.valueIterator();
     while (fd_it.next()) |fd| _ = std.os.linux.close(fd.*);
     relay.pending_fds.clearRetainingCapacity();
+    relay.own_cache.drop();
     // Wake this engine's app threads so they exit (apps can reconnect once
     // an engine returns). shutdown, not close: it unwedges a writer blocked
     // mid-send on a stuck app, and never blocks itself, so holding the relay
@@ -267,6 +315,10 @@ pub fn serveLink(relay: *Relay, link: *Link) void {
         app.*.stream.shutdown(io, .both) catch {};
         dropped += 1;
     }
+    // under relay.mutex (relay → writer is the lock order; the writer never
+    // waits holding its own): a link taking over can't start transfers
+    // that this would then cancel
+    relay.writer.dropAll(io);
     relay.mutex.unlock(io);
     relay.link_detached.broadcast(io);
     std.log.info("engine detached ({d} app conns dropped)", .{dropped});
@@ -299,9 +351,12 @@ const AppConn = struct {
     /// DMABUF_CREATED names the server wl_buffer id (adoptCreated).
     dmabuf_creates: std.AutoHashMapUnmanaged(u32, *dmabuf.Buffer) = .empty,
     surfaces: std.AutoHashMapUnmanaged(u32, SurfaceState) = .empty,
-    /// COMMIT notices not yet ACKed (handle backends; a handful at most, so
-    /// a list).
+    /// COMMIT notices not yet ACKed (handle backends, dmabuf virtgpu; a
+    /// handful at most, so a list).
     pending: std.ArrayList(Pending) = .empty,
+    /// The next COMMIT's serial: 1, 2, 3, … (never 0), one space for every
+    /// COMMIT of this conn whatever its kind (STREAM.md).
+    next_serial: u32 = 1,
     /// ACK serials taken from `app.acks` (swapped under its mutex).
     acks_taken: std.ArrayList(u32) = .empty,
     /// Frames produced by one app read burst; sent as ONE link message.
@@ -312,6 +367,9 @@ const AppConn = struct {
     frames_to_fire: std.ArrayList(u32) = .empty,
     /// Monotonic ns of the last frame-callback batch fired for this conn.
     last_frame_ns: i96 = 0,
+    /// A virtgpu COMMIT of this conn went out past its fence wait (logged
+    /// once per conn: no other client can use up the line).
+    fence_timeout_logged: bool = false,
 
     fn init(relay: *Relay, conn_id: u32, app: *AppLink, link: *Link) AppConn {
         return .{
@@ -322,6 +380,11 @@ const AppConn = struct {
             .frames = link.frame_callbacks,
             .pixels = .init(relay.backend, relay.gpa, relay.io, conn_id, &relay.next_handle_id),
         };
+    }
+
+    fn advanceSerial(self: *AppConn) void {
+        self.next_serial +%= 1;
+        if (self.next_serial == 0) self.next_serial = 1;
     }
 
     fn surfaceState(self: *AppConn, surface_id: u32) !*SurfaceState {
@@ -373,6 +436,12 @@ const AppConn = struct {
     fn deinit(self: *AppConn) void {
         const gpa = self.relay.gpa;
         self.pixels.deinit();
+        // un-ACKed virtgpu COMMITs: their GEM references go (the engine
+        // forgets the conn's COMMITs with it)
+        for (self.pending.items) |p| switch (p.hold) {
+            .gem => |g| g.importer.unref(g.handle),
+            .backend => {},
+        };
         self.pending.deinit(gpa);
         self.acks_taken.deinit(gpa);
         var buf_it = self.buffers.valueIterator();
@@ -421,8 +490,13 @@ const Pending = struct {
     serial: u32,
     /// the committed wl_buffer; 0 once it was destroyed (nothing to release)
     buffer_id: u32,
-    /// the backend's, handed back to `acked`
-    token: u32,
+    /// what the COMMIT keeps alive until its ACK
+    hold: union(enum) {
+        /// a buffer backend's (its handle), handed back to `acked`
+        backend: u32,
+        /// dmabuf virtgpu: a reference on the resource's GEM handle
+        gem: struct { importer: *virtgpu.Importer, handle: u32 },
+    },
 };
 
 /// Per-surface state the commit path needs.
@@ -432,12 +506,21 @@ const SurfaceState = struct {
     /// that commit owes a wl_buffer.release (see finishCommit).
     pending_attach: bool = false,
     damage: shm.DamageList = .{},
-    /// Dims of the last buffer the engine was shown; a change (or the first
-    /// commit) forces one full-buffer damage rect — the engine's copy of the
-    /// surface is resized, hence gone. Zeroed by a commit that showed
-    /// nothing, so the next one is full too (the engine missed changes).
+    /// What the engine was last shown of this surface: the buffer's dims
+    /// and the kind of content. A change of either (or the first commit)
+    /// forces one full-buffer damage rect — the engine's copy of the
+    /// surface is resized, or was made by another path (a GL presenter
+    /// starts a blank texture when stream/handle pixels follow a GPU image,
+    /// and the copy backend's shadow knows nothing of a GPU image), hence
+    /// gone. Reset by a commit that showed nothing (`forgetShown`), so the
+    /// next one is full too (the engine missed changes). Two resources of
+    /// the same size alternating (a swapchain) are one kind: damage is
+    /// relative to the previous commit's content whichever buffer held it,
+    /// and each buffer holds the whole surface (wl_surface.attach).
     last_w: u32 = 0,
     last_h: u32 = 0,
+    last_kind: ShownKind = .none,
+
     /// wl_surface.set_buffer_scale — multiplies wl_surface.damage rects into
     /// buffer coords. Technically double-buffered state, but apps set it
     /// before their first commit, and a scale flip changes the buffer dims
@@ -456,6 +539,20 @@ const SurfaceState = struct {
     /// commits. Intercepted so the engine never sees the request — otherwise
     /// both sides would fire wl_callback.done (a fatal double-fire).
     pending_frames: std.ArrayList(u32) = .empty,
+
+    const ShownKind = enum {
+        none,
+        /// BUFFER frames or a COMMIT of kind shm (wl_shm, readback dmabufs)
+        pixels,
+        /// a COMMIT of kind virtgpu
+        resource,
+    };
+
+    fn forgetShown(self: *SurfaceState) void {
+        self.last_w = 0;
+        self.last_h = 0;
+        self.last_kind = .none;
+    }
 };
 
 /// One thread per app: register with the attached engine (waiting for one
@@ -469,7 +566,8 @@ pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
         return;
     };
     app.* = .{ .stream = app_stream };
-    if (relay.backend != .copy) {
+    const commits = relay.backend != .copy or if (relay.dmabuf) |cfg| cfg.backend.sendsCommits() else false;
+    if (commits) {
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         if (linux.errno(rc) != .SUCCESS) {
             std.log.err("eventfd failed: {t}", .{linux.errno(rc)});
@@ -486,7 +584,10 @@ pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
     }
     const link = relay.link.?;
     const conn_id = relay.next_conn_id;
-    relay.next_conn_id += 1;
+    // conn 0 is reserved (STREAM.md CONN_OPEN): never handed out, even
+    // after 2^32 conns
+    relay.next_conn_id +%= 1;
+    if (relay.next_conn_id == 0) relay.next_conn_id = 1;
     relay.conns.put(gpa, conn_id, app) catch {
         relay.mutex.unlock(io);
         app.destroy(io, gpa);
@@ -524,6 +625,7 @@ pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
     }
     const still_attached = relay.link == link;
     relay.mutex.unlock(io);
+    relay.writer.dropConn(io, conn_id); // its receives of the own selection end (and none start)
     if (still_attached) {
         const close_frame = stream.encodeConnFrame(.conn_close, conn_id);
         link.send(&close_frame) catch {};
@@ -642,7 +744,10 @@ fn ackCommit(conn: *AppConn, serial: u32) !void {
             tracked.busy -= 1;
             settleRelease(conn, p.buffer_id, tracked);
         }
-        try conn.pixels.acked(p.token, &conn.batch);
+        switch (p.hold) {
+            .backend => |token| try conn.pixels.acked(token, &conn.batch),
+            .gem => |g| g.importer.unref(g.handle),
+        }
         return;
     }
     // unknown serial (a duplicate, or never sent): ignored, per STREAM.md
@@ -817,7 +922,7 @@ fn handleAppMessage(conn: *AppConn, header: wire.Header, msg_bytes: []const u8) 
                 return; // FDMSG, not WIRE
             } else if (std.mem.eql(u8, msg.name, "create_immed")) {
                 // the client named the wl_buffer: it is tracked from now on
-                if (try takeDmabufParams(conn, header.object_id, args[1..])) |b| {
+                if (try takeDmabufParams(conn, header.object_id, args[1..], "buffer", args[0].new_id)) |b| {
                     const old = conn.buffers.fetchPut(gpa, args[0].new_id, .{ .source = .{ .dmabuf = b } }) catch |err| {
                         conn.dropSource(.{ .dmabuf = b });
                         return err;
@@ -827,7 +932,7 @@ fn handleAppMessage(conn: *AppConn, header: wire.Header, msg_bytes: []const u8) 
             } else if (std.mem.eql(u8, msg.name, "create")) {
                 // the engine allocates the wl_buffer (a server id) and says
                 // which with DMABUF_CREATED, before its `created` event
-                if (try takeDmabufParams(conn, header.object_id, args)) |b| {
+                if (try takeDmabufParams(conn, header.object_id, args, "params", header.object_id)) |b| {
                     const old = conn.dmabuf_creates.fetchPut(gpa, header.object_id, b) catch |err| {
                         conn.dropSource(.{ .dmabuf = b });
                         return err;
@@ -927,6 +1032,13 @@ fn handleAppMessage(conn: *AppConn, header: wire.Header, msg_bytes: []const u8) 
 /// The commit path. A commit that latches attach(B) makes a release of B
 /// owed; the backend presents the commit (or doesn't), and a COMMIT notice
 /// makes B busy until the engine ACKs it; then `settleRelease` decides.
+/// COMMIT notices come from the buffer backend (handles: shm buffers) or
+/// straight from here (dmabuf virtgpu: a named resource) — one serial
+/// space and one ACK ledger per conn either way.
+/// Ordering: everything here runs while the app's `wl_surface.commit` is
+/// handled, after that request's WIRE was appended to the burst; nothing is
+/// deferred or reordered, so a COMMIT reaches the link after the commit
+/// request that made it and before any later request of the app.
 fn finishCommit(conn: *AppConn, surface_id: u32) !void {
     const state = conn.surfaces.getPtr(surface_id) orelse return;
     defer state.damage.reset(); // per-commit state, consumed whatever happens
@@ -944,63 +1056,103 @@ fn finishCommit(conn: *AppConn, surface_id: u32) !void {
     const dmabuf_buffer: ?*dmabuf.Buffer = if (tracked.source == .dmabuf) tracked.source.dmabuf else null;
 
     present: {
-        const buffer = switch (view) {
-            .pixels => |b| b,
+        const width: u32, const height: u32 = switch (view) {
             .unreadable => {
-                state.last_w = 0;
-                state.last_h = 0;
+                state.forgetShown();
                 break :present;
             },
+            .pixels => |buffer| dims: {
+                if (dmabuf_buffer != null and conn.pixels != .copy) {
+                    // readback pixels ride the copy path only (main.zig
+                    // refuses the combination; a harness could still build it)
+                    state.forgetShown();
+                    break :present;
+                }
+                if (!buffer.fits()) {
+                    // unreadable geometry: nothing presented, but the client
+                    // gets its buffer back (withholding the release would
+                    // stall it)
+                    std.log.warn("conn {d}: buffer {d} ({d}x{d} stride {d} @{d}) exceeds its {d} B pool", .{ conn.conn_id, state.buffer_id, buffer.width, buffer.height, buffer.stride, buffer.offset, buffer.pool.size });
+                    state.forgetShown();
+                    break :present;
+                }
+                break :dims .{ buffer.width, buffer.height };
+            },
+            .resource => |r| .{ r.ref.width, r.ref.height },
         };
-        if (dmabuf_buffer != null and conn.pixels != .copy) {
-            // readback pixels ride the copy path only (main.zig refuses
-            // the combination; a harness could still build it)
-            state.last_w = 0;
-            state.last_h = 0;
-            break :present;
-        }
-        if (!buffer.fits()) {
-            // unreadable geometry: nothing presented, but the client gets
-            // its buffer back (withholding the release would stall it)
-            std.log.warn("conn {d}: buffer {d} ({d}x{d} stride {d} @{d}) exceeds its {d} B pool", .{ conn.conn_id, state.buffer_id, buffer.width, buffer.height, buffer.stride, buffer.offset, buffer.pool.size });
-            state.last_w = 0;
-            state.last_h = 0;
-            break :present;
-        }
-        const resized = state.last_w != buffer.width or state.last_h != buffer.height;
+        const kind: SurfaceState.ShownKind = if (view == .resource) .resource else .pixels;
+        // a new size or a new kind of content: the engine's copy is gone
+        const resized = state.last_w != width or state.last_h != height or state.last_kind != kind;
+
         var rect_buf: [shm.DamageList.cap]shm.Rect = undefined;
-        const rects = state.damage.clamped(&rect_buf, buffer.width, buffer.height, resized);
+        const rects = state.damage.clamped(&rect_buf, width, height, resized);
         if (rects.len == 0) break :present; // nothing changed, nothing ships
         try conn.pending.ensureUnusedCapacity(conn.relay.gpa, 1);
-        // a dmabuf's pending GPU writes land, and its CPU view is synced,
-        // around the copy path's read
-        if (dmabuf_buffer) |d| d.beginRead(conn.conn_id);
-        defer if (dmabuf_buffer) |d| d.endRead();
-        const settle = try conn.pixels.commit(.{
-            .conn_id = conn.conn_id,
-            .surface_id = surface_id,
-            .buffer_id = state.buffer_id,
-            .buffer = buffer,
-            .damage = rects,
-            .resized = resized,
-        }, &conn.batch);
-        switch (settle) {
-            .now => {},
-            .unshown => {
-                state.last_w = 0;
-                state.last_h = 0;
-                break :present;
+        const serial = conn.next_serial;
+        switch (view) {
+            .unreadable => unreachable,
+            .pixels => |buffer| {
+                // a dmabuf's pending GPU writes land, and its CPU view is
+                // synced, around the copy path's read
+                if (dmabuf_buffer) |d| d.beginRead(conn.conn_id);
+                defer if (dmabuf_buffer) |d| d.endRead();
+                const settle = try conn.pixels.commit(.{
+                    .conn_id = conn.conn_id,
+                    .surface_id = surface_id,
+                    .buffer_id = state.buffer_id,
+                    .buffer = buffer,
+                    .damage = rects,
+                    .resized = resized,
+                    .serial = serial,
+                }, &conn.batch);
+                switch (settle) {
+                    .now => {},
+                    .unshown => {
+                        state.forgetShown();
+                        break :present;
+                    },
+                    .busy => |b| {
+                        std.debug.assert(b.serial == serial);
+                        conn.advanceSerial();
+                        tracked.busy += 1;
+                        conn.pending.appendAssumeCapacity(.{ .serial = serial, .buffer_id = state.buffer_id, .hold = .{ .backend = b.token } });
+                    },
+                }
             },
-            .busy => |b| {
+            .resource => |r| {
+                // the client's GPU work for this frame was submitted before
+                // its commit request; wait (bounded) for the buffer's
+                // implicit write fences so the engine's renderer has it
+                if (!dmabuf_buffer.?.awaitWrites(virtgpu_fence_wait_ms)) {
+                    if (!conn.fence_timeout_logged)
+                        std.log.warn("conn {d}: dmabuf buffer {d} (resource {d}) still being written after {d} ms; sending its COMMIT anyway (logged once per conn)", .{ conn.conn_id, state.buffer_id, r.ref.resource, virtgpu_fence_wait_ms });
+                    conn.fence_timeout_logged = true;
+                }
+                try conn.batch.virtgpuCommit(conn.relay.gpa, conn.conn_id, surface_id, serial, r.ref, rects);
+                conn.advanceSerial();
+                r.importer.ref(r.gem); // the resource lives until this COMMIT's ACK
                 tracked.busy += 1;
-                conn.pending.appendAssumeCapacity(.{ .serial = b.serial, .buffer_id = state.buffer_id, .token = b.token });
+                conn.pending.appendAssumeCapacity(.{ .serial = serial, .buffer_id = state.buffer_id, .hold = .{ .gem = .{ .importer = r.importer, .handle = r.gem } } });
+                // the engine now shows a GPU image: the copy backend's
+                // shadow no longer mirrors it and would trim the next
+                // pixels away as "unchanged" (a full rect alone is not
+                // enough). Dropped here, not at the switch back: an unshown
+                // commit in between forgets the kind.
+                conn.pixels.surfaceDestroyed(surface_id);
             },
         }
-        state.last_w = buffer.width;
-        state.last_h = buffer.height;
+        state.last_w = width;
+        state.last_h = height;
+        state.last_kind = kind;
     }
     settleRelease(conn, state.buffer_id, tracked);
 }
+
+/// How long a virtgpu COMMIT waits for its dmabuf's implicit write fences
+/// before going out anyway: long enough for a frame the host is still
+/// executing, short enough that a hung GPU only slows the app's relay
+/// thread (other apps and the link are unaffected).
+const virtgpu_fence_wait_ms = 100;
 
 /// zwp_linux_buffer_params_v1.add(fd, plane_idx, offset, stride, mod_hi,
 /// mod_lo): keep the plane's fd with its params and forward the message as
@@ -1030,13 +1182,16 @@ fn interceptDmabufAdd(conn: *AppConn, params_id: u32, args: []const wire.Value, 
 }
 
 /// create/create_immed (`a` = width, height, format, flags): the params'
-/// planes become a buffer. Null if the params are unknown or empty (the
-/// compositor raises the protocol error; nothing to track).
-fn takeDmabufParams(conn: *AppConn, params_id: u32, a: []const wire.Value) !?*dmabuf.Buffer {
+/// planes become a buffer, which a naming backend names now (virtgpu;
+/// `label`/`id` say which object in its log). Null if the params are
+/// unknown or empty (the compositor raises the protocol error; nothing to
+/// track).
+fn takeDmabufParams(conn: *AppConn, params_id: u32, a: []const wire.Value, label: []const u8, id: u32) !?*dmabuf.Buffer {
     const params = conn.dmabuf_params.getPtr(params_id) orelse return null;
     if (params.planes[0] == null) return null;
     const b = try conn.relay.gpa.create(dmabuf.Buffer);
     b.* = params.take(a[0].int, a[1].int, a[2].uint, a[3].uint);
+    if (conn.relay.dmabuf) |cfg| b.prepare(cfg.backend, conn.conn_id, label, id);
     return b;
 }
 
@@ -1106,6 +1261,20 @@ fn interceptPipeReceive(conn: *AppConn, msg_bytes: []const u8) !void {
         _ = std.os.linux.close(fd);
         return;
     }
+    // Pipes only (STREAM.md FDMSG pipe). A parked fd is closed on the link
+    // thread (forwarded, answered, or at detach under relay.mutex) or
+    // written by the selection writer, and only a pipe's write and close
+    // are sure not to block there: a FUSE file's close waits for its
+    // server's FLUSH reply, a tty's for its output to drain, O_NONBLOCK or
+    // not. Refused here, on this conn's own thread — what a client's
+    // strange fd can stall is its own conn — and never sent on: the
+    // receiver reads EOF.
+    if (!pipe_writer.isPipe(fd)) {
+        if (!conn.relay.non_pipe_logged.swap(true, .monotonic))
+            std.log.warn("conn {d}: a selection receive with an fd that is not a pipe — refused (the receiver reads EOF); clients pass pipes", .{conn.conn_id});
+        _ = std.os.linux.close(fd);
+        return;
+    }
 
     relay.mutex.lockUncancelable(relay.io);
     if (relay.link != conn.link) {
@@ -1133,6 +1302,174 @@ fn interceptPipeReceive(conn: *AppConn, msg_bytes: []const u8) !void {
         if (parked) |kv| _ = std.os.linux.close(kv.value); // else a detach closed it
         return err;
     };
+}
+
+/// How long a pipe read (the engine reading a source's selection) may take
+/// in all; a write of the engine's own selection has pipe_writer's
+/// deadline_ms (the same 5 s).
+pub const pipe_deadline_ms = pipe_writer.deadline_ms;
+/// Largest selection the relay reads for the engine, whatever it asks.
+pub const pipe_read_max: u32 = 64 << 20;
+
+/// A receive of the engine's own selection, answered (FDMSG own_pipe, or
+/// pipe with the bytes from an engine that doesn't use own_pipe): write
+/// `blob` into the fd parked under the receive's token — on the writer
+/// thread, capped — unless its conn went meanwhile. Takes `fd` and the
+/// caller's blob reference. The check here is unlocked by the time start()
+/// runs; a conn that closes in between is caught by the writer's
+/// tombstone for it (dropConn), so its fd is closed at once all the same.
+fn serveOwnReceive(relay: *Relay, conn_id: u32, fd: i32, blob: *pipe_writer.Blob) void {
+    relay.mutex.lockUncancelable(relay.io);
+    const live = relay.conns.contains(conn_id);
+    relay.mutex.unlock(relay.io);
+    if (!live) {
+        blob.unref();
+        _ = linux.close(fd);
+        return;
+    }
+    relay.writer.start(relay.io, relay.gpa, conn_id, fd, blob);
+}
+
+/// FDMSG own_pipe (STREAM.md): keep a payload's bytes if they came, then
+/// serve the parked receive from the kept copy (EOF without one); gen 0
+/// drops the copy.
+fn handleOwnPipe(relay: *Relay, conn_id: u32, aux: []const u8) void {
+    const io = relay.io;
+    const m = stream.OwnPipe.decode(aux) catch {
+        std.log.err("own_pipe fdmsg with bad aux len {d}", .{aux.len});
+        return;
+    };
+    const valid = m.gen != 0 and m.blob < core.compositor.own_selection_max_mimes;
+    if (m.gen != 0 and !valid) std.log.err("own_pipe fdmsg naming payload {d}", .{m.blob});
+    // the copy, made before taking the lock (up to 64 MiB)
+    const fresh: ?*pipe_writer.Blob = if (valid and m.flags & stream.OwnPipe.has_bytes != 0)
+        pipe_writer.Blob.create(relay.gpa, m.bytes) catch null
+    else
+        null;
+    relay.mutex.lockUncancelable(io);
+    if (!valid) {
+        if (m.gen == 0) relay.own_cache.drop();
+    } else if (m.flags & stream.OwnPipe.has_bytes != 0) {
+        relay.own_payloads_received += 1;
+        if (relay.own_cache.gen != m.gen) relay.own_cache.drop();
+        relay.own_cache.gen = m.gen;
+        if (relay.own_cache.blobs[m.blob]) |old| old.unref();
+        relay.own_cache.blobs[m.blob] = fresh; // null: out of memory, receives read EOF
+    }
+    const parked = if (m.token != 0) relay.pending_fds.fetchRemove(m.token) else null;
+    const blob: ?*pipe_writer.Blob = if (valid and relay.own_cache.gen == m.gen)
+        if (relay.own_cache.blobs[m.blob]) |b| b.ref() else null
+    else
+        null;
+    relay.mutex.unlock(io);
+    const fd = (parked orelse {
+        if (blob) |b| b.unref();
+        if (m.token != 0) std.log.err("own_pipe fdmsg with unknown token {d}", .{m.token});
+        return;
+    }).value;
+    if (blob) |b| return serveOwnReceive(relay, conn_id, fd, b);
+    _ = linux.close(fd); // nothing to write: the receiver reads EOF
+}
+
+/// FDMSG pipe_read from the engine: `wire_bytes` is a source's
+/// send(mime, fd) event for conn `conn_id`, aux = read id ++ max bytes.
+/// Make a pipe, send the event with its write end, read the other end on a
+/// thread, and answer with pipe_read (aux = read id ++ status ++ bytes).
+/// Every read gets exactly one answer while the link stays attached.
+fn startPipeRead(relay: *Relay, conn_id: u32, wire_bytes: []const u8, aux: []const u8) void {
+    const io = relay.io;
+    if (aux.len != 8 or wire_bytes.len < wire.header_size) {
+        std.log.err("pipe_read fdmsg with bad aux len {d}", .{aux.len});
+        return;
+    }
+    const read_id = std.mem.readInt(u32, aux[0..4], .little);
+    const max = @min(std.mem.readInt(u32, aux[4..8], .little), pipe_read_max);
+    relay.mutex.lockUncancelable(io);
+    const link = relay.link orelse {
+        relay.mutex.unlock(io);
+        return; // detached: no answer is owed to a gone engine
+    };
+    link.users += 1; // the reader's; it lets go after answering
+    relay.mutex.unlock(io);
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS)
+        return finishPipeRead(relay, link, conn_id, read_id, .failed, &.{});
+    const sent = if (relay.acquireApp(conn_id)) |app| blk: {
+        defer relay.releaseApp(app);
+        app.sendWithFd(io, wire_bytes, fds[1]) catch break :blk false;
+        break :blk true;
+    } else false;
+    _ = linux.close(fds[1]); // the source holds it now: EOF when it closes it
+    if (!sent) {
+        _ = linux.close(fds[0]);
+        return finishPipeRead(relay, link, conn_id, read_id, .failed, &.{});
+    }
+    const thread = std.Thread.spawn(.{}, readPipe, .{ relay, link, conn_id, read_id, max, fds[0] }) catch {
+        _ = linux.close(fds[0]);
+        return finishPipeRead(relay, link, conn_id, read_id, .failed, &.{});
+    };
+    thread.detach();
+}
+
+/// The reader thread: read until EOF, `max` exceeded, the deadline, or the
+/// link detaching (polls in short slices to notice), then answer.
+fn readPipe(relay: *Relay, link: *Link, conn_id: u32, read_id: u32, max: u32, fd: i32) void {
+    defer _ = linux.close(fd);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(relay.gpa);
+    const status: stream.PipeReadStatus = status: {
+        const deadline = Io.Clock.now(.awake, relay.io).toMilliseconds() + pipe_deadline_ms;
+        var chunk: [16 * 1024]u8 = undefined;
+        while (true) {
+            const left = deadline - Io.Clock.now(.awake, relay.io).toMilliseconds();
+            if (left <= 0) break :status .timeout;
+            relay.mutex.lockUncancelable(relay.io);
+            const attached = relay.link == link;
+            relay.mutex.unlock(relay.io);
+            if (!attached) break :status .failed;
+            var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            const prc = linux.poll(&pfd, 1, @intCast(@min(left, 100)));
+            if (linux.errno(prc) == .INTR or prc == 0) continue;
+            if (linux.errno(prc) != .SUCCESS) break :status .failed;
+            const rc = linux.read(fd, &chunk, chunk.len);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => break :status .failed,
+            }
+            // EOF is all of it, whether or not the source is still
+            // connected: it is every Wayland receiver's only completion
+            // signal, and a source may hand the write to a child and hang
+            // up first (wl-copy --paste-once). One killed mid-write looks
+            // the same here as to any receiver (STREAM.md status 0).
+            if (rc == 0) break :status .ok;
+            if (data.items.len + rc > max) break :status .too_large;
+            data.appendSlice(relay.gpa, chunk[0..rc]) catch break :status .failed;
+        }
+    };
+    finishPipeRead(relay, link, conn_id, read_id, status, if (status == .ok) data.items else &.{});
+}
+
+/// Send a pipe_read answer (if `link` is still the attached one) and drop
+/// the reader's use of the link.
+fn finishPipeRead(relay: *Relay, link: *Link, conn_id: u32, read_id: u32, status: stream.PipeReadStatus, bytes: []const u8) void {
+    defer {
+        relay.mutex.lockUncancelable(relay.io);
+        relay.unuse(link);
+        relay.mutex.unlock(relay.io);
+    }
+    const aux = relay.gpa.alloc(u8, 8 + bytes.len) catch return;
+    defer relay.gpa.free(aux);
+    std.mem.writeInt(u32, aux[0..4], read_id, .little);
+    std.mem.writeInt(u32, aux[4..8], @intFromEnum(status), .little);
+    @memcpy(aux[8..], bytes);
+    const frame = relay.gpa.alloc(u8, 13 + 4 + aux.len) catch return;
+    defer relay.gpa.free(frame);
+    _ = stream.encodeFdMsg(frame, conn_id, .pipe_read, &.{}, aux);
+    relay.mutex.lockUncancelable(relay.io);
+    const attached = relay.link == link;
+    relay.mutex.unlock(relay.io);
+    if (attached) link.send(frame) catch {};
 }
 
 /// CLOCK_MONOTONIC now, less `age_us` (never below 0), in ns.
@@ -1194,10 +1531,12 @@ fn handleEngineFrame(relay: *Relay, frame: stream.Frame) void {
                 defer _ = std.os.linux.close(fd); // SCM_RIGHTS dups it into the app
                 app.sendWithFd(io, f.wire_bytes, fd) catch {};
             },
+            @intFromEnum(stream.FdMsgKind.pipe_read) => startPipeRead(relay, f.conn_id, f.wire_bytes, f.aux),
+            @intFromEnum(stream.FdMsgKind.own_pipe) => handleOwnPipe(relay, f.conn_id, f.aux),
             @intFromEnum(stream.FdMsgKind.pipe) => {
                 // a selection source's send(mime, fd) event: attach the fd
                 // parked under the echoed token
-                if (f.aux.len != 4) {
+                if (f.aux.len < 4) {
                     std.log.err("pipe fdmsg with bad aux len {d}", .{f.aux.len});
                     return;
                 }
@@ -1209,6 +1548,17 @@ fn handleEngineFrame(relay: *Relay, frame: stream.Frame) void {
                     std.log.err("pipe fdmsg with unknown token {d}", .{token});
                     return;
                 }).value;
+                // no wire message, bytes after the token: the compositor's
+                // own selection from an engine that ignores FEATURE
+                // selection_cache — written like an own_pipe's, from a copy
+                // made for this receive alone
+                if (f.wire_bytes.len == 0 and f.aux.len > 4) {
+                    const blob = pipe_writer.Blob.create(relay.gpa, f.aux[4..]) catch {
+                        _ = linux.close(fd);
+                        return;
+                    };
+                    return serveOwnReceive(relay, f.conn_id, fd, blob);
+                }
                 defer _ = std.os.linux.close(fd); // SCM_RIGHTS dups it into the app
                 // no wire message: the offer's source is gone — closing the
                 // write end is the whole answer (the receiver reads EOF)
@@ -1330,6 +1680,51 @@ test "a pipe fd intercepted by a conn whose link already detached is closed, not
     try std.testing.expectEqual(@as(usize, 0), linux.read(pipe_fds[0], &byte, 1));
 }
 
+test "a selection receive whose fd is not a pipe is refused at once: closed, not parked, not sent on" {
+    std.testing.log_level = .err; // the refusal warns
+    defer std.testing.log_level = .warn;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var relay: Relay = .{ .io = threaded.io(), .gpa = gpa };
+    defer relay.deinit();
+    var link: Link = undefined; // attached: a pipe would be parked
+    relay.link = &link;
+    defer relay.link = null;
+    var app: AppLink = .{ .stream = undefined };
+    var conn: AppConn = .init(&relay, 1, &app, &link);
+    defer conn.deinit();
+    var msg: [16]u8 = undefined;
+    _ = wire.encodeMessage(&msg, core.objects.server_id_base, 1, &.{});
+
+    // a socket end (a FUSE file, a tty: closing one parked on the link
+    // thread could block it; the socket stands in for "not a pipe")
+    var sp: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &sp));
+    defer _ = linux.close(sp[1]);
+    conn.fds.fds[0] = sp[0];
+    conn.fds.len = 1;
+    try interceptPipeReceive(&conn, &msg);
+    // a regular file
+    conn.fds.fds[0] = @intCast(linux.memfd_create("wland-test", linux.MFD.CLOEXEC));
+    conn.fds.len = 1;
+    try interceptPipeReceive(&conn, &msg);
+    try std.testing.expectEqual(@as(usize, 0), relay.pending_fds.count());
+    try std.testing.expectEqual(@as(usize, 0), conn.batch.bytes.items.len);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.read(sp[1], &byte, 1)); // EOF
+
+    // a pipe is parked and sent on, as ever
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&pipe_fds, .{ .CLOEXEC = true }));
+    defer _ = linux.close(pipe_fds[0]);
+    conn.fds.fds[0] = pipe_fds[1];
+    conn.fds.len = 1;
+    try interceptPipeReceive(&conn, &msg);
+    try std.testing.expectEqual(@as(usize, 1), relay.pending_fds.count());
+    try std.testing.expect(conn.batch.bytes.items.len > 0);
+}
+
 test "a pipe token echoed with no wire message closes the parked fd: the receiver reads EOF" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1353,4 +1748,79 @@ test "a pipe token echoed with no wire message closes the parked fd: the receive
     try std.testing.expectEqual(@as(usize, 0), relay.pending_fds.count());
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), linux.read(pipe_fds[0], &byte, 1));
+}
+
+test "own selection frames: an old engine's pipe bytes and own_pipe payloads go through the writer; a payload the relay lacks, or a gone conn, reads EOF; gen 0 drops the copy" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var relay: Relay = .{ .io = threaded.io(), .gpa = gpa };
+    defer relay.deinit();
+    var app: AppLink = .{ .stream = undefined };
+    try relay.conns.put(gpa, 1, &app); // a live receiving conn (never written to)
+    defer _ = relay.conns.remove(1);
+
+    const Park = struct {
+        fn park(r: *Relay, token: u32) !i32 {
+            var fds: [2]i32 = undefined;
+            try std.testing.expectEqual(@as(usize, 0), linux.pipe2(&fds, .{ .CLOEXEC = true }));
+            try r.pending_fds.put(r.gpa, token, fds[1]);
+            return fds[0];
+        }
+        fn readAll(fd: i32, out: []u8) !usize {
+            defer _ = linux.close(fd);
+            var n: usize = 0;
+            while (true) {
+                const rc = linux.read(fd, out[n..].ptr, out.len - n);
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+                if (rc == 0) return n;
+                n += rc;
+            }
+        }
+        fn ownPipe(r: *Relay, conn: u32, m: stream.OwnPipe) void {
+            var aux: [64]u8 = undefined;
+            m.writeHeader(aux[0..stream.OwnPipe.header_len]);
+            @memcpy(aux[stream.OwnPipe.header_len..][0..m.bytes.len], m.bytes);
+            var frame: [128]u8 = undefined;
+            handleEngineMessage(r, stream.encodeFdMsg(&frame, conn, .own_pipe, &.{}, aux[0 .. stream.OwnPipe.header_len + m.bytes.len]));
+        }
+    };
+    var out: [64]u8 = undefined;
+
+    // an engine that doesn't use own_pipe: token ++ bytes, every receive
+    const r1 = try Park.park(&relay, 1);
+    var aux: [16]u8 = undefined;
+    std.mem.writeInt(u32, aux[0..4], 1, .little);
+    @memcpy(aux[4..9], "hello");
+    var frame: [64]u8 = undefined;
+    handleEngineMessage(&relay, stream.encodeFdMsg(&frame, 1, .pipe, &.{}, aux[0..9]));
+    try std.testing.expectEqualStrings("hello", out[0..try Park.readAll(r1, &out)]);
+
+    // own_pipe: the bytes once, then the kept copy
+    const r2 = try Park.park(&relay, 2);
+    Park.ownPipe(&relay, 1, .{ .token = 2, .gen = 7, .blob = 3, .flags = stream.OwnPipe.has_bytes, .bytes = "kept" });
+    try std.testing.expectEqualStrings("kept", out[0..try Park.readAll(r2, &out)]);
+    const r3 = try Park.park(&relay, 3);
+    Park.ownPipe(&relay, 1, .{ .token = 3, .gen = 7, .blob = 3, .flags = 0, .bytes = "" });
+    try std.testing.expectEqualStrings("kept", out[0..try Park.readAll(r3, &out)]);
+    try std.testing.expectEqual(@as(usize, 1), relay.own_payloads_received);
+    // a payload it never got, another generation: EOF
+    const r4 = try Park.park(&relay, 4);
+    Park.ownPipe(&relay, 1, .{ .token = 4, .gen = 7, .blob = 4, .flags = 0, .bytes = "" });
+    try std.testing.expectEqual(@as(usize, 0), try Park.readAll(r4, &out));
+    const r5 = try Park.park(&relay, 5);
+    Park.ownPipe(&relay, 1, .{ .token = 5, .gen = 8, .blob = 3, .flags = 0, .bytes = "" });
+    try std.testing.expectEqual(@as(usize, 0), try Park.readAll(r5, &out));
+    const r6 = try Park.park(&relay, 6);
+    // a conn gone meanwhile: EOF, nothing started
+    const r7 = try Park.park(&relay, 7);
+    Park.ownPipe(&relay, 2, .{ .token = 7, .gen = 7, .blob = 3, .flags = 0, .bytes = "" });
+    try std.testing.expectEqual(@as(usize, 0), try Park.readAll(r7, &out));
+    // gen 0: the copy goes; what is parked for later reads EOF
+    Park.ownPipe(&relay, 0, .{ .token = 0, .gen = 0, .blob = 0, .flags = 0, .bytes = "" });
+    try std.testing.expectEqual(@as(u32, 0), relay.own_cache.gen);
+    try std.testing.expectEqual(@as(?*pipe_writer.Blob, null), relay.own_cache.blobs[3]);
+    Park.ownPipe(&relay, 1, .{ .token = 6, .gen = 7, .blob = 3, .flags = 0, .bytes = "" });
+    try std.testing.expectEqual(@as(usize, 0), try Park.readAll(r6, &out));
+    try std.testing.expectEqual(@as(usize, 0), relay.pending_fds.count());
 }

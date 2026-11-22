@@ -21,6 +21,14 @@
 //! at once, or (auto_ack = false) when the test calls `Engine.ack`.
 //! `.backend = .{ .kwshm = dev }` (dev: any open fd) runs the kwshm backend
 //! against kwshm.fake (test builds); the engine resolves export ids through it.
+//! dmabuf virtgpu: pass a `dmabuf` Config whose importer runs on a
+//! `virtgpu.Fake` and set `engine.gpu` to it; kind-virtgpu COMMITs land in
+//! `Engine.gpu_commits` and their resources' pixels in `Engine.surfaces`.
+//! Copy mode: BUFFER / BUFFER_LZ pixels land in `Engine.surfaces` too (byte
+//! order put back to the client's BGRA; X alpha comes out 0xff). Like the
+//! reference GL presenter, a surface whose content changes kind (handle
+//! pixels, stream pixels, a GPU resource) or size starts from a blank
+//! (zeroed) copy: only what the new frame's rects name is shown.
 
 const std = @import("std");
 const Io = std.Io;
@@ -34,6 +42,7 @@ const relay_mod = @import("relay.zig");
 const buffers = @import("buffers.zig");
 const dmabuf = @import("dmabuf.zig");
 const kwshm = @import("kwshm.zig");
+const virtgpu = @import("virtgpu.zig");
 const Link = @import("link.zig").Link;
 const StreamLink = @import("stream_link.zig").StreamLink;
 
@@ -42,8 +51,10 @@ const timeout_ms = 5000;
 pub const Options = struct {
     frame_callbacks: Link.FrameCallbacks = .engine,
     backend: buffers.Backend = .copy,
-    /// the relay takes dmabufs (its FEATURE frame reaches the engine first)
+    /// the relay takes dmabufs (its FEATURE frames reach the engine first)
     dmabuf: ?dmabuf.Config = null,
+    /// the engine can draw GPU buffers (Compositor.gpu_source)
+    gpu_source: bool = true,
 };
 
 pub const Loop = struct {
@@ -76,6 +87,7 @@ pub const Loop = struct {
         self.relay = .{ .io = io, .gpa = gpa, .backend = opts.backend, .dmabuf = opts.dmabuf };
         self.link.init(io, self.link_fds[0], opts.frame_callbacks);
         self.engine.init(gpa, self.link_fds[1]);
+        self.engine.comp.gpu_source = opts.gpu_source;
         self.link_thread = try std.Thread.spawn(.{}, relay_mod.serveLink, .{ &self.relay, &self.link.link });
     }
 
@@ -282,17 +294,29 @@ pub const Engine = struct {
     /// COMMIT naming an unknown handle, a duplicate handle id, an invalid
     /// COMMIT, a failed open or read. Tests expect 0.
     errors: usize = 0,
-    /// Pixels read through handles, as the client wrote them (BGRA/BGRX),
-    /// tightly packed w*4 rows, by key(conn_id, surface_id).
+    /// What each surface shows, as the client wrote it (BGRA/BGRX), tightly
+    /// packed w*4 rows, by key(conn_id, surface_id): pixels read through
+    /// handles or resources, or shipped in BUFFER frames.
     surfaces: std.AutoHashMapUnmanaged(u64, Pixels) = .empty,
     /// Every COMMIT received, in order.
     commits: std.ArrayList(SeenCommit) = .empty,
     /// false: COMMITs are not ACKed until the test calls `ack`.
     auto_ack: bool = true,
+    /// Every COMMIT of buffer kind virtgpu received, in order.
+    gpu_commits: std.ArrayList(SeenGpuCommit) = .empty,
+    /// The virtio-gpu stand-in the relay names resources on (a test's
+    /// `virtgpu.Fake`): set, the engine resolves each kind-virtgpu COMMIT's
+    /// resource through it as the host renderer would and reads the damaged
+    /// pixels into `surfaces` — an unresolvable resource counts as an error.
+    gpu: ?*virtgpu.Fake = null,
 
     pub const OpenHandle = struct { fd: i32, offset: u64, size: u64 };
-    pub const Pixels = struct { width: u32, height: u32, bytes: []u8 };
+    pub const Pixels = struct { width: u32, height: u32, bytes: []u8, kind: ContentKind };
+    /// Where a surface's pixels came from: a change starts a blank copy,
+    /// as the GL presenter's texture does (present.ts).
+    pub const ContentKind = enum { handle, buffer, gpu };
     pub const SeenCommit = struct { conn_id: u32, surface_id: u32, serial: u32, ref: stream.ShmRef, n_rects: u32, first_rect: stream.Rect };
+    pub const SeenGpuCommit = struct { conn_id: u32, surface_id: u32, serial: u32, ref: stream.VirtgpuRef, n_rects: u32, first_rect: stream.Rect };
 
     pub fn key(conn_id: u32, id: u32) u64 {
         return @as(u64, conn_id) << 32 | id;
@@ -329,6 +353,7 @@ pub const Engine = struct {
         while (s_it.next()) |s| self.gpa.free(s.bytes);
         self.surfaces.deinit(self.gpa);
         self.commits.deinit(self.gpa);
+        self.gpu_commits.deinit(self.gpa);
     }
 
     /// ACK a COMMIT now (auto_ack = false tests). Any serial goes — the
@@ -425,6 +450,7 @@ pub const Engine = struct {
     /// engine does, then ACK it (also when it is invalid).
     fn commitNotice(self: *Engine, f: stream.CommitFrame) !void {
         defer if (self.auto_ack) self.batch.ack(self.gpa, f.conn_id, f.serial) catch @panic("OOM");
+        if (f.kind == @intFromEnum(stream.BufferKind.virtgpu)) return self.gpuCommit(f);
         const ref = f.shm() catch {
             self.errors += 1;
             return;
@@ -438,14 +464,7 @@ pub const Engine = struct {
             self.errors += 1;
             return;
         }
-        const gop = try self.surfaces.getOrPut(self.gpa, key(f.conn_id, f.surface_id));
-        if (!gop.found_existing or gop.value_ptr.width != ref.width or gop.value_ptr.height != ref.height) {
-            if (gop.found_existing) self.gpa.free(gop.value_ptr.bytes);
-            gop.value_ptr.* = .{ .width = ref.width, .height = ref.height, .bytes = &.{} };
-            gop.value_ptr.bytes = try self.gpa.alloc(u8, @as(usize, ref.width) * ref.height * 4);
-            @memset(gop.value_ptr.bytes, 0);
-        }
-        const dst = gop.value_ptr.bytes;
+        const dst = try self.surfaceFor(f.conn_id, f.surface_id, ref.width, ref.height, .handle);
         var i: u32 = 0;
         while (i < f.n_rects) : (i += 1) {
             const r = f.rectAt(i);
@@ -457,6 +476,75 @@ pub const Engine = struct {
                 const out = dst[(y * ref.width + x) * 4 ..][0..row_len];
                 const n = linux.pread(h.fd, out.ptr, out.len, @intCast(at));
                 if (linux.errno(n) != .SUCCESS or n != out.len) self.errors += 1;
+            }
+        }
+    }
+
+    /// A kind-virtgpu COMMIT: record it; with `gpu` set, read the damaged
+    /// pixels of the resource it names (its file, at the plane's offset and
+    /// stride) — the host renderer's view.
+    fn gpuCommit(self: *Engine, f: stream.CommitFrame) !void {
+        const ref = f.virtgpu() catch {
+            self.errors += 1;
+            return;
+        };
+        try self.gpu_commits.append(self.gpa, .{ .conn_id = f.conn_id, .surface_id = f.surface_id, .serial = f.serial, .ref = ref, .n_rects = f.n_rects, .first_rect = f.rectAt(0) });
+        const fake = self.gpu orelse return;
+        const fd = fake.resolve(ref.resource) orelse {
+            self.errors += 1; // the relay let the resource go under a COMMIT
+            return;
+        };
+        defer _ = linux.close(fd);
+        const dst = try self.surfaceFor(f.conn_id, f.surface_id, ref.width, ref.height, .gpu);
+        var i: u32 = 0;
+        while (i < f.n_rects) : (i += 1) {
+            const r = f.rectAt(i);
+            const row_len: usize = @as(usize, @intCast(r.w)) * 4;
+            for (0..@intCast(r.h)) |row| {
+                const y = @as(usize, @intCast(r.y)) + row;
+                const x: usize = @intCast(r.x);
+                const out = dst[(y * ref.width + x) * 4 ..][0..row_len];
+                const n = linux.pread(fd, out.ptr, out.len, @intCast(@as(usize, ref.offset) + y * ref.stride + x * 4));
+                if (linux.errno(n) != .SUCCESS or n != out.len) self.errors += 1;
+            }
+        }
+    }
+
+    /// A surface's pixels for a frame of `kind` at `width`×`height`: kept
+    /// while both match, otherwise a fresh zeroed copy (what a presenter
+    /// shows of a surface whose content changed kind or size is only what
+    /// the new frame names).
+    fn surfaceFor(self: *Engine, conn_id: u32, surface_id: u32, width: u32, height: u32, kind: ContentKind) ![]u8 {
+        const gop = try self.surfaces.getOrPut(self.gpa, key(conn_id, surface_id));
+        if (gop.found_existing and gop.value_ptr.width == width and gop.value_ptr.height == height and gop.value_ptr.kind == kind)
+            return gop.value_ptr.bytes;
+        if (gop.found_existing) self.gpa.free(gop.value_ptr.bytes);
+        gop.value_ptr.* = .{ .width = width, .height = height, .bytes = &.{}, .kind = kind };
+        gop.value_ptr.bytes = try self.gpa.alloc(u8, @as(usize, width) * height * 4);
+        @memset(gop.value_ptr.bytes, 0);
+        return gop.value_ptr.bytes;
+    }
+
+    /// BUFFER / BUFFER_LZ: the rects' RGBA pixels into the surface, back in
+    /// the client's byte order (BGRA).
+    fn bufferPixels(self: *Engine, conn_id: u32, surface_id: u32, width: u32, height: u32, n_rects: u32, rect_bytes: []const u8, rgba: []const u8) !void {
+        const dst = try self.surfaceFor(conn_id, surface_id, width, height, .buffer);
+        var off: usize = 0;
+        var i: u32 = 0;
+        while (i < n_rects) : (i += 1) {
+            const rb = rect_bytes[@as(usize, i) * 16 ..][0..16];
+            const x: usize = @intCast(std.mem.readInt(i32, rb[0..4], .little));
+            const y0: usize = @intCast(std.mem.readInt(i32, rb[4..8], .little));
+            const rw: usize = @intCast(std.mem.readInt(i32, rb[8..12], .little));
+            const rh: usize = @intCast(std.mem.readInt(i32, rb[12..16], .little));
+            for (0..rh) |row| {
+                const y = y0 + row;
+                for (0..rw) |col| {
+                    const s = rgba[off..][0..4];
+                    const d = dst[(y * width + x + col) * 4 ..][0..4];
+                    d.* = .{ s[2], s[1], s[0], s[3] };
+                    off += 4;
+                }
             }
         }
     }
@@ -510,16 +598,25 @@ pub const Engine = struct {
                 .wire => |w| try self.comp.onWire(w.conn_id, w.bytes),
                 .fdmsg => |f| if (f.kind == @intFromEnum(stream.FdMsgKind.pipe))
                     self.comp.onPipeReceive(f.conn_id, f.wire_bytes, std.mem.readInt(u32, f.aux[0..4], .little))
+                else if (f.kind == @intFromEnum(stream.FdMsgKind.pipe_read))
+                    {} // a readSelection's answer: tests read it from `frames`
                 else
                     try self.comp.onWire(f.conn_id, f.wire_bytes),
-                // pixels: a view's business; recorded above for assertions
-                .buffer, .buffer_lz => {},
+                .buffer => |b| try self.bufferPixels(b.conn_id, b.surface_id, b.width, b.height, b.n_rects, b.rect_bytes, b.pixels),
+                .buffer_lz => |b| {
+                    const raw = try self.gpa.alloc(u8, b.raw_len);
+                    defer self.gpa.free(raw);
+                    if ((core.lz4.decompress(b.comp, raw) orelse 0) != raw.len) return error.BadLz4;
+                    try self.bufferPixels(b.conn_id, b.surface_id, b.width, b.height, b.n_rects, b.rect_bytes, raw);
+                },
                 .handle_open => |h| try self.handleOpen(h),
                 .handle_close => |h| self.handleClose(h.conn_id, h.handle_id),
                 .commit => |cf| try self.commitNotice(cf),
-                .feature => |f| if (f.feature == @intFromEnum(stream.FeatureKind.linux_dmabuf)) {
-                    const d = try stream.DmabufFeature.decode(f.bytes);
-                    try self.comp.setDmabuf(d.main_device, d.table);
+                .feature => |f| {
+                    // a malformed one is a relay bug here, not a log line
+                    if (f.feature == @intFromEnum(stream.FeatureKind.linux_dmabuf)) _ = try stream.DmabufFeature.decode(f.bytes);
+                    if (f.feature == @intFromEnum(stream.FeatureKind.dmabuf_kind)) _ = try stream.DmabufKindFeature.decode(f.bytes);
+                    self.comp.applyFeature(f.feature, f.bytes);
                 },
                 .srvobj, .ack, .dmabuf_created, .presented => return error.UnexpectedFrame, // engine → relay only
             }
@@ -527,7 +624,8 @@ pub const Engine = struct {
         try self.flush();
     }
 
-    fn flush(self: *Engine) !void {
+    /// Send what the compositor queued (after a direct `comp` call).
+    pub fn flush(self: *Engine) !void {
         const msg = self.batch.finish();
         if (msg.len == 0) return;
         var hdr: [stream.record_header_len]u8 = undefined;

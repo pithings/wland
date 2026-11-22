@@ -55,7 +55,7 @@ pub const StreamLink = struct {
         };
         try out.resize(gpa, len);
         if (!try readExact(self.fd, out.items)) {
-            std.log.err("stream link: closed mid-record", .{});
+            std.log.info("stream link: closed mid-record", .{}); // a drop, not a protocol error
             return error.LinkGone;
         }
     }
@@ -81,6 +81,9 @@ fn readExact(fd: i32, buf: []u8) error{LinkGone}!bool {
             },
             .INTR => continue,
             .CONNRESET => if (got == 0) return false else return error.LinkGone,
+            // the peer or the transport went away (vsock resets on snapshot
+            // restore and page suspend): a drop, logged by serveLink at info
+            .PIPE, .NOTCONN, .SHUTDOWN, .CONNABORTED, .TIMEDOUT, .HOSTDOWN, .HOSTUNREACH, .NETDOWN, .NETRESET, .NETUNREACH => return error.LinkGone,
             else => |e| {
                 std.log.err("stream link read: {t}", .{e});
                 return error.LinkGone;
