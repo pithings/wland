@@ -126,6 +126,12 @@ export interface WlandOptions {
   /** Take a window's element out of your frame (ViewOptions.unmount).
    *  Default: element.remove(). */
   unmount?(win: ViewWindow): void;
+  /** The view shows and hides window elements (display: none while
+   *  minimized): ViewOptions.manageDisplay. Default true; false when your
+   *  window manager owns whether an element shows (a minimize effect; tell
+   *  wland about windows you hide with WindowEntry.setVisible or
+   *  engine.setVisible). Not implied by `mount`. */
+  manageDisplay?: boolean;
 }
 
 /** A row of a taskbar / window list. Minimized windows are listed too
@@ -152,6 +158,11 @@ export interface WindowEntry {
   /** Ask the app to close the window (Engine.close: xdg_toplevel.close).
    *  The app decides; the list changes when the window goes. */
   close(): void;
+  /** Whether the window is on screen, for a window manager that hides it
+   *  for reasons of its own (Engine.setVisible: hidden, the app stops
+   *  rendering as when minimized, but stays unminimized and focused).
+   *  Showing and hiding the element is yours (`manageDisplay`). */
+  setVisible(visible: boolean): void;
 }
 
 export interface Wland {
@@ -218,7 +229,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
   const log = (line: string) => each(onEvent, { type: 'log', line });
 
   const view = createView({ container, webgl: options.webgl, log, onWindowsChange, mount: options.mount, unmount: options.unmount,
-    focusOnMap: options.autoFocus !== false });
+    focusOnMap: options.autoFocus !== false, manageDisplay: options.manageDisplay });
   // set before the link starts: events only flow after engine.start()
   let engine: Engine | undefined, input: Input | undefined, wm: WindowManager | undefined;
   let clip: ClipboardBridge | null = null;
@@ -317,6 +328,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       setMaximized: (on: boolean) => mgr.setMaximized(w.conn, w.surface, on),
       setFullscreen: (on: boolean) => mgr.setFullscreen(w.conn, w.surface, on),
       close: () => eng.close(w.conn, w.surface),
+      setVisible: (visible: boolean) => eng.setVisible(w.conn, w.surface, visible),
     })),
   };
 }

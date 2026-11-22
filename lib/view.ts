@@ -22,7 +22,8 @@
 //
 // Window states come from the core ('maximize' / 'fullscreen' / 'minimize'
 // events, and every commit's flags): a minimized window's element is hidden
-// (display: none); a fullscreen one fills its parent (`inset: 0`, black,
+// (display: none — unless `manageDisplay` is off: then whether an element
+// shows is the embedder's alone); a fullscreen one fills its parent (`inset: 0`, black,
 // clipping) with the window geometry centred in it — the spec's border fill
 // around a smaller buffer — and carries `data-wland-fullscreen` so page CSS
 // can drop whatever it dresses windows in (shadows). Positions stay the
@@ -85,8 +86,9 @@ export interface ViewWindow {
   maxW: number;
   maxH: number;
   /** Window states as of the last event or commit (CommitEvent.maximized,
-   *  .fullscreen, .minimized). A minimized window is hidden but still
-   *  listed (a taskbar restores it). */
+   *  .fullscreen, .minimized). A minimized window is hidden (unless
+   *  ViewOptions.manageDisplay is off) but still listed (a taskbar
+   *  restores it). */
   maximized: boolean;
   fullscreen: boolean;
   minimized: boolean;
@@ -112,6 +114,15 @@ export interface ViewOptions {
    *  embedder that decides focus (InputOptions.autoFocus false): a new
    *  window then takes nothing from the element that has the focus. */
   focusOnMap?: boolean;
+  /** The view shows and hides window elements itself: `style.display =
+   *  'none'` while a window is minimized or its toplevel unmapped, '' when
+   *  it is back. Default true; false for an embedder whose window manager
+   *  owns that (a minimize effect that animates the element away, windows
+   *  it hides for reasons of its own — tell the core with
+   *  Engine.setVisible): the view then never writes a window element's
+   *  display, and a minimized window stays wherever the embedder leaves
+   *  it. Not implied by `mount`. */
+  manageDisplay?: boolean;
   log?(line: string): void;
 }
 
@@ -217,6 +228,7 @@ export function createView(options: ViewOptions): View {
   const log = options.log || (() => {});
   const onWindowsChange = options.onWindowsChange || (() => {});
   const mode = options.webgl || 'auto';
+  const manageDisplay = options.manageDisplay !== false;
   // probe now, while the page is calm (no apps, a tiny off-DOM canvas) —
   // never lazily during an app's first large present
   let useGL = mode === 'always' || (mode === 'auto' && probeWebGL(log));
@@ -405,7 +417,7 @@ export function createView(options: ViewOptions): View {
   // or a commit's flags)
   function setStates(win: Win, maximized: boolean, fullscreen: boolean, minimized: boolean) {
     if (win.maximized === maximized && win.fullscreen === fullscreen && win.minimized === minimized) return;
-    if (win.minimized !== minimized) win.element.style.display = minimized ? 'none' : '';
+    if (win.minimized !== minimized && manageDisplay) win.element.style.display = minimized ? 'none' : '';
     win.maximized = maximized;
     win.fullscreen = fullscreen;
     win.minimized = minimized;
@@ -435,7 +447,7 @@ export function createView(options: ViewOptions): View {
         st.position = 'absolute';
         st.left = '0px';
         st.top = '0px';
-        win.element.style.display = win.minimized ? 'none' : '';
+        if (manageDisplay) win.element.style.display = win.minimized ? 'none' : '';
         box(win, ev);
         if (!s.focusable) {
           s.focusable = true;
@@ -699,7 +711,7 @@ export function createView(options: ViewOptions): View {
         const win = windows.get(keyOf(ev.conn, ev.surface));
         if (win && ev.role !== ROLE_TOPLEVEL) {
           setStates(win, false, false, false);
-          win.element.style.display = 'none';
+          if (manageDisplay) win.element.style.display = 'none';
         }
         onWindowsChange();
         break;

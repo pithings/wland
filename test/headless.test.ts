@@ -129,7 +129,7 @@ function spy(engine: Engine, rels: number[][]): Call[] {
   for (const name of ['pointerEnter', 'pointerLeave', 'pointerMotion', 'pointerButton', 'pointerAxis',
     'keyboardEnter', 'keyboardLeave', 'key', 'textInputCommit', 'popupDismiss', 'requestResize',
     'dragMotion', 'dragDrop', 'dragCancel', 'pointerLockGranted', 'pointerLockLost', 'tick',
-    'setFullscreen', 'setMaximized', 'setMinimized']) {
+    'setFullscreen', 'setMaximized', 'setMinimized', 'setVisible']) {
     const orig = e[name];
     e[name] = (...args) => {
       const shown = [...args];
@@ -294,7 +294,7 @@ test('scene: windows cascade, take focus on map, and go away with their surface 
   const [w1] = hl.windows();
   assert.deepEqual({ ...w1 }, {
     key: `c1s${ta.surface}`, conn: 1, surface: ta.surface, title: 'first', appId: '', decorated: false, minW: 0, minH: 0, maxW: 0, maxH: 0,
-    x: 24, y: 48, width: 40, height: 30, originX: 24, originY: 48, z: w1.z, maximized: false, fullscreen: false, minimized: false, focused: true,
+    x: 24, y: 48, width: 40, height: 30, originX: 24, originY: 48, z: w1.z, maximized: false, fullscreen: false, minimized: false, hidden: false, focused: true,
   });
   assert.deepEqual(calls, [['keyboardEnter', 1, ta.surface]]);
   assert.ok(changes > 0, 'onWindowsChange');
@@ -890,6 +890,34 @@ test('minimize: hidden but listed, keyboard and pointer pass on; focus() refuses
   hl.restore(kb);
   assert.equal(hl.window(kb)!.minimized, false);
   assert.equal(hl.focused()!.key, kb);
+  hl.dispose();
+});
+
+test('setVisible: a hidden window is neither drawn nor hit, keeps focus and stays unminimized (engine.setVisible); shown again it is back as it was', async () => {
+  const ctx = await setup({ background: [9, 9, 9, 255] });
+  const { hl, calls } = ctx;
+  const a = client(ctx, 1);
+  const ta = a.toplevel('below');
+  a.paint(ta.surface, 40, 30, [255, 0, 0, 255]);
+  const b = client(ctx, 2);
+  const tb = b.toplevel('above');
+  b.paint(tb.surface, 50, 20, [0, 255, 0, 255]);
+  const ka = `c1s${ta.surface}`, kb = `c2s${tb.surface}`;
+  hl.move(ka, 60, 80);
+  assert.equal(hl.focused()!.key, kb);
+  calls.length = 0;
+  hl.setVisible(kb, false);
+  hl.setVisible(kb, false); // again: nothing
+  assert.deepEqual(calls, [['setVisible', 2, tb.surface, false]]);
+  assert.deepEqual(hl.windows().map((w) => [w.key, w.hidden, w.minimized]), [[ka, false, false], [kb, true, false]]);
+  assert.equal(hl.focused()!.key, kb, 'focus stays');
+  assert.deepEqual(px(hl.screenshot(), 70, 90), [255, 0, 0, 255]);
+  assert.equal(hl.surfaceAt(70, 90)!.conn, 1);
+  calls.length = 0;
+  hl.setVisible(kb, true);
+  assert.deepEqual(calls, [['setVisible', 2, tb.surface, true]]);
+  assert.equal(hl.window(kb)!.hidden, false);
+  assert.deepEqual(px(hl.screenshot(), 70, 90), [0, 255, 0, 255], 'its last buffer, at once');
   hl.dispose();
 });
 

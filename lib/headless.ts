@@ -168,6 +168,10 @@ export interface HeadlessWindow {
   fullscreen: boolean;
   /** Hidden (not drawn, not hit, never focused) until restore(). */
   minimized: boolean;
+  /** Hidden by setVisible(false): not drawn, not hit, and rendered for
+   *  like a minimized window (Engine.setVisible) — but not minimized, and
+   *  focus stays where it was. */
+  hidden: boolean;
   focused: boolean;
 }
 
@@ -268,6 +272,11 @@ export interface Headless {
   minimize(ref: WindowRef): void;
   /** Bring a minimized window back where it was, raised and focused. */
   restore(ref: WindowRef): void;
+  /** Hide (false) or show (true) the window as an embedder's window
+   *  manager does for reasons of its own (Engine.setVisible): hidden, it is
+   *  neither drawn nor hit and the app renders as when minimized, but
+   *  nothing else changes (focus, stacking, its popups). */
+  setVisible(ref: WindowRef, visible: boolean): void;
   /** Ask the app to close the window (engine.close: xdg_toplevel.close);
    *  the app decides, and its answer (the window going, a dialog) is seen
    *  as usual. */
@@ -426,7 +435,7 @@ interface Surf {
 interface Win {
   key: string; conn: number; surface: number; x: number; y: number; z: number;
   gx: number; gy: number; gw: number; gh: number;
-  maximized: boolean; fullscreen: boolean; minimized: boolean; restore: { x: number; y: number } | null;
+  maximized: boolean; fullscreen: boolean; minimized: boolean; hidden: boolean; restore: { x: number; y: number } | null;
 }
 type Target = { key: string; conn: number; surface: number };
 /** An app-initiated move/resize, driven by the scripted pointer. */
@@ -494,7 +503,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       // view.ts's default mount: cascade; the 48px headroom keeps what an
       // app draws above its window geometry on-screen
       win = { key, conn, surface: root, x: 24 + (placed % 8) * 40, y: 48 + (placed % 6) * 36, z: ++zTop,
-        gx: 0, gy: 0, gw: 0, gh: 0, maximized: false, fullscreen: false, minimized: false, restore: null };
+        gx: 0, gy: 0, gw: 0, gh: 0, maximized: false, fullscreen: false, minimized: false, hidden: false, restore: null };
       placed++;
       wins.set(key, win);
       changed();
@@ -663,7 +672,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         if (ev.role !== ROLE_POPUP) popups.delete(keyOf(ev.conn, ev.surface));
         // an unmapped toplevel's states went with its xdg_toplevel
         const win = wins.get(keyOf(ev.conn, ev.surface));
-        if (win && ev.role !== ROLE_TOPLEVEL) { win.maximized = win.fullscreen = win.minimized = false; place(win); }
+        if (win && ev.role !== ROLE_TOPLEVEL) { win.maximized = win.fullscreen = win.minimized = win.hidden = false; place(win); }
         changed();
         break;
       }
@@ -853,12 +862,13 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
 
   // --- geometry -------------------------------------------------------------
 
-  // a mapped toplevel (listed); `shown`: and not minimized (drawn, hit, focused)
+  // a mapped toplevel (listed); `shown`: and not minimized or hidden (drawn,
+  // hit; focused unless minimized)
   const visible = (win: Win) => {
     const root = surfaces.get(win.key);
     return !!root && root.role === ROLE_TOPLEVEL && root.commits > 0;
   };
-  const shown = (win: Win) => visible(win) && !win.minimized;
+  const shown = (win: Win) => visible(win) && !win.minimized && !win.hidden;
   // a window's surfaces bottom to top, as Wayland stacks them (engine
   // stackOrder): drawn in this order, hit-tested in reverse
   function layers(win: Win): Surf[] {
@@ -1180,7 +1190,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       width: win.fullscreen ? output.width : win.gw || root.logicalWidth,
       height: win.fullscreen ? output.height : win.gh || root.logicalHeight,
       originX: o.x, originY: o.y, z: win.z,
-      maximized: win.maximized, fullscreen: win.fullscreen, minimized: win.minimized,
+      maximized: win.maximized, fullscreen: win.fullscreen, minimized: win.minimized, hidden: win.hidden,
       focused: !!active && active.conn === win.conn && active.surface === win.surface,
     };
   };
@@ -1247,6 +1257,13 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     restore(ref) {
       const win = toplevel(ref);
       if (win) engine.setMinimized(win.conn, win.surface, false);
+    },
+    setVisible(ref, on) {
+      const win = toplevel(ref);
+      if (!win || win.hidden === !on) return;
+      win.hidden = !on;
+      engine.setVisible(win.conn, win.surface, on);
+      changed();
     },
     close(ref) {
       const win = toplevel(ref);

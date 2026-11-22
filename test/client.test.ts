@@ -842,10 +842,10 @@ test('createWland: the frame loop ticks with rAF timestamps and the display inte
 // engine; the states arrive as events, as the core sends them ---------------
 type Ev = Parameters<ReturnType<typeof createView>['handle']>[0];
 function wmRig(dom: ReturnType<typeof installFakeDom>,
-  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive'> & { autoFocus?: boolean } = {}) {
-  const { autoFocus, ...wmOpts } = opts;
+  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive'> & { autoFocus?: boolean; manageDisplay?: boolean } = {}) {
+  const { autoFocus, manageDisplay, ...wmOpts } = opts;
   const container = dom.container();
-  const view = createView({ container, webgl: 'never', focusOnMap: autoFocus !== false });
+  const view = createView({ container, webgl: 'never', focusOnMap: autoFocus !== false, manageDisplay });
   const calls: unknown[][] = [];
   const engine = new Proxy({} as Engine, {
     get: (_, name) => (...args: unknown[]) => { calls.push([name, ...args]); },
@@ -1025,6 +1025,36 @@ test('view + input + wm: a minimized window hides, keyboard focus passes to the 
   }
 });
 
+test('view manageDisplay false: the view never writes a window element\'s display — minimized, restored, unmapped and mapped again stay as the embedder set them; the states still follow', async () => {
+  const dom = installFakeDom();
+  try {
+    const r = wmRig(dom, { manageDisplay: false });
+    r.commit(1, 5);
+    r.commit(2, 5);
+    assert.ok(!r.el(2, 5).style.display);
+    r.el(2, 5).style.display = 'block'; // the embedder's (a minimize effect playing)
+    r.feed({ type: 'minimize', conn: 2, surface: 5, minimized: true });
+    r.commit(2, 5, { minimized: true });
+    assert.equal(r.el(2, 5).style.display, 'block');
+    assert.equal(r.view.window(2, 5)!.minimized, true);
+    assert.ok(r.input.focused(1, 5), 'focus passed on as always');
+    r.el(2, 5).style.display = 'none';
+    r.feed({ type: 'minimize', conn: 2, surface: 5, minimized: false });
+    assert.equal(r.el(2, 5).style.display, 'none');
+    assert.equal(r.view.window(2, 5)!.minimized, false);
+    // unmapped (its xdg_toplevel went) and mapped again
+    r.el(1, 5).style.display = 'flex';
+    r.feed({ type: 'surface', conn: 1, surface: 5, role: 0, root: 5 });
+    assert.equal(r.el(1, 5).style.display, 'flex');
+    r.commit(1, 5);
+    assert.equal(r.el(1, 5).style.display, 'flex');
+    r.dispose();
+    await new Promise((res) => setTimeout(res, 0));
+  } finally {
+    dom.uninstall();
+  }
+});
+
 test('wm: Alt+F11 / F10 / F9 act on the focused window, swallowed with their keyup; other modifiers pass; the API calls the engine', async () => {
   const dom = installFakeDom();
   try {
@@ -1199,6 +1229,12 @@ test('createWland: mount / unmount and onFocusChange are passed on; app id and s
     wl.engine.close = (...a) => { asked.push(a); };
     w.close();
     assert.deepEqual(asked, [[1, 5]]);
+    // setVisible() is engine.setVisible
+    const shown: unknown[][] = [];
+    wl.engine.setVisible = (...a) => { shown.push(a); };
+    w.setVisible(false);
+    w.setVisible(true);
+    assert.deepEqual(shown, [[1, 5, false], [1, 5, true]]);
     assert.equal(wl.windows().length, 2, 'the app decides');
     feed({ type: 'destroy', conn: 1, surface: 5 });
     assert.deepEqual(unmounted, ['c1s5']);
@@ -1745,12 +1781,12 @@ test('input autoFocus false: focus only when told — none at map or press, none
   }
 });
 
-test('createWland: interactive, shortcuts and autoFocus are passed on', async () => {
+test('createWland: interactive, shortcuts, autoFocus and manageDisplay are passed on', async () => {
   const dom = installFakeDom();
   try {
     const link = scriptedLink();
     const asked: unknown[] = [];
-    const wl: Wland = await createWland({ container: dom.container(), wasm, link, webgl: 'never', scale: 1,
+    const wl: Wland = await createWland({ container: dom.container(), wasm, link, webgl: 'never', scale: 1, manageDisplay: false,
       autoFocus: false, shortcuts: { drag: false }, interactive: (ev) => { asked.push(ev.type); return true; } });
     link.cb!.onOpen();
     const feed = (ev: Ev) => { wl.view.handle(ev); wl.input.handle(ev); wl.wm.handle(ev); };
@@ -1766,6 +1802,8 @@ test('createWland: interactive, shortcuts and autoFocus are passed on', async ()
     dom.document.dispatch('pointerdown', { target: canvas, altKey: true, button: 0, buttons: 1, pointerId: 1, clientX: 0, clientY: 0 });
     feed({ type: 'move', conn: 1, surface: 5 });
     assert.deepEqual(asked, ['move'], 'no alt-drag (drag off); the move asked');
+    feed({ type: 'minimize', conn: 1, surface: 5, minimized: true });
+    assert.ok(!(wl.view.window(1, 5)!.element as any).style.display, 'the view leaves display alone');
     wl.dispose();
   } finally {
     dom.uninstall();
