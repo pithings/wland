@@ -194,7 +194,7 @@ pub const Client = struct {
     fds: shm.FdQueue = .{},
     events: std.ArrayList(Event) = .empty,
 
-    fn deinit(self: *Client) void {
+    pub fn deinit(self: *Client) void {
         for (self.events.items) |e| self.gpa.free(e.body);
         self.events.deinit(self.gpa);
         self.fds.drain();
@@ -253,7 +253,7 @@ pub const Client = struct {
         return null;
     }
 
-    fn read(self: *Client) !void {
+    pub fn read(self: *Client) !void {
         const n = try shm.recvWithFds(self.fd, self.rx[self.fill..], &self.fds);
         if (n == 0) return error.EndOfStream;
         self.fill += n;
@@ -618,7 +618,8 @@ pub const Engine = struct {
                     if (f.feature == @intFromEnum(stream.FeatureKind.dmabuf_kind)) _ = try stream.DmabufKindFeature.decode(f.bytes);
                     self.comp.applyFeature(f.feature, f.bytes);
                 },
-                .srvobj, .ack, .dmabuf_created, .presented => return error.UnexpectedFrame, // engine → relay only
+                .srvobj, .ack, .dmabuf_created, .presented, .call => return error.UnexpectedFrame, // engine → relay only
+                .event, .surface => return error.UnexpectedFrame, // session viewers only
             }
         }
         try self.flush();

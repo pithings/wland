@@ -763,7 +763,7 @@ fn appReadLoop(conn: *AppConn) !void {
 /// of large incompressible commits can), as several, split at frame
 /// boundaries; order is kept. A single frame larger than `max` goes alone
 /// (a stream link refuses it, dropping this conn).
-fn sendBatch(link: *Link, msg: []const u8, max: usize) !void {
+pub fn sendBatch(link: *Link, msg: []const u8, max: usize) !void {
     var rest = msg;
     while (rest.len > max) {
         var n: usize = 0;

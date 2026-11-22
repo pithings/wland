@@ -34,6 +34,15 @@
 //   'close' and keep no state for apps that are gone.
 // - dispose() ends it all for good: the link is closed, every buffer token
 //   closed, and nothing is emitted or sent afterwards.
+// - A link whose relay announces FEATURE session (STREAM.md "Profiles")
+//   has its compositor in the relay: the engine swaps the remote core
+//   (remote-core.ts) in for the wasm's — input becomes CALL frames, the
+//   relay's EVENT/SURFACE frames become the same events — and is sent the
+//   scene on every attach ('synced' when it is complete). Its close ends
+//   the apps here as above, but not in the relay; the next link starts on
+//   the local core again until its FEATUREs say otherwise.
+
+import { createRemoteCore, FRAME_CALL, FRAME_EVENT, FRAME_SURFACE, SURFACE_LEN, type CoreExports, type CoreImports } from './remote-core.ts';
 
 export { createWsLink } from './link-ws.ts';
 export { createStreamLink } from './link-stream.ts';
@@ -467,6 +476,18 @@ export interface Engine {
    *  Rejects at once with Error(NO_SELECTION_BRIDGE) when the link's relay
    *  can't read selections (selectionBridged() false). */
   readSelection(mime: string, options?: { maxBytes?: number; timeout?: number }): Promise<Uint8Array | null>;
+
+  // --- profile (STREAM.md "Profiles: passthrough and session") ---
+  /** The link's session, when its relay hosts the compositor (`wlandr
+   *  --profile session`, FEATURE session): the apps outlive the link, and
+   *  a link that opens again is sent the scene as it is ('synced' once it
+   *  is all there). `id` is the relay run's session id (16 hex digits):
+   *  key what the page keeps across reloads by it. null on a passthrough
+   *  link (the compositor is this engine's), before the link's FEATURE
+   *  frames are in, and once it closed — also during the 'disconnect'
+   *  events a closing session link brings (its apps live on in the relay;
+   *  a 'disconnect' while this is non-null is an app that really went). */
+  session(): { id: string } | null;
 }
 
 // --- events ---------------------------------------------------------------
@@ -476,10 +497,14 @@ export type Event =
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
   | TitleEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
   | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
-  | SelectionEvent | PositionEvent;
+  | SelectionEvent | PositionEvent | SyncedEvent;
 
 /** The link is up and the compositor initialised; input calls work now. */
 export interface OpenEvent { type: 'open' }
+/** Session links only (Engine.session()): the scene the relay sends a
+ *  link that attaches — every app conn, surface, window state, buffer,
+ *  cursor and the selection, as events like any others — is all there. */
+export interface SyncedEvent { type: 'synced' }
 export interface ErrorEvent { type: 'error'; detail: string }
 /** The link closed. takenOver: another tab claimed the session. Every app
  *  conn of the link got its 'disconnect' first. A stream link over an
@@ -816,6 +841,8 @@ const FRAME_CONN_CLOSE = 0x04;
 const FRAME_BUFFER_LZ = 0x07;
 const FRAME_HANDLE_OPEN = 0x08;
 const FRAME_COMMIT = 0x0a;
+const FRAME_FEATURE = 0x0c;
+const FEATURE_SESSION = 4;
 const BUFFER_HEADER = 21; // type + conn + surface + width + height + n_rects
 const NOTICE_WORDS = 14;  // wland_commit_notice's fixed words (wasm.zig)
 const EMPTY = new Uint8Array(0);
@@ -824,15 +851,6 @@ const WL_SHM_ARGB8888 = 0;
 const fixed = (v: number) => Math.round(v * 256); // wl_fixed 24.8
 const thenable = <T>(v: T | PromiseLike<T>): v is PromiseLike<T> =>
   v !== null && typeof v === 'object' && typeof (v as PromiseLike<T>).then === 'function';
-
-// The core's exports (core/src/wasm.zig): memory plus `wland_*` functions,
-// every argument and result a wasm i32/u32 (or f64) number.
-type CoreFn = (...args: number[]) => number;
-interface CoreExports {
-  memory: WebAssembly.Memory;
-  [name: `wland_${string}`]: CoreFn;
-}
-type CoreImports = { env: Record<`js_${string}`, (...args: number[]) => void> };
 
 /** A handle the relay announced: its token once open() returned one. */
 interface HandleEntry { conn: number; size: number; token: unknown; ok: boolean }
@@ -893,7 +911,18 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   // NO_SELECTION_BRIDGE was logged on it
   let bridge: boolean | null = null;
   let noBridgeLogged = false;
-  let ex: CoreExports; // wasm exports (core/src/wasm.zig)
+  // the core the engine talks to: the wasm's exports (core/src/wasm.zig),
+  // or on a session link the remote core (remote-core.ts: the relay's
+  // compositor behind the same shape); `real` is always the wasm's
+  let ex: CoreExports;
+  let real: CoreExports;
+  // this link's session (FEATURE session; null: passthrough or not known
+  // yet), whether a frame other than FEATURE has arrived on it (FEATUREs
+  // are first: a session one after that is too late), and whether a
+  // session frame on a passthrough link was logged
+  let session: { id: string } | null = null;
+  let linkSettled = false;
+  let strayLogged = false;
 
   // --- event dispatch: queue while the core runs, drain when it returns ---
   const queue: Event[] = [];
@@ -992,12 +1021,8 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
 
   const imports: CoreImports = {
     env: {
-      js_send: (ptr, len) => {
-        if (!live) return;
-        stats.bytesOut += len;
-        // a copy: links may queue or transfer it, wasm memory is reused
-        link.send(new Uint8Array(ex.memory.buffer, ptr, len).slice());
-      },
+      // a copy: links may queue or transfer it, wasm memory is reused
+      js_send: (ptr, len) => sendOut(new Uint8Array(ex.memory.buffer, ptr, len).slice()),
       // wasm passes u32 args as i32: 0xffffffff arrives as -1, hence >>> 0
       // (conn ids are u32 everywhere else: the frames, the caller's calls)
       js_log: (ptr, len) => log(str(ptr, len)),
@@ -1076,8 +1101,34 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     },
   };
 
-  ex = await instantiate(options.wasm ?? new URL('wland.wasm', import.meta.url), imports);
+  // engine → relay: frames the core made (js_send) or the remote core's CALLs
+  function sendOut(bytes: Uint8Array<ArrayBuffer>) {
+    if (!live) return;
+    stats.bytesOut += bytes.length;
+    link.send(bytes);
+  }
+
+  ex = real = await instantiate(options.wasm ?? new URL('wland.wasm', import.meta.url), imports);
   const version = ex.wland_version();
+
+  // FEATURE session (the link's first message): from here the compositor
+  // is the relay's. The remote core stands in for the wasm's, and the
+  // attach goes out as CALLs — init first (it is what asks the relay for
+  // the scene), then what onOpen gave the local core.
+  function enterSession(id: string) {
+    session = { id };
+    ex = createRemoteCore({
+      real, env: imports.env, send: sendOut, frameLen, log,
+      synced: () => emit({ type: 'synced' }),
+      locks: real.wland_keyboard_locks_state(),
+    });
+    bridge = true; // a session relay bridges the clipboard (its core does)
+    run(ex.wland_init, output.scale, output.scale120);
+    run(ex.wland_set_gpu_source, gpu ? 1 : 0);
+    if (output.width > 0 && output.height > 0) run(ex.wland_desktop_size, output.width, output.height);
+    if (output.suspended) run(ex.wland_set_suspended, 1);
+    if (locks >= 0) run(ex.wland_keyboard_locks, locks);
+  }
 
   // one reusable region of wasm memory for bytes JS hands the core (frame
   // spans, BUFFER_LZ input, COMMIT frames). Pointers survive memory.grow;
@@ -1522,12 +1573,29 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
         break;
       }
       const t = bytes[off];
+      if (t !== FRAME_FEATURE) linkSettled = true;
       if (t === FRAME_BUFFER || t === FRAME_BUFFER_LZ || t === FRAME_COMMIT) {
         if (span >= 0) toCore(off);
         if (g !== gen) return false;
         if (t === FRAME_BUFFER) commitBuffer(dv, off);
         else if (t === FRAME_BUFFER_LZ) commitCompressed(bytes, off, len);
         else onCommit(bytes, off, len);
+        off += len;
+      } else if (t === FRAME_FEATURE && dv.getUint32(off + 1, true) === FEATURE_SESSION && ex === real) {
+        // the FEATUREs before it were the local core's; it and every frame
+        // after it are the remote core's
+        if (span >= 0) toCore(off);
+        if (g !== gen) return false;
+        if (linkSettled) log('FEATURE session after the link\'s first frames: ignored (still passthrough)');
+        else {
+          if (len < 17) log(`FEATURE session with ${len - 9} bytes (wants a u64 id): id 0`);
+          enterSession(sessionId(dv, off, len));
+        }
+        off += len;
+      } else if ((t === FRAME_EVENT || t === FRAME_SURFACE || t === FRAME_CALL) && ex === real) {
+        // session frames on a passthrough link: no core for them
+        if (span >= 0) toCore(off);
+        if (!strayLogged) { strayLogged = true; log(`frame type 0x${t.toString(16)} on a passthrough link: skipped`); }
         off += len;
       } else {
         if (span < 0) span = off;
@@ -1584,6 +1652,12 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       if (disposed) return;
       if (live) saveLocks(); // a link that opens again without closing first
       live = true;
+      // every link starts as passthrough, on the local core, until its
+      // FEATURE frames say otherwise
+      ex = real;
+      session = null;
+      linkSettled = false;
+      strayLogged = false;
       selection = { conn: 0, mimes: [] }; // wland_init: a fresh compositor
       ownSelection = null;
       bridge = null; // (its relay's FEATURE frames decide again)
@@ -1612,7 +1686,11 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       halt();
       // the relay dropped every app of this link: close them in the core
       // as its CONN_CLOSE would (drags, selections and focus end there;
-      // each emits 'disconnect' and closes the conn's handles)
+      // each emits 'disconnect' and closes the conn's handles). On a
+      // session link the remote core does the same locally (nothing is
+      // sent: halt() ended that) while the apps live on in the relay —
+      // session() is null for these 'disconnect's, which tells them apart.
+      session = null;
       for (const conn of [...conns]) {
         const f = new Uint8Array(5);
         f[0] = FRAME_CONN_CLOSE;
@@ -1622,6 +1700,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       }
       conns.clear();
       closeHandles(() => true);
+      ex = real; // (the remote core's mirror goes with it)
       // the next link's compositor starts with an empty clipboard
       if (selection.conn || selection.mimes.length) {
         selection = { conn: 0, mimes: [] };
@@ -1765,6 +1844,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     // clipboard
     selection: () => ({ conn: selection.conn, mimes: [...selection.mimes] }),
     selectionBridged: () => bridged(),
+    session: () => (live && session ? { id: session.id } : null),
     setSelection(data) {
       if (!live) return false;
       const b = bridged();
@@ -1883,6 +1963,11 @@ function spansOf(damage: Int32Array, stride: number, single: boolean): number[] 
   return out;
 }
 
+// FEATURE session's bytes: u64 session_id, as 16 hex digits
+function sessionId(dv: DataView, off: number, len: number): string {
+  return len >= 17 ? dv.getBigUint64(off + 9, true).toString(16).padStart(16, '0') : '0'.repeat(16);
+}
+
 // A link message packs one or more self-delimiting frames (STREAM.md);
 // returns the byte length of the frame at `off`, or -1 if unknown/short.
 function frameLen(dv: DataView, off: number, total: number): number {
@@ -1919,6 +2004,8 @@ function frameLen(dv: DataView, off: number, total: number): number {
     case FRAME_HANDLE_OPEN: return room < 17 ? -1 : 17 + u32(off + 13);
     case 0x09: case 0x0b: return 9;                                      // HANDLE_CLOSE, ACK
     case 0x0c: return room < 9 ? -1 : 9 + u32(off + 5);                  // FEATURE
+    case FRAME_CALL: case FRAME_EVENT: return room < 7 ? -1 : 7 + u32(off + 3);
+    case FRAME_SURFACE: return SURFACE_LEN;
     case FRAME_COMMIT: return room < 25 ? -1 : 25 + u32(off + 21) + u32(off + 13) * 16;
     default: return -1;
   }

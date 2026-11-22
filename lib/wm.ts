@@ -22,6 +22,17 @@
 // Alt alone): Alt+F11 toggles fullscreen, Alt+F10 maximize, Alt+F9
 // minimizes — on the window holding keyboard focus.
 //
+// On a session link (engine.session(): the compositor is the relay's, the
+// apps outlive the page) window positions and their stacking are kept in
+// sessionStorage, `wland.win:<session id>:<conn>:<surface>` → {x, y, z}:
+// written after each press, window state change and scene sync and as the
+// page goes (pagehide), put back when the scene the relay replays to the
+// reloaded page maps the windows again (positions at their first commit,
+// the stacking at 'synced', which also focuses the top window), dropped
+// when the window or its app really goes. Window states are not kept: they
+// are the relay's and come back with the scene. Nothing of this runs on a
+// passthrough link.
+//
 // The types below are the contract.
 
 import type { Engine, Event as WlandEvent } from './engine.ts';
@@ -70,6 +81,36 @@ const EDGE_CURSORS: Record<number, string | undefined> = { 1: 'n-resize', 2: 's-
 
 const now = () => performance.now() >>> 0;
 const keyOf = (conn: number, surface: number) => `c${conn}s${surface}`;
+
+// sessionStorage for the session's window places (see the file comment);
+// every access may throw (storage disabled) or find none (Node)
+const PLACE_PREFIX = 'wland.win:';
+interface Place { x: number; y: number; z: number }
+function store(): Storage | null {
+  try { return typeof sessionStorage === 'undefined' ? null : sessionStorage; } catch { return null; }
+}
+function loadPlace(key: string): Place | null {
+  try {
+    const v = JSON.parse(store()?.getItem(key) ?? 'null');
+    return v && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z) ? v : null;
+  } catch { return null; }
+}
+function savePlace(key: string, place: Place) {
+  try { store()?.setItem(key, JSON.stringify(place)); } catch { /* full or disabled */ }
+}
+// remove the keys `drop` picks
+function dropPlaces(drop: (key: string) => boolean) {
+  try {
+    const st = store();
+    if (!st) return;
+    const keys: string[] = [];
+    for (let i = 0; i < st.length; i++) {
+      const k = st.key(i);
+      if (k && k.startsWith(PLACE_PREFIX) && drop(k)) keys.push(k);
+    }
+    for (const k of keys) st.removeItem(k);
+  } catch { /* */ }
+}
 
 /** An app-initiated move/resize in progress; `pointer` the pointerId it
  *  follows (the press that made the app ask). */
@@ -122,6 +163,66 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     else if (dnd) engine.dragCancel();
   };
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('blur', onBlur);
+
+  // --- session: window places across reloads (see the file comment) -------
+  // sid: the session id as of the last 'synced' (null: passthrough, or the
+  // link closed); checked: window elements whose saved place was looked up
+  let sid: string | null = null;
+  const checked = new WeakSet<HTMLElement>();
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  const placeKey = (conn: number, surface: number) => `${PLACE_PREFIX}${sid}:${conn}:${surface}`;
+  // every window's floating position (where it goes back to while
+  // maximized or fullscreen) and its z-index, written
+  function persist() {
+    if (!sid) return;
+    for (const w of view.windows()) {
+      const pos = restore.get(w.key) ?? { left: w.element.style.left, top: w.element.style.top };
+      const x = parseFloat(pos.left), y = parseFloat(pos.top);
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        savePlace(placeKey(w.conn, w.surface), { x, y, z: Number(w.element.style.zIndex) || 0 });
+      }
+    }
+  }
+  // after the press's own work (a click's raise comes after the pointerup)
+  function persistSoon() {
+    if (!sid || persistTimer !== undefined) return;
+    persistTimer = setTimeout(() => { persistTimer = undefined; persist(); }, 0);
+  }
+  // a window the scene mapped again: back where it was (its restore
+  // position while maximized or fullscreen — the wm snapped it already, or
+  // will at this commit)
+  function placeSaved(w: ViewWindow) {
+    if (checked.has(w.element)) return;
+    checked.add(w.element);
+    const saved = loadPlace(placeKey(w.conn, w.surface));
+    if (!saved) return;
+    const pos = { left: `${saved.x}px`, top: `${saved.y}px` };
+    if (restore.has(w.key)) restore.set(w.key, pos);
+    else { w.element.style.left = pos.left; w.element.style.top = pos.top; }
+  }
+  // the scene is all there: places for the windows mapped before the id
+  // was known, the saved stacking, the keyboard to the top window
+  function synced() {
+    sid = engine.session?.()?.id ?? null;
+    if (!sid) return;
+    const current = `${PLACE_PREFIX}${sid}:`;
+    dropPlaces((k) => !k.startsWith(current)); // an earlier relay run's
+    const stack: { w: ViewWindow; z: number }[] = [];
+    for (const w of view.windows()) {
+      placeSaved(w);
+      const saved = loadPlace(placeKey(w.conn, w.surface));
+      if (saved) stack.push({ w, z: saved.z });
+    }
+    if (stack.length) {
+      stack.sort((a, b) => a.z - b.z);
+      for (const { w } of stack) view.raise(w.conn, w.surface);
+      const top = [...stack].reverse().find(({ w }) => !w.minimized);
+      if (top) input.focus(top.w.conn, top.w.surface);
+    }
+    persist();
+  }
+  const onPageHide = () => persist();
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('pagehide', onPageHide);
 
   // the pointer goes back to whatever surface is under it after a grab
   function reenter(x: number, y: number) {
@@ -372,6 +473,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
 
   on('pointerup', (ev) => {
     held.delete(ev.pointerId);
+    persistSoon(); // a move, a raise
     if ((grab || dnd) && !ours(ev)) return;
     if (dnd) {
       // final position, then the drop; the compositor answers with
@@ -447,6 +549,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
       case 'maximize':
         stateOf(ev.conn, ev.surface).maximized = ev.maximized;
         place(ev.conn, ev.surface);
+        persistSoon();
         break;
       case 'fullscreen': {
         const st = stateOf(ev.conn, ev.surface);
@@ -460,6 +563,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
         }
         if (grab && grab.conn === ev.conn && grab.surface === ev.surface) cancelGrab();
         syncBrowserFs();
+        persistSoon();
         break;
       }
       case 'minimize': {
@@ -473,12 +577,14 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
           input.focus(ev.conn, ev.surface);
         }
         syncBrowserFs();
+        persistSoon();
         break;
       }
       case 'commit':
         // enforced per commit too: apps can START maximized or fullscreen
         // (saved session state) before their window existed for the event
         if (ev.role === ROLE_TOPLEVEL) {
+          if (sid) { const w = view.window(ev.conn, ev.surface); if (w) placeSaved(w); } // (before the snap below)
           const st = stateOf(ev.conn, ev.surface);
           const was = st.fullscreen;
           st.maximized = ev.maximized;
@@ -496,11 +602,14 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
         if (ev.role !== ROLE_TOPLEVEL && states.delete(keyOf(ev.conn, ev.surface))) syncBrowserFs();
         break;
       case 'destroy':
+        // (a closing link's apps live on in the relay: session() null then)
+        if (sid && engine.session()) dropPlaces((k) => k === placeKey(ev.conn, ev.surface));
         popups.delete(keyOf(ev.conn, ev.surface));
         restore.delete(keyOf(ev.conn, ev.surface));
         if (states.delete(keyOf(ev.conn, ev.surface))) syncBrowserFs();
         break;
       case 'disconnect':
+        if (sid && engine.session()) dropPlaces((k) => k.startsWith(`${PLACE_PREFIX}${sid}:${ev.conn}:`));
         for (const [key, p] of popups) if (p.conn === ev.conn) popups.delete(key);
         for (const key of restore.keys()) if (key.startsWith(`c${ev.conn}s`)) restore.delete(key);
         for (const [key, s] of states) if (s.conn === ev.conn) states.delete(key);
@@ -523,6 +632,8 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
         input.suppress(false);
         document.body.style.cursor = '';
         break;
+      case 'synced': synced(); break;
+      case 'close': sid = null; break; // (the next link's 'synced' says again)
     }
   }
 
@@ -543,7 +654,13 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     // told); the browser's fullscreen, if it was ours, is left
     dispose() {
       for (const [type, fn, opts] of listening.splice(0)) document.removeEventListener(type, fn, opts);
-      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') window.removeEventListener('blur', onBlur);
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('blur', onBlur);
+        window.removeEventListener('pagehide', onPageHide);
+      }
+      sid = null;
+      clearTimeout(persistTimer);
+      persistTimer = undefined;
       held.clear();
       if (grab || dnd) document.body.style.cursor = '';
       grab = null;

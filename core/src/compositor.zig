@@ -338,6 +338,11 @@ const Surface = struct {
     input_pending: ?Region = null,
     input_pending_set: bool = false,
     input: ?Region = null,
+    /// The last value surface_fn told the embedder for this surface (a
+    /// Role; 0 = none, also before anything was told): what replaySurfaces
+    /// tells an embedder that attaches later. Differs from `role` while a
+    /// surface is unmapped (role kept, embedder told none).
+    notified: u32 = 0,
 };
 
 /// A rectangle in a surface's local coordinates, logical px.
@@ -666,6 +671,12 @@ const Conn = struct {
     cursor_surface: u32 = 0,
     cursor_hx: i32 = 0,
     cursor_hy: i32 = 0,
+    /// The shape set_shape last set for the current enter (0 = none: a
+    /// cursor surface, or nothing set yet), for replaySeat.
+    cursor_shape: u32 = 0,
+    /// xdg_toplevel.set_title, by wl_surface id (owned copies), for
+    /// replaySurfaces; dropped with the surface or its xdg_toplevel.
+    titles: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// where the pointer is in pointer_focus's local px (wl_fixed): the
     /// last enter or motion as the client saw it (clamped while confined,
     /// frozen while locked), and that motion's time
@@ -1020,6 +1031,9 @@ pub const Compositor = struct {
     }
 
     fn destroyConn(self: *Compositor, conn: *Conn) void {
+        var title_it = conn.titles.valueIterator();
+        while (title_it.next()) |t| self.gpa.free(t.*);
+        conn.titles.deinit(self.gpa);
         conn.objects.deinit(self.gpa);
         conn.surfaces.deinit(self.gpa);
         conn.positioners.deinit(self.gpa);
@@ -1447,10 +1461,11 @@ pub const Compositor = struct {
                 surface.geom_pending = .{ args[0].int, args[1].int, args[2].int, args[3].int };
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "set_title")) {
-            if (self.title_fn) |title_fn| {
-                if (surfaceByToplevelId(conn, header.object_id)) |surface| {
-                    title_fn(self.ctx, conn_id, surfaceIdOf(conn, surface), args[0].string orelse "");
-                }
+            if (surfaceByToplevelId(conn, header.object_id)) |surface| {
+                const surface_id = surfaceIdOf(conn, surface);
+                const title = args[0].string orelse "";
+                self.keepTitle(conn, surface_id, title);
+                if (self.title_fn) |title_fn| title_fn(self.ctx, conn_id, surface_id, title);
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "set_min_size")) {
             if (surfaceByToplevelId(conn, header.object_id)) |surface| {
@@ -1881,6 +1896,7 @@ pub const Compositor = struct {
         if (msg.destructor) {
             if (std.mem.eql(u8, iface.name, "wl_surface")) {
                 _ = conn.surfaces.remove(header.object_id);
+                self.dropTitle(conn, header.object_id);
                 self.restacked(conn); // it, or its children, may have been placed
                 // its subsurfaces are unmapped with it, their role objects
                 // inert (the id may name another surface right after)
@@ -1952,6 +1968,7 @@ pub const Compositor = struct {
                         (surface.role == .toplevel and surface.toplevel_id == header.object_id);
                     if (match) {
                         self.positions_dirty = true;
+                        if (surface.role == .toplevel) self.dropTitle(conn, kv.key_ptr.*);
                         surface.role = .none;
                         surface.popup_id = 0;
                         surface.toplevel_id = 0;
@@ -2122,7 +2139,22 @@ pub const Compositor = struct {
     }
 
     fn notifySurface(self: *Compositor, conn_id: u32, surface_id: u32, value: u32) void {
+        if (self.conns.get(conn_id)) |conn| {
+            if (conn.surfaces.getPtr(surface_id)) |s| s.notified = if (value == surface_destroyed_code) 0 else value;
+        }
         if (self.surface_fn) |surface_fn| surface_fn(self.ctx, conn_id, surface_id, value);
+    }
+
+    /// set_title's title kept for replaySurfaces (a failed copy just drops
+    /// the old one: the replay then sends no title).
+    fn keepTitle(self: *Compositor, conn: *Conn, surface_id: u32, title: []const u8) void {
+        self.dropTitle(conn, surface_id);
+        const copy = self.gpa.dupe(u8, title) catch return;
+        conn.titles.put(self.gpa, surface_id, copy) catch self.gpa.free(copy);
+    }
+
+    fn dropTitle(self: *Compositor, conn: *Conn, surface_id: u32) void {
+        if (conn.titles.fetchRemove(surface_id)) |kv| self.gpa.free(kv.value);
     }
 
     fn surfaceByXdgId(conn: *Conn, xdg_id: u32) ?*Surface {
@@ -3695,6 +3727,7 @@ pub const Compositor = struct {
         conn.pointer_enter_serial = serial; // set_shape/set_cursor must echo this serial
         noteInputSerial(conn, serial); // a hover alone doesn't make it the last input conn
         conn.cursor_surface = 0; // a new enter takes a fresh set_cursor
+        conn.cursor_shape = 0;
         // one serial for every wl_pointer: set_cursor/set_shape from any
         // of them names it
         self.seatEvent(conn_id, &conn.pointers, "wl_pointer", "enter", &.{
@@ -3725,6 +3758,7 @@ pub const Compositor = struct {
         // the shape or cursor surface the client set applied only while its
         // surface held the pointer — reset to the default pointer now
         conn.cursor_surface = 0;
+        conn.cursor_shape = 0;
         if (self.cursor_shape_fn) |f| f(self.ctx, conn_id, cursor_shape_reset);
     }
 
@@ -4260,6 +4294,7 @@ pub const Compositor = struct {
         if (serial != conn.pointer_enter_serial) return; // stale — ignore
         if (conn.pointer_focus == 0) return; // pointer isn't over our surface
         conn.cursor_surface = 0; // whichever the client used last wins
+        conn.cursor_shape = shape;
         if (self.cursor_shape_fn) |f| f(self.ctx, conn_id, shape);
     }
 
@@ -4274,6 +4309,7 @@ pub const Compositor = struct {
         if (conn.pointer_focus == 0) return;
         if (surface_id != 0 and !conn.surfaces.contains(surface_id)) return;
         conn.cursor_surface = surface_id;
+        conn.cursor_shape = 0;
         conn.cursor_hx = hx;
         conn.cursor_hy = hy;
         self.emitCursorSurface(conn_id, conn);
@@ -4460,6 +4496,148 @@ pub const Compositor = struct {
     /// next link's compositor.
     pub fn lockState(self: *const Compositor) struct { caps_lock: bool, num_lock: bool } {
         return .{ .caps_lock = self.mods_locked & mod_lock != 0, .num_lock = self.mods_locked & mod_num != 0 };
+    }
+
+    // ------------------------------------------------------------------
+    // a compositor that outlives its embedders (the relay's session host,
+    // server/src/session.zig): an embedder that attaches later is told the
+    // scene as it is now, one that goes lets go of what it held
+    // ------------------------------------------------------------------
+
+    /// The open conns' ids, ascending (owned by the caller).
+    pub fn connIds(self: *Compositor, gpa: std.mem.Allocator) ![]u32 {
+        const ids = try gpa.alloc(u32, self.conns.count());
+        var it = self.conns.keyIterator();
+        var i: usize = 0;
+        while (it.next()) |id| : (i += 1) ids[i] = id.*;
+        std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+        return ids;
+    }
+
+    /// A conn's surface ids (owned by the caller), parents before what
+    /// hangs from them (by depth in the parent chain, then id); empty for
+    /// an unknown conn.
+    pub fn surfaceIds(self: *Compositor, gpa: std.mem.Allocator, conn_id: u32) ![]u32 {
+        const conn = self.conns.get(conn_id) orelse return gpa.alloc(u32, 0);
+        const Entry = struct { depth: u8, id: u32 };
+        const list = try gpa.alloc(Entry, conn.surfaces.count());
+        defer gpa.free(list);
+        var it = conn.surfaces.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) {
+            var depth: u8 = 0;
+            var parent = kv.value_ptr.parent_id;
+            // bounded like surfaceRoot: a client's cycle can't hang it
+            while (parent != 0 and depth < 8) : (depth += 1) {
+                parent = (conn.surfaces.get(parent) orelse break).parent_id;
+            }
+            list[i] = .{ .depth = depth, .id = kv.key_ptr.* };
+        }
+        std.mem.sort(Entry, list, {}, struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                return a.depth < b.depth or (a.depth == b.depth and a.id < b.id);
+            }
+        }.lessThan);
+        const ids = try gpa.alloc(u32, list.len);
+        for (list, ids) |e, *id| id.* = e.id;
+        return ids;
+    }
+
+    /// The surface has content (its last attach-latching commit named a
+    /// buffer): an embedder attaching now should be shown its pixels.
+    pub fn surfaceHasContent(self: *Compositor, conn_id: u32, surface_id: u32) bool {
+        const conn = self.conns.get(conn_id) orelse return false;
+        const surface = conn.surfaces.get(surface_id) orelse return false;
+        return surface.on_output;
+    }
+
+    /// Tell an embedder that attaches to a running compositor what describes
+    /// each surface now, through the same callbacks the changes went
+    /// through: per conn (ascending), per surface (parents first) the
+    /// surface_fn value it was last told (unless none), its title, its
+    /// input region (unless infinite, the default) and its set window
+    /// states (interactive kinds 2, 6, 8). Pixels are the embedder's.
+    pub fn replaySurfaces(self: *Compositor) void {
+        const ids = self.connIds(self.gpa) catch return;
+        defer self.gpa.free(ids);
+        for (ids) |conn_id| {
+            const surfaces = self.surfaceIds(self.gpa, conn_id) catch continue;
+            defer self.gpa.free(surfaces);
+            for (surfaces) |surface_id| {
+                // re-fetched for every surface: the callbacks may read the
+                // compositor (never change it)
+                const conn = self.conns.get(conn_id) orelse break;
+                const s = conn.surfaces.get(surface_id) orelse continue;
+                if (s.notified != 0) {
+                    if (self.surface_fn) |f| f(self.ctx, conn_id, surface_id, s.notified);
+                }
+                if (conn.titles.get(surface_id)) |t| {
+                    if (self.title_fn) |f| f(self.ctx, conn_id, surface_id, t);
+                }
+                if (s.input) |*r| {
+                    if (self.input_region_fn) |f| f(self.ctx, conn_id, surface_id, r);
+                }
+                if (s.role == .toplevel) {
+                    if (self.interactive_fn) |f| {
+                        if (s.maximized) f(self.ctx, conn_id, surface_id, 2, 0);
+                        if (s.fullscreen) f(self.ctx, conn_id, surface_id, 6, 0);
+                        if (s.minimized) f(self.ctx, conn_id, surface_id, 8, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The seat half of an attaching embedder's replay: per conn
+    /// (ascending) the pointer image while it holds the pointer, its text
+    /// input while entered, the pointer lock it wants; then the clipboard
+    /// selection (selection_fn, always once).
+    pub fn replaySeat(self: *Compositor) void {
+        const ids = self.connIds(self.gpa) catch return;
+        defer self.gpa.free(ids);
+        for (ids) |conn_id| {
+            const conn = self.conns.get(conn_id) orelse continue;
+            if (conn.pointer_focus != 0) {
+                if (conn.cursor_surface != 0) {
+                    self.emitCursorSurface(conn_id, conn);
+                } else if (conn.cursor_shape != 0) {
+                    if (self.cursor_shape_fn) |f| f(self.ctx, conn_id, conn.cursor_shape);
+                }
+            }
+            if (conn.text_input_id != 0 and conn.ti_focus_surface != 0) self.textInputNotify(conn_id, conn);
+            if (conn.lock_surface != 0) {
+                if (self.pointer_lock_fn) |f| f(self.ctx, conn_id, conn.lock_surface);
+            }
+        }
+        self.notifySelection();
+    }
+
+    /// selection_fn with the clipboard selection as it is now (an embedder
+    /// whose request changed nothing is told the outcome all the same).
+    pub fn tellSelection(self: *Compositor) void {
+        self.notifySelection();
+    }
+
+    /// The embedder went (a viewer closed): what only it held up ends —
+    /// a drag is cancelled, every pointer lock is lost and the pointer and
+    /// keyboard leave every client (held buttons and modifiers released:
+    /// the next enter starts clean), and the apps are told they are
+    /// suspended until an embedder says otherwise. Clients stay connected.
+    pub fn embedderGone(self: *Compositor) void {
+        self.dragCancel();
+        if (self.connIds(self.gpa)) |ids| {
+            defer self.gpa.free(ids);
+            for (ids) |conn_id| {
+                self.pointerLockLost(conn_id);
+                self.pointerLeave(conn_id);
+                self.keyboardLeave(conn_id);
+                if (self.conns.get(conn_id)) |conn| {
+                    conn.buttons_held = 0;
+                    conn.mods_depressed = 0;
+                }
+            }
+        } else |_| {}
+        self.setSuspended(true);
     }
 
     /// wl_keyboard.modifiers to every wl_keyboard, one serial.
@@ -9630,4 +9808,144 @@ test "dnd: a target with two wl_data_devices — each gets its own offer and the
     comp.onPipeReceive(2, wire.encodeMessage(&buf, e1[1], 1, &.{ .{ .string = "text/plain" }, .fd }), 5);
     try std.testing.expectEqual(@as(u32, 1), sink.fdmsg_conn);
     try std.testing.expectEqual(@as(u32, 5), sink.fdmsg_token);
+}
+
+/// Records the embedder callbacks a replay makes, one line each, in order.
+const ReplayRecorder = struct {
+    lines: std.ArrayList([]u8) = .empty,
+
+    fn add(self: *ReplayRecorder, comptime fmt: []const u8, args: anytype) void {
+        const line = std.fmt.allocPrint(std.testing.allocator, fmt, args) catch unreachable;
+        self.lines.append(std.testing.allocator, line) catch unreachable;
+    }
+    fn clear(self: *ReplayRecorder) void {
+        for (self.lines.items) |l| std.testing.allocator.free(l);
+        self.lines.clearRetainingCapacity();
+    }
+    fn deinit(self: *ReplayRecorder) void {
+        self.clear();
+        self.lines.deinit(std.testing.allocator);
+    }
+    fn of(ctx: ?*anyopaque) *ReplayRecorder {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+    fn send(_: ?*anyopaque, _: u32, _: []const u8) void {}
+    fn log(_: ?*anyopaque, _: []const u8) void {}
+    fn surface(ctx: ?*anyopaque, c: u32, s: u32, v: u32) void {
+        of(ctx).add("surface {d} {d} {d}", .{ c, s, v });
+    }
+    fn title(ctx: ?*anyopaque, c: u32, s: u32, t: []const u8) void {
+        of(ctx).add("title {d} {d} {s}", .{ c, s, t });
+    }
+    fn interactive(ctx: ?*anyopaque, c: u32, s: u32, k: u32, v: u32) void {
+        of(ctx).add("interactive {d} {d} {d} {d}", .{ c, s, k, v });
+    }
+    fn region(ctx: ?*anyopaque, c: u32, s: u32, r: ?*const Region) void {
+        of(ctx).add("region {d} {d} {d}", .{ c, s, if (r) |x| x.slice().len else 99 });
+    }
+    fn selection(ctx: ?*anyopaque, c: u32, mimes: []const []const u8) void {
+        of(ctx).add("selection {d} {d}", .{ c, mimes.len });
+    }
+    fn shape(ctx: ?*anyopaque, c: u32, v: u32) void {
+        of(ctx).add("shape {d} {d}", .{ c, v });
+    }
+    fn lock(ctx: ?*anyopaque, c: u32, s: u32) void {
+        of(ctx).add("lock {d} {d}", .{ c, s });
+    }
+    fn expect(self: *const ReplayRecorder, want: []const []const u8) !void {
+        errdefer for (self.lines.items) |l| std.debug.print("got: {s}\n", .{l});
+        try std.testing.expectEqual(want.len, self.lines.items.len);
+        for (want, self.lines.items) |w, l| try std.testing.expectEqualStrings(w, l);
+    }
+};
+
+test "replay: an embedder attaching later is told each surface (parents first: role, title, input region, window states) and the seat (pointer image, lock, selection); embedderGone lets go of the seat and suspends" {
+    var rec: ReplayRecorder = .{};
+    defer rec.deinit();
+    var comp = Compositor.init(std.testing.allocator, &rec, ReplayRecorder.send, ReplayRecorder.log);
+    defer comp.deinit();
+    comp.surface_fn = ReplayRecorder.surface;
+    comp.title_fn = ReplayRecorder.title;
+    comp.interactive_fn = ReplayRecorder.interactive;
+    comp.input_region_fn = ReplayRecorder.region;
+    comp.selection_fn = ReplayRecorder.selection;
+    comp.cursor_shape_fn = ReplayRecorder.shape;
+    comp.pointer_lock_fn = ReplayRecorder.lock;
+
+    const surf = comptime protocol.find("wl_surface").?;
+    const tl = comptime protocol.find("xdg_toplevel").?;
+    var buf: [128]u8 = undefined;
+    const S = struct {
+        fn send(c: *Compositor, b: []u8, obj: u32, op: u16, args: []const wire.Value) !void {
+            try c.onWire(1, wire.encodeMessage(b, obj, op, args));
+        }
+    };
+    // conn 1: toplevel surface 6 (xdg 7, toplevel 8), mapped with content
+    try wmBaseToplevel(&comp, 1);
+    try S.send(&comp, &buf, 6, comptime surf.requestIndex("commit").?, &.{});
+    try S.send(&comp, &buf, 6, comptime surf.requestIndex("attach").?, &.{ .{ .object = 30 }, .{ .int = 0 }, .{ .int = 0 } });
+    try S.send(&comp, &buf, 6, comptime surf.requestIndex("commit").?, &.{});
+    try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_title").?, &.{.{ .string = "Old" }});
+    try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_title").?, &.{.{ .string = "Hello" }});
+    try S.send(&comp, &buf, 8, comptime tl.requestIndex("set_maximized").?, &.{});
+    // a subsurface 9 of it (made after a later surface 12, so ids alone
+    // would not order it), with an input region of one box
+    try S.send(&comp, &buf, 2, 0, &.{ .{ .uint = 2 }, .{ .new_id_dynamic = .{ .interface = "wl_subcompositor", .version = 1, .id = 5 } } });
+    try S.send(&comp, &buf, 3, 0, &.{.{ .new_id = 12 }}); // create_surface 12: never given a role
+    try S.send(&comp, &buf, 3, 0, &.{.{ .new_id = 9 }});
+    try S.send(&comp, &buf, 5, 1, &.{ .{ .new_id = 10 }, .{ .object = 9 }, .{ .object = 6 } });
+    try S.send(&comp, &buf, 3, comptime protocol.find("wl_compositor").?.requestIndex("create_region").?, &.{.{ .new_id = 11 }});
+    try S.send(&comp, &buf, 11, comptime protocol.find("wl_region").?.requestIndex("add").?, &.{ .{ .int = 0 }, .{ .int = 0 }, .{ .int = 5 }, .{ .int = 5 } });
+    try S.send(&comp, &buf, 9, comptime surf.requestIndex("set_input_region").?, &.{.{ .object = 11 }});
+    try S.send(&comp, &buf, 9, comptime surf.requestIndex("commit").?, &.{});
+    try comp.connOpen(2); // a conn with nothing yet
+    try std.testing.expect(comp.surfaceHasContent(1, 6));
+    try std.testing.expect(!comp.surfaceHasContent(1, 9));
+    const conns = try comp.connIds(std.testing.allocator);
+    defer std.testing.allocator.free(conns);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, conns);
+
+    rec.clear();
+    comp.replaySurfaces();
+    try rec.expect(&.{ "surface 1 6 1", "title 1 6 Hello", "interactive 1 6 2 0", "surface 1 9 2", "region 1 9 1" });
+    rec.clear();
+    comp.replaySeat();
+    try rec.expect(&.{"selection 0 0"}); // nobody holds the pointer: no image
+
+    // a pointer over the window with a shape: the image is replayed while it holds it
+    try S.send(&comp, &buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 20 } } });
+    try S.send(&comp, &buf, 20, 0, &.{.{ .new_id = 21 }}); // get_pointer
+    try S.send(&comp, &buf, 20, 1, &.{.{ .new_id = 22 }}); // get_keyboard
+    comp.pointerEnter(1, 6, 0, 0);
+    comp.keyboardEnter(1, 6);
+    comp.keyboardKey(1, 0, 42, true); // shift held
+    comp.pointerButton(1, 0, 0x110, true);
+    try S.send(&comp, &buf, 2, 0, &.{ .{ .uint = 9 }, .{ .new_id_dynamic = .{ .interface = "wp_cursor_shape_manager_v1", .version = 1, .id = 23 } } });
+    const enter_serial = comp.conns.get(1).?.pointer_enter_serial;
+    try S.send(&comp, &buf, 23, 1, &.{ .{ .new_id = 24 }, .{ .object = 21 } }); // get_pointer
+    try S.send(&comp, &buf, 24, 1, &.{ .{ .uint = enter_serial }, .{ .uint = 3 } }); // set_shape
+    rec.clear();
+    comp.replaySeat();
+    try rec.expect(&.{ "shape 1 3", "selection 0 0" });
+
+    // the embedder goes: pointer and keyboard leave, nothing held, suspended
+    rec.clear();
+    comp.embedderGone();
+    const c1 = comp.conns.get(1).?;
+    try std.testing.expectEqual(@as(u32, 0), c1.pointer_focus);
+    try std.testing.expectEqual(@as(u32, 0), c1.keyboard_focus);
+    try std.testing.expectEqual(@as(u32, 0), c1.buttons_held);
+    try std.testing.expectEqual(@as(u32, 0), c1.mods_depressed);
+    try std.testing.expectEqual(@as(u32, 0), c1.cursor_shape);
+    try std.testing.expect(comp.suspended);
+    try rec.expect(&.{"shape 1 0"}); // the pointer image reset with the leave
+    rec.clear();
+    comp.replaySeat();
+    try rec.expect(&.{"selection 0 0"});
+
+    // destroying the xdg_toplevel drops its title; the role-none surface is not replayed
+    try S.send(&comp, &buf, 8, comptime tl.requestIndex("destroy").?, &.{});
+    rec.clear();
+    comp.replaySurfaces();
+    try rec.expect(&.{ "surface 1 9 2", "region 1 9 1" });
 }

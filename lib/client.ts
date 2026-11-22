@@ -15,6 +15,7 @@ import { createView, watchOutput, type OutputControl, type OutputWatch, type Vie
 import { createInput, type Input } from './input.ts';
 import { createWindowManager, type WindowManager } from './wm.ts';
 import { createClipboardBridge, type ClipboardBridge } from './clipboard.ts';
+import { reconnecting } from './link-ws.ts';
 
 export * from './engine.ts';
 export * from './view.ts';
@@ -26,8 +27,15 @@ export interface WlandOptions {
   /** Windows live in here. A positioned, fixed-size box: its client size is
    *  the output size reported to apps. Its children belong to wland. */
   container: HTMLElement;
-  /** Default: createWsLink(`ws(s)://<location.host>/ws`). */
+  /** Default: createWsLink(`ws(s)://<location.host>/ws`), dialled again
+   *  after a drop while it is a session link (see `reconnect`). */
   link?: Link;
+  /** The default link only: when a session link (Engine.session(): a
+   *  `wlandr --profile session`, whose apps outlive the link) closes other
+   *  than by a takeover, connect again (backing off from 0.5 s to 10 s);
+   *  the relay sends the scene again. Default true. A passthrough link is
+   *  never reconnected (its apps went with it). */
+  reconnect?: boolean;
   /** The embedder's access to buffer handles (EngineOptions.buffers), for a
    *  relay running a handle backend. Buffer-source commits reach the view
    *  swizzled by the core when it presents with 2D only (EngineOptions.rgba),
@@ -177,17 +185,26 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
     input?.dispose();
     view.dispose();
   };
+  // the link is a session one (its scene synced since it opened): the
+  // default link reconnects after a drop while this holds (a failed
+  // attempt opens nothing and keeps it)
+  let sessionLink = false;
+  const defaultLink = () => {
+    const ws = createWsLink(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    return options.reconnect === false ? ws : reconnecting(ws, () => sessionLink && !disposed);
+  };
   try {
     engine = await createEngine({
       wasm: options.wasm,
-      link: options.link || createWsLink(
-        `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`),
+      link: options.link || defaultLink(),
       buffers: options.buffers,
       gpu: options.gpu,
       // a 2D-only view takes buffer-source commits swizzled by the core; a GL
       // view takes the rows as written (its shader swaps channels)
       rgba: !view.webgl,
       onEvent(ev) {
+        if (ev.type === 'open') sessionLink = false;
+        else if (ev.type === 'synced') sessionLink = true;
         // the view first: a commit's pixels are only valid during dispatch,
         // and may be invalid once anything has called back into the engine
         each(view.handle, ev);

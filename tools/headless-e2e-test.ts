@@ -177,6 +177,7 @@ let commits = 0, opened = false;
 const errors: string[] = [];
 const titles: string[] = [];
 const grabs: string[] = []; // 'move' / 'resize' events: the grabs the core started
+let synced = 0; // 'synced' events: scene replays of a session relay
 let hl!: Headless;
 
 /** Commits stopped arriving for `quiet` ms. */
@@ -415,8 +416,13 @@ async function foot() {
   hl.pointerMove(bx + 280, by + 50);
   await settle();
   const w1 = hl.windows()[0]!;
-  check(grabs.length === g0 && w1.x === w0.x && w1.width === w0.width,
+  // (a session relay's compositor may see the app's request between the
+  // press and the release, which cross as two messages: its 'resize' then
+  // comes, and the scene ignores it — no button is held here any more)
+  const quiet = hl.engine.session() ? true : grabs.length === g0;
+  check(quiet && w1.x === w0.x && w1.width === w0.width,
     `a quick click on the border: no grab (${grabs.slice(g0)}), the window stays ${w1.width} wide at x=${w1.x}`);
+  grabs.length = g0;
   hl.pointerMove(bx, by);
   hl.pointerDown();
   await until(() => grabs.length > g0, 5000, 'the resize request of a held press');
@@ -854,9 +860,61 @@ async function scale2() {
   hl.setOutput(hl.output.width, hl.output.height, 1);
 }
 
+/** A scene on the main relay's link (the page; again after a "reload"). */
+function attach(): Promise<Headless> {
+  return createHeadless({
+    link: `ws://127.0.0.1:${PORT}/ws`, width: 1280, height: 800,
+    onEvent(ev) {
+      if (ev.type === 'commit') commits++;
+      else if (ev.type === 'open') opened = true;
+      else if (ev.type === 'synced') synced++;
+      else if (ev.type === 'error') errors.push(ev.detail);
+      else if (ev.type === 'title') titles.push(ev.title);
+      else if (ev.type === 'move' || ev.type === 'resize') grabs.push(ev.type);
+    },
+  });
+}
+
+/** --profile session: the compositor is the relay's, so a viewer that goes
+ *  (a page reload) takes no app with it and the next one is sent the scene
+ *  as it is — a terminal's still image included, which no new commit brings. */
+async function reattach() {
+  console.log('== session: the viewer goes and another attaches (a page reload) ==');
+  const sid = hl.engine.session()?.id;
+  if (!sid) return console.log('  skipped: a passthrough relay (apps end with their link; --profile session keeps them)');
+  const spec = need('term');
+  if (!spec) return;
+  const app = runApp(spec);
+  const win = await oneWindow(spec.name);
+  hl.type(`printf '\\033]2;Before-Reload\\007'; echo KEPT\n`);
+  await until(() => titles.includes('Before-Reload'), 5000, 'foot to be retitled before the reload');
+  await settle();
+  const before = hl.screenshot();
+  hl.dispose();
+  await sleep(1500); // no viewer at all for a while
+  check(alive(app), 'the app outlives its viewer');
+  const s0 = synced;
+  hl = await attach();
+  await until(() => synced > s0, 10000, 'the scene replay (synced)');
+  check(hl.engine.session()?.id === sid, `the same session (${sid})`);
+  const again = hl.windows();
+  check(again.length === 1 && again[0]!.title === 'Before-Reload' && again[0]!.width === win.width && again[0]!.height === win.height,
+    `its window is back: "${again[0]?.title}" ${again[0]?.width}x${again[0]?.height}`);
+  await settle();
+  const after = hl.screenshot();
+  check(colours(after) >= 3 && colours(after) === colours(before), `with its content, from the replay (${colours(after)} colours sampled, ${colours(before)} before)`);
+  hl.click(again[0]!.x + again[0]!.width / 2, again[0]!.y + again[0]!.height / 2);
+  hl.type(`printf '\\033]2;After-Reload\\007'\n`);
+  await until(() => titles.includes('After-Reload'), 5000, 'foot to be retitled after the reload');
+  check(alive(app), 'input reaches it again: typed keys retitled the window');
+  await stop(app);
+  await noWindows();
+}
+
 async function gpu() {
   console.log('== a GPU client: dmabufs named as resources (--dmabuf virtgpu, test-only device) ==');
   if (realApps) return console.log('  skipped: fixtures only (virtgpu:@fake takes memfds, not a real GPU\'s dmabufs)');
+  if (RELAY.includes('session')) return console.log('  skipped: a session relay takes the copy backend only (no --dmabuf virtgpu yet)');
   const spec = need('dmabuf');
   if (!spec) return;
   // a relay of its own: the main one takes no dmabufs
@@ -963,16 +1021,7 @@ try {
     up = await fetch(`http://127.0.0.1:${PORT}/`).then(() => true, () => false);
     if (!up) await sleep(50);
   }
-  hl = await createHeadless({
-    link: `ws://127.0.0.1:${PORT}/ws`, width: 1280, height: 800,
-    onEvent(ev) {
-      if (ev.type === 'commit') commits++;
-      else if (ev.type === 'open') opened = true;
-      else if (ev.type === 'error') errors.push(ev.detail);
-      else if (ev.type === 'title') titles.push(ev.title);
-      else if (ev.type === 'move' || ev.type === 'resize') grabs.push(ev.type);
-    },
-  });
+  hl = await attach();
   await until(() => opened || !alive(relay), 10000, 'the link to open');
   check(opened, `link open: ws://127.0.0.1:${PORT}/ws (apps: ${appSet})`);
   await info();
@@ -987,6 +1036,7 @@ try {
   await nautilus();
   await x11();
   await scale2();
+  await reattach();
   await gpu();
   check(errors.length === 0, `no engine error events ${errors.join('; ')}`);
   console.log('HEADLESS-E2E PASS');

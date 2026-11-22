@@ -18,6 +18,7 @@ const virtgpu = @import("virtgpu.zig");
 const StreamLink = @import("stream_link.zig").StreamLink;
 const socket = @import("socket.zig");
 const xwayland = @import("xwayland.zig");
+const Session = @import("session.zig").Session;
 
 // libwayland clients connect to $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY, the name
 // defaulting to "wayland-0". With no --display we take the first free
@@ -27,16 +28,16 @@ const xwayland = @import("xwayland.zig");
 
 // The usage text matches the build: a -Dhttp=false relay has no HTTP options.
 const usage_synopsis = if (build_options.http)
-    \\usage: wlandr [--port N] [--host ADDR] [--web-root DIR] [--display NAME] [--dmabuf MODE] [--xwayland MODE]
+    \\usage: wlandr [--port N] [--host ADDR] [--web-root DIR] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--profile MODE]
     \\                 serve the browser compositor (HTTP + /ws)
-    \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand]
+    \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE]
     \\                 serve one engine over a byte stream, no HTTP
     \\       wlandr --version
     \\                 print the version and this build's features (below), exit 0
     \\
     \\
 else
-    \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand]
+    \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE]
     \\                 serve one engine over a byte stream (this build has no HTTP server: --link is required)
     \\       wlandr --version
     \\                 print the version and this build's features (below), exit 0
@@ -89,6 +90,12 @@ const usage_link =
     \\  --no-fence-wait  with --dmabuf virtgpu: send each COMMIT without first waiting (up to 100 ms)
     \\                   for the dmabuf's implicit write fences — for a device that delivers GPU work
     \\                   to the page ahead of the link's COMMIT on its own (unkernel: one channel)
+    \\  --profile MODE   who runs the compositor (default passthrough):
+    \\                   passthrough  the engine (the page's wasm core); apps go when its link does
+    \\                   session      this relay: apps outlive links, the engine is a viewer that
+    \\                                is sent the scene and sends input (one at a time, the newest
+    \\                                takes over). Needs --buffers copy and --dmabuf off or readback;
+    \\                                not with --link-on-demand
     \\  --xwayland MODE  X11 apps through xwayland-satellite, started with the first X client:
     \\
 ;
@@ -111,11 +118,12 @@ const usage_tail =
     \\On a --link stream, messages are length-prefixed records (protocol/STREAM.md) and
     \\wl_surface.frame callbacks are left to the engine (it fires them when it presents).
     \\When a reconnecting link drops, every app connected through it is disconnected (its
-    \\compositor state lived in that engine); apps connecting meanwhile wait for the next one.
+    \\compositor state lived in that engine); apps connecting meanwhile wait for the next one —
+    \\except with --profile session, where apps stay and the next link is sent the scene.
     \\--version prints `wlandr VERSION`, then `features:` and space-separated tokens, one per thing
     \\this build supports (tokens are only ever added): http, link:fd, link:unix, link:vsock,
     \\buffers:MODE and dmabuf:MODE per mode above, no-fence-wait, selection_cache, xwayland,
-    \\link-on-demand.
+    \\link-on-demand, profile:session.
     \\
 ;
 const usage = usage_synopsis ++ usage_display ++ usage_http ++ usage_link ++ usage_xwayland_default ++ usage_tail;
@@ -131,8 +139,9 @@ const features = blk: {
     for (@typeInfo(buffers.Kind).@"enum".fields) |m| f = f ++ " buffers:" ++ m.name;
     for (@typeInfo(std.meta.Tag(dmabuf.Backend)).@"enum".fields) |m| f = f ++ " dmabuf:" ++ m.name;
     // --no-fence-wait; STREAM FEATURE selection_cache (the clipboard
-    // bridge); --xwayland; --link-on-demand (with --link-timeout)
-    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand";
+    // bridge); --xwayland; --link-on-demand (with --link-timeout);
+    // --profile session
+    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand profile:session";
 };
 const version_text = "wlandr " ++ build_options.version ++ "\nfeatures: " ++ features ++ "\n";
 
@@ -181,7 +190,17 @@ const Options = struct {
     /// --link-timeout: the bound on an on-demand dial
     link_timeout_ms: u32 = default_link_timeout_ms,
     link_timeout_given: bool = false,
+    /// --profile: who runs the compositor
+    profile: Profile = .passthrough,
     http_address: Io.net.IpAddress = undefined,
+};
+
+/// `--profile`: STREAM.md "Profiles".
+const Profile = enum {
+    /// the engine runs the compositor (everything before session)
+    passthrough,
+    /// the relay does (session.zig); engines are viewers
+    session,
 };
 
 /// `--link-timeout` unset: an on-demand dial that has not connected by then
@@ -242,6 +261,12 @@ fn parseArgs(args: anytype, out: anytype) !Options {
                 return error.BadLinkTimeout;
             }
             o.link_timeout_given = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            const mode = args.next() orelse return error.MissingProfileValue;
+            o.profile = std.meta.stringToEnum(Profile, mode) orelse {
+                out.print("--profile takes passthrough or session, not {s}\n\n" ++ usage, .{mode});
+                return error.BadProfile;
+            };
         } else if (std.mem.eql(u8, arg, "--version")) {
             return error.Version;
         } else if (std.mem.eql(u8, arg, "--xwayland")) {
@@ -280,6 +305,24 @@ fn parseArgs(args: anytype, out: anytype) !Options {
     if (o.link_timeout_given and !o.on_demand) {
         out.print("--link-timeout applies to --link-on-demand only\n\n" ++ usage, .{});
         return error.LinkTimeoutNeedsOnDemand;
+    }
+    if (o.profile == .session) {
+        // v1 of the session host: pixels are BUFFER frames it keeps a copy
+        // of (STREAM.md "Profiles"); handles and GPU resources are not
+        if (o.buffer_mode != .copy) {
+            out.print("--profile session needs --buffers copy (not {t})\n\n" ++ usage, .{o.buffer_mode});
+            return error.SessionNeedsCopy;
+        }
+        if (o.dmabuf) |d| if (d.tag != .readback) {
+            out.print("--profile session takes --dmabuf readback only (not {t})\n\n" ++ usage, .{d.tag});
+            return error.SessionNeedsReadback;
+        };
+        if (o.on_demand) {
+            // apps never wait for a link in session (the compositor is
+            // here), so nothing would ever ask for the dial
+            out.print("--profile session does not take --link-on-demand: apps never wait for a link there\n\n" ++ usage, .{});
+            return error.SessionNotOnDemand;
+        }
     }
     if (!o.fence_wait and (o.dmabuf == null or o.dmabuf.?.tag != .virtgpu)) {
         // only virtgpu COMMITs wait; readback's read must see the GPU's writes
@@ -371,6 +414,14 @@ pub fn main(init: std.process.Init) !void {
     relay.* = .{ .io = io, .gpa = gpa, .backend = backend, .dmabuf = dmabuf_config };
     if (opts.on_demand) relay.on_demand = .{ .link_text = link_text };
     var wayland = try relay_mod.listenWayland(io, socket_path);
+    // session: the compositor runs here, on the relay's one lifelong link,
+    // before any app can connect (apps then never wait for an engine)
+    const session: ?*Session = if (opts.profile == .session) blk: {
+        const s = try Session.create(gpa, io);
+        try s.start(relay);
+        std.log.info("profile: session (id {x:0>16}): apps outlive links; engines are viewers", .{s.session_id});
+        break :blk s;
+    } else null;
 
     // X11 apps: on by default where a person runs apps by hand (the HTTP
     // server), off for a --link relay (scripts, tests, a guest) unless asked
@@ -394,11 +445,12 @@ pub fn main(init: std.process.Init) !void {
             .timeout_ms = opts.link_timeout_ms,
             .dmabuf = dmabuf_later,
             .fence_wait = opts.fence_wait,
+            .session = session,
         });
     }
     if (build_options.http) { // comptime: -Dhttp=false never compiles this
         const server = @import("server.zig");
-        const srv = server.Server.create(gpa, io, relay, .{ .address = http_address, .web_root = web_root }) catch |err| {
+        const srv = server.Server.create(gpa, io, relay, .{ .address = http_address, .web_root = web_root, .session = session }) catch |err| {
             if (err == error.AddressInUse) std.log.err("HTTP port {d} is in use (another wlandr? pass --port, or --port 0 for any free one)", .{port});
             if (err == error.AddressUnavailable) std.log.err("--host {s}: not an address of this machine", .{host});
             return err;
@@ -548,7 +600,14 @@ const DialOptions = struct {
     /// --dmabuf that did not resolve at startup: retried before each dial
     dmabuf: ?DmabufMode = null,
     fence_wait: bool = true,
+    /// --profile session: each link is a viewer of this session host
+    session: ?*Session = null,
 };
+
+/// One link's life: a viewer of the session host, or the relay's engine.
+fn serveOne(relay: *relay_mod.Relay, link: *@import("link.zig").Link, session: ?*Session) void {
+    if (session) |s| s.serveViewer(link) else relay_mod.serveLink(relay, link);
+}
 
 /// Run the relay over a byte-stream link. Frame callbacks: .engine — a
 /// stream link's engine is local to its host (the page, over vsock) and
@@ -576,7 +635,7 @@ fn serveStreamLink(relay: *relay_mod.Relay, spec: LinkSpec, text: []const u8, op
         const fd = spec.fd;
         var link: StreamLink = undefined;
         link.init(io, fd, .engine);
-        relay_mod.serveLink(relay, &link.link);
+        serveOne(relay, &link.link, opts.session);
         _ = linux.close(fd);
         std.log.info("link {s} closed, exiting", .{text});
         return;
@@ -613,7 +672,7 @@ fn serveStreamLink(relay: *relay_mod.Relay, spec: LinkSpec, text: []const u8, op
         std.log.info("link {s} connected", .{text});
         var link: StreamLink = undefined;
         link.init(io, fd, .engine);
-        relay_mod.serveLink(relay, &link.link);
+        serveOne(relay, &link.link, opts.session);
         _ = linux.close(fd);
         std.log.info("link {s} closed; {s}", .{ text, if (on_demand) "dialing again for the next app" else "reconnecting" });
     }
@@ -744,6 +803,8 @@ test {
     _ = @import("relay_test.zig");
     _ = @import("socket.zig");
     _ = @import("xwayland.zig");
+    _ = @import("session.zig");
+    _ = @import("session_test.zig");
     if (build_options.http) _ = @import("server.zig");
 }
 
@@ -829,6 +890,18 @@ test "arguments are validated whole, whatever their order, before anything is op
         try std.testing.expectEqual(@as(u32, 750), t.link_timeout_ms);
         try std.testing.expect(!(try tryArgs(&.{ "--link", "unix:/run/l" })).on_demand);
     }
+    // --profile session: the copy backend, dmabuf off or readback, no on-demand dial
+    try std.testing.expectEqual(Profile.passthrough, (try tryArgs(&.{ "--link", "fd:3" })).profile);
+    try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--link", "fd:3", "--profile", "session" })).profile);
+    try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--dmabuf", "readback" })).profile);
+    try std.testing.expectEqual(Profile.passthrough, (try tryArgs(&.{ "--link", "fd:3", "--profile", "passthrough", "--buffers", "kwshm" })).profile);
+    try std.testing.expectError(error.BadProfile, tryArgs(&.{ "--link", "fd:3", "--profile", "local" }));
+    try std.testing.expectError(error.MissingProfileValue, tryArgs(&.{ "--link", "fd:3", "--profile" }));
+    try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--link", "fd:3", "--buffers", "procfd", "--profile", "session" }));
+    try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--profile", "session", "--link", "vsock:2:1", "--buffers", "kwshm" }));
+    try std.testing.expectError(error.SessionNeedsReadback, tryArgs(&.{ "--profile", "session", "--link", "fd:3", "--dmabuf", "virtgpu" }));
+    try std.testing.expectError(error.SessionNotOnDemand, tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--link-on-demand" }));
+    if (build_options.http) try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--port", "0" })).profile);
     const o = try tryArgs(&.{ "--link", "vsock:2:1023", "--buffers", "kwshm", "--dmabuf", "virtgpu:/dev/dri/renderD129" });
     try std.testing.expectEqual(buffers.Kind.kwshm, o.buffer_mode);
     try std.testing.expectEqual(std.meta.Tag(dmabuf.Backend).virtgpu, o.dmabuf.?.tag);
@@ -853,7 +926,8 @@ test "the usage text matches the build" {
     try std.testing.expectEqual(build_options.http, has("--host ADDR"));
     try std.testing.expectEqual(build_options.http, has("--web-root DIR"));
     // the synopsis names every mode flag
-    try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand]"));
+    try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE]"));
+    try std.testing.expect(has("--profile MODE   who runs the compositor"));
     try std.testing.expect(has("--link-timeout MS  with --link-on-demand"));
     // the refusal line embedders match is the one documented
     try std.testing.expect(has("`" ++ relay_mod.refused_line ++ "SPEC"));
@@ -878,7 +952,7 @@ test "--version: the build's version, then one token per feature of this build" 
         }
     }.f;
     try std.testing.expectEqual(build_options.http, has(line, "http"));
-    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand" }) |t|
+    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand", "profile:session" }) |t|
         try std.testing.expect(has(line, t));
     try std.testing.expect(std.mem.indexOf(u8, line, "@fake") == null); // test-only, never offered
     try std.testing.expect(std.mem.indexOf(u8, line, "  ") == null); // no empty token

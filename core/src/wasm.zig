@@ -455,6 +455,9 @@ export fn wland_on_frame(ptr: [*]const u8, len: usize) void {
             .feature => |f| compositor.applyFeature(f.feature, f.bytes), // FEATURE: what the relay can do
             .dmabuf_created => logf("DMABUF_CREATED frame reached wasm — engine→relay only", .{}),
             .presented => logf("PRESENTED frame reached wasm — engine→relay only", .{}),
+            // session-profile frames: a session relay's (FEATURE session),
+            // whose compositor is its own — this core never takes part
+            .call, .event, .surface => logf("{t} frame reached wasm — session profile only (a session relay needs a viewer, not this core)", .{std.meta.activeTag(p.frame)}),
         }
     }
     flushOut();

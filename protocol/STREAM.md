@@ -1060,3 +1060,186 @@ a variable one).
 - No heartbeats. ACK (for COMMIT) is the only acknowledgement. Copy-mode pixel
   payloads above a size threshold are LZ4-compressed (BUFFER_LZ, 0x07);
   everything else ships uncompressed.
+
+## Profiles: passthrough and session
+
+A link runs in one of two profiles, fixed for the link's life.
+
+- **passthrough** (the default; everything above): the relay forwards
+  Wayland to the engine, whose compositor (the wasm core) holds every app's
+  state. A link that closes takes its apps with it.
+- **session** (`wlandr --profile session`): the compositor runs inside the
+  relay (the same core, hosted natively) and outlives links. The engine on
+  the other end is a *viewer*: it is sent the scene and sends input. A
+  viewer that goes away (a page reload) changes nothing for the apps; the
+  next one is sent the scene as it is now. One viewer at a time, the newest
+  takes over (the old one gets the takeover close, as in passthrough).
+
+The relay announces session with **FEATURE 4 = session**, the first frame
+of the link's first message; bytes: exactly 8, `u64 session_id`
+little-endian (random per relay run — a viewer keys state it keeps across
+reloads, window positions, by it; shown as 16 lowercase hex digits). A
+viewer honours it only among the link's leading FEATURE frames (one after
+any other frame is ignored: the link stays passthrough). No such frame:
+passthrough. An engine that does not know the feature must not be pointed
+at a session relay (it would meet frame types it cannot parse).
+
+On a session link:
+
+- **Never sent**: WIRE, FDMSG, SRVOBJ, DMABUF_CREATED, PRESENTED (they are
+  between the relay and its own compositor).
+- **Unchanged**: CONN_OPEN, CONN_CLOSE (relay→viewer only), BUFFER,
+  BUFFER_LZ, HANDLE_OPEN, HANDLE_CLOSE, COMMIT, ACK.
+- **New**: CALL (viewer→relay), EVENT and SURFACE (relay→viewer), below.
+  They mirror the core's embedder ABI (`core/src/wasm.zig`): a CALL is one
+  `wland_*` export call, an EVENT one `js_*` import call, SURFACE carries
+  what the synchronous `wland_surface_*` getters return.
+
+Initial version limits: the copy buffer backend only (`--buffers copy`,
+`--dmabuf` none or `readback`), so pixels are BUFFER / BUFFER_LZ and no
+COMMIT/ACK/HANDLE frame occurs; wlandr refuses other combinations with
+`--profile session`.
+
+### Argument encoding (CALL, EVENT)
+
+Arguments follow in the listed order, little-endian, unpadded: `u32`/`i32`
+4 bytes, `f64` 8 bytes, `bytes` = `u32 len` + `len` bytes. Fixed-point
+values (`*_fixed`, wl_fixed) and everything else mean what the wasm export
+or import of the same name means. A receiver skips an op it does not know
+(the frame is self-delimiting) and ignores bytes past the arguments it
+knows.
+
+### 0x0f CALL — an embedder call, viewer→relay only (session)
+
+```
+u8  type = 0x0f
+u16 op
+u32 len
+u8  args[len]
+```
+
+| op | call | args |
+| --- | --- | --- |
+| 1 | init | i32 scale, i32 scale_120 |
+| 2 | set_gpu_source | u32 has |
+| 3 | set_dpr | i32 scale, i32 scale_120 |
+| 4 | desktop_size | i32 w, i32 h |
+| 5 | set_suspended | u32 suspended |
+| 6 | pointer_enter | u32 conn, u32 surface, i32 x_fixed, i32 y_fixed |
+| 7 | pointer_leave | u32 conn |
+| 8 | pointer_motion | u32 conn, u32 time_ms, i32 x_fixed, i32 y_fixed, i32 dx, i32 dy, i32 dxu, i32 dyu, f64 utime |
+| 9 | pointer_lock_granted | u32 conn, u32 surface |
+| 10 | pointer_lock_lost | u32 conn |
+| 11 | pointer_button | u32 conn, u32 time_ms, u32 button, u32 pressed |
+| 12 | pointer_axis | u32 conn, u32 time_ms, u32 axis, i32 value_fixed, i32 value120 |
+| 13 | keyboard_enter | u32 conn, u32 surface |
+| 14 | keyboard_leave | u32 conn |
+| 15 | key | u32 conn, u32 time_ms, u32 evdev_key, u32 pressed |
+| 16 | keyboard_locks | u32 locks |
+| 17 | text_input_preedit | u32 conn, bytes text, i32 cursor_begin, i32 cursor_end |
+| 18 | text_input_commit_string | u32 conn, bytes text |
+| 19 | set_maximized | u32 conn, u32 surface, u32 on |
+| 20 | set_fullscreen | u32 conn, u32 surface, u32 on |
+| 21 | set_minimized | u32 conn, u32 surface, u32 on |
+| 22 | popup_dismiss | u32 conn, u32 surface |
+| 23 | request_resize | u32 conn, u32 surface, i32 w, i32 h |
+| 24 | drag_motion | u32 conn, u32 surface, u32 time_ms, i32 x_fixed, i32 y_fixed |
+| 25 | drag_drop | — |
+| 26 | drag_cancel | — |
+| 27 | set_selection | bytes packed (as wland_set_selection takes it; len 0 clears) |
+| 28 | read_selection | bytes mime, u32 read_id, u32 max_bytes |
+
+**init is the attach.** A viewer sends it once, first, when it has seen
+FEATURE session (followed by its set_gpu_source / desktop_size /
+set_suspended / keyboard_locks as it would call them on a fresh core). It
+does not reset the compositor: the relay applies the scale like set_dpr and
+answers with the **scene replay** — for every app conn a CONN_OPEN, for
+every surface its SURFACE and the EVENTs that describe it now
+(surface_event with its role, set_title, input_region, the interactive
+state kinds 2/6/8 that are set), parents before what hangs from them, then
+for every surface with content one BUFFER (or BUFFER_LZ) holding its whole
+current image as one damage rect, then the current cursor, text_input,
+pointer_lock, selection and keyboard_locks_state EVENTs, then EVENT
+`synced`. Nothing but the FEATURE frame(s) is sent to a viewer before its
+init; CALLs before init are ignored. Every init starts the SURFACE diffing
+afresh: the relay forgets the records it sent before (they were another
+viewer's, or an earlier init's), so the replay carries a SURFACE for every
+live surface — all of them, parents first, ahead of the replay's EVENTs —
+and later SURFACEs are relative to those. The replay is one consistent
+snapshot (taken in one step of the compositor); CALLs the viewer sends
+while it is still arriving (its window manager focusing toplevels as they
+map) are applied after it, in order.
+
+There is no tick: the relay runs the frame clock itself (frame callbacks
+and presentation feedback at its ~60 Hz pace while a viewer is attached,
+slowly while none is). There is no note_buffer_size: the relay notes the
+dims of every pixel frame itself, before the SURFACE that precedes it.
+
+set_selection and read_selection have no synchronous result: the outcome
+is the `selection` EVENT, respectively a `selection_data` EVENT (status 3
+when there was nothing to ask). A set_selection that changes nothing
+(refused: malformed, too large; or an empty one while an app owns the
+selection) is still answered with a `selection` EVENT naming the selection
+as it is.
+
+**When a viewer goes** (link closed or taken over) the relay ends what
+only it was holding up: the pointer leaves, the keyboard leaves (held keys
+and buttons are released), a pointer lock is lost, a drag is cancelled,
+pending selection reads are dropped, and the apps are told they are
+suspended until the next init.
+
+### 0x10 EVENT — an embedder event, relay→viewer only (session)
+
+```
+u8  type = 0x10
+u16 op
+u32 len
+u8  args[len]
+```
+
+| op | event | args |
+| --- | --- | --- |
+| 1 | log | bytes line |
+| 2 | set_title | u32 conn, u32 surface, bytes title |
+| 3 | surface_event | u32 conn, u32 surface, u32 value |
+| 4 | interactive | u32 conn, u32 surface, u32 kind, u32 value |
+| 5 | cursor_shape | u32 conn, u32 shape |
+| 6 | cursor_surface | u32 conn, u32 surface, i32 hx, i32 hy |
+| 7 | text_input | u32 conn, u32 active, i32 x, i32 y, i32 w, i32 h |
+| 8 | input_region | u32 conn, u32 surface, u32 infinite, u32 n, n × { i32 x, y, w, h } |
+| 9 | pointer_lock | u32 conn, u32 surface |
+| 10 | selection | u32 conn, bytes mimes (NUL-separated) |
+| 11 | selection_data | u32 read_id, u32 status, bytes data |
+| 12 | keyboard_locks_state | u32 locks (what wland_keyboard_locks_state returns; sent when it changes) |
+| 13 | synced | — (the scene replay that answered init is complete) |
+
+EVENTs keep the order the compositor made them in, relative to each other
+and to the pixel frames, CONN_OPEN/CONN_CLOSE and SURFACE frames around
+them. conn_close has no EVENT: CONN_CLOSE (0x04) is it.
+
+### 0x11 SURFACE — a surface's synchronous state, relay→viewer only (session)
+
+```
+u8  type = 0x11
+u32 conn_id
+u32 surface_id
+u32 role            ← wland_surface_role
+i32 scale           ← wland_surface_scale
+i32 view_w, view_h  ← wland_surface_view_w / _h
+u32 toplevel_state  ← wland_toplevel_state (of this surface)
+u32 root            ← wland_surface_root
+u32 parent          ← wland_surface_parent
+i32 abs_x, abs_y    ← wland_surface_abs_x / _y
+i32 z               ← wland_surface_z
+i32 geom_x, geom_y, geom_w, geom_h   ← wland_window_geometry (of this surface)
+```
+
+65 bytes. The viewer keeps the last one per (conn, surface) and answers the
+getters from it. The relay sends one whenever any field differs from what
+it last sent for that surface, and always **before** the EVENT or pixel
+frame that the viewer reads it for: after every step that can change
+compositor state it compares every live surface and sends the changed ones,
+ahead of that step's EVENTs and of the next pixel frame. A surface's
+record ends with its `surface_event` destroyed value or its conn's
+CONN_CLOSE. A SURFACE whose abs_x, abs_y or z differ from the previous one
+is what `wland_take_positions_dirty` reports.

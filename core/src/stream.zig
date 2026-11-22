@@ -37,6 +37,13 @@ pub const FrameType = enum(u8) {
     /// timestamp the relay writes (its CLOCK_MONOTONIC, less `age_us`)
     /// before passing it to the app.
     presented = 0x0e,
+    /// viewer→relay (session profile): one embedder call (`CallOp`).
+    call = 0x0f,
+    /// relay→viewer (session profile): one embedder event (`EventOp`).
+    event = 0x10,
+    /// relay→viewer (session profile): a surface's synchronous state
+    /// (`SurfaceFrame`).
+    surface = 0x11,
 };
 
 /// A damage rect, buffer px.
@@ -169,6 +176,11 @@ pub const FeatureKind = enum(u32) {
     /// neither and offers clients no selection of its own. Bytes: none (any
     /// are ignored).
     selection_cache = 3,
+    /// The link runs the session profile (STREAM.md "Profiles"): the
+    /// compositor lives in the relay and the engine is a viewer (CALL in,
+    /// EVENT and SURFACE out). Bytes: `u64 session_id` (random per relay
+    /// run).
+    session = 4,
 };
 
 /// FEATURE bytes of kind dmabuf_kind: `u32 buffer_kind` (BufferKind, the
@@ -492,6 +504,9 @@ pub const Frame = union(FrameType) {
     dmabuf_created: struct { conn_id: u32, params_id: u32, buffer_id: u32 },
     /// `bytes` is one wire message, the presented event (see stampPresented).
     presented: struct { conn_id: u32, age_us: u32, bytes: []const u8 },
+    call: OpFrame,
+    event: OpFrame,
+    surface: SurfaceFrame,
 };
 
 pub const ParseError = error{ Truncated, UnknownType, BadLength };
@@ -516,7 +531,7 @@ fn u32At(bytes: []const u8, off: usize) u32 {
 pub fn parseNext(bytes: []const u8) ParseError!Parsed {
     if (bytes.len < 1) return error.Truncated;
     const frame_type: FrameType = switch (bytes[0]) {
-        0x01...0x0e => @enumFromInt(bytes[0]),
+        0x01...0x11 => @enumFromInt(bytes[0]),
         else => return error.UnknownType,
     };
     switch (frame_type) {
@@ -671,8 +686,203 @@ pub fn parseNext(bytes: []const u8) ParseError!Parsed {
                 .bytes = bytes[presented_header_len..total],
             } }, .consumed = total };
         },
+        .call, .event => {
+            _ = try have(bytes, op_frame_header_len);
+            const len = u32At(bytes, 3);
+            const total = try have(bytes, @as(u64, op_frame_header_len) + len);
+            const f: OpFrame = .{ .op = std.mem.readInt(u16, bytes[1..3], .little), .args = bytes[op_frame_header_len..total] };
+            return .{ .frame = if (frame_type == .call) .{ .call = f } else .{ .event = f }, .consumed = total };
+        },
+        .surface => {
+            _ = try have(bytes, SurfaceFrame.len);
+            return .{ .frame = .{ .surface = SurfaceFrame.decode(bytes[0..SurfaceFrame.len]) }, .consumed = SurfaceFrame.len };
+        },
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session profile (STREAM.md "Profiles"): CALL, EVENT, SURFACE
+// ---------------------------------------------------------------------------
+
+/// 0x0f CALL / 0x10 EVENT: `op` raw (an unknown one still frames and is
+/// skipped), `args` encoded per the op's table row (`ArgReader`).
+pub const OpFrame = struct { op: u16, args: []const u8 };
+
+/// CALL / EVENT fixed part: type, u16 op, u32 len.
+pub const op_frame_header_len = 7;
+
+/// CALL `op`: one `wland_*` export of core/src/wasm.zig, args as listed in
+/// STREAM.md.
+pub const CallOp = enum(u16) {
+    init = 1,
+    set_gpu_source = 2,
+    set_dpr = 3,
+    desktop_size = 4,
+    set_suspended = 5,
+    pointer_enter = 6,
+    pointer_leave = 7,
+    pointer_motion = 8,
+    pointer_lock_granted = 9,
+    pointer_lock_lost = 10,
+    pointer_button = 11,
+    pointer_axis = 12,
+    keyboard_enter = 13,
+    keyboard_leave = 14,
+    key = 15,
+    keyboard_locks = 16,
+    text_input_preedit = 17,
+    text_input_commit_string = 18,
+    set_maximized = 19,
+    set_fullscreen = 20,
+    set_minimized = 21,
+    popup_dismiss = 22,
+    request_resize = 23,
+    drag_motion = 24,
+    drag_drop = 25,
+    drag_cancel = 26,
+    set_selection = 27,
+    read_selection = 28,
+    _,
+};
+
+/// EVENT `op`: one `js_*` import of core/src/wasm.zig (plus `synced`).
+pub const EventOp = enum(u16) {
+    log = 1,
+    set_title = 2,
+    surface_event = 3,
+    interactive = 4,
+    cursor_shape = 5,
+    cursor_surface = 6,
+    text_input = 7,
+    input_region = 8,
+    pointer_lock = 9,
+    selection = 10,
+    selection_data = 11,
+    keyboard_locks_state = 12,
+    synced = 13,
+    _,
+};
+
+/// Write a CALL or EVENT frame (header + `args`) into `out`; returns it.
+pub fn encodeOpFrame(out: []u8, frame_type: FrameType, op: u16, args: []const u8) []u8 {
+    std.debug.assert(frame_type == .call or frame_type == .event);
+    const total = op_frame_header_len + args.len;
+    std.debug.assert(out.len >= total);
+    out[0] = @intFromEnum(frame_type);
+    std.mem.writeInt(u16, out[1..3], op, .little);
+    std.mem.writeInt(u32, out[3..7], @intCast(args.len), .little);
+    @memcpy(out[op_frame_header_len..total], args);
+    return out[0..total];
+}
+
+/// CALL / EVENT arguments, encoded: little-endian, unpadded; `bytes` is a
+/// u32 length + the bytes. Appends to a caller-owned list.
+pub const ArgWriter = struct {
+    list: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+
+    pub fn u32_(self: ArgWriter, v: u32) !void {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .little);
+        try self.list.appendSlice(self.gpa, &b);
+    }
+    pub fn i32_(self: ArgWriter, v: i32) !void {
+        return self.u32_(@bitCast(v));
+    }
+    pub fn f64_(self: ArgWriter, v: f64) !void {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, @bitCast(v), .little);
+        try self.list.appendSlice(self.gpa, &b);
+    }
+    pub fn bytes(self: ArgWriter, v: []const u8) !void {
+        try self.u32_(@intCast(v.len));
+        try self.list.appendSlice(self.gpa, v);
+    }
+};
+
+/// Decode CALL / EVENT arguments in order; a field past the end is
+/// error.Truncated (bytes after the known fields are ignored).
+pub const ArgReader = struct {
+    rest: []const u8,
+
+    pub fn u32_(self: *ArgReader) error{Truncated}!u32 {
+        if (self.rest.len < 4) return error.Truncated;
+        defer self.rest = self.rest[4..];
+        return std.mem.readInt(u32, self.rest[0..4], .little);
+    }
+    pub fn i32_(self: *ArgReader) error{Truncated}!i32 {
+        return @bitCast(try self.u32_());
+    }
+    pub fn f64_(self: *ArgReader) error{Truncated}!f64 {
+        if (self.rest.len < 8) return error.Truncated;
+        defer self.rest = self.rest[8..];
+        return @bitCast(std.mem.readInt(u64, self.rest[0..8], .little));
+    }
+    pub fn bytes(self: *ArgReader) error{Truncated}![]const u8 {
+        const n = try self.u32_();
+        if (self.rest.len < n) return error.Truncated;
+        defer self.rest = self.rest[n..];
+        return self.rest[0..n];
+    }
+};
+
+/// 0x11 SURFACE: what the synchronous `wland_surface_*` getters of
+/// core/src/wasm.zig answer for one surface, as of when it was sent.
+pub const SurfaceFrame = struct {
+    conn_id: u32,
+    surface_id: u32,
+    role: u32,
+    scale: i32,
+    view_w: i32,
+    view_h: i32,
+    toplevel_state: u32,
+    root: u32,
+    parent: u32,
+    abs_x: i32,
+    abs_y: i32,
+    z: i32,
+    geom_x: i32,
+    geom_y: i32,
+    geom_w: i32,
+    geom_h: i32,
+
+    /// type + 16 four-byte fields
+    pub const len = 65;
+
+    pub fn encode(self: SurfaceFrame, out: *[len]u8) void {
+        out[0] = @intFromEnum(FrameType.surface);
+        const words = [16]u32{
+            self.conn_id,         self.surface_id,      self.role,           @bitCast(self.scale),
+            @bitCast(self.view_w), @bitCast(self.view_h), self.toplevel_state, self.root,
+            self.parent,          @bitCast(self.abs_x), @bitCast(self.abs_y), @bitCast(self.z),
+            @bitCast(self.geom_x), @bitCast(self.geom_y), @bitCast(self.geom_w), @bitCast(self.geom_h),
+        };
+        for (words, 0..) |w, i| std.mem.writeInt(u32, out[1 + i * 4 ..][0..4], w, .little);
+    }
+
+    pub fn decode(b: *const [len]u8) SurfaceFrame {
+        var w: [16]u32 = undefined;
+        for (&w, 0..) |*x, i| x.* = std.mem.readInt(u32, b[1 + i * 4 ..][0..4], .little);
+        return .{
+            .conn_id = w[0],
+            .surface_id = w[1],
+            .role = w[2],
+            .scale = @bitCast(w[3]),
+            .view_w = @bitCast(w[4]),
+            .view_h = @bitCast(w[5]),
+            .toplevel_state = w[6],
+            .root = w[7],
+            .parent = w[8],
+            .abs_x = @bitCast(w[9]),
+            .abs_y = @bitCast(w[10]),
+            .z = @bitCast(w[11]),
+            .geom_x = @bitCast(w[12]),
+            .geom_y = @bitCast(w[13]),
+            .geom_w = @bitCast(w[14]),
+            .geom_h = @bitCast(w[15]),
+        };
+    }
+};
 
 /// FEATURE fixed part: type, feature, len.
 pub const feature_header_len = 9;
@@ -964,6 +1174,15 @@ pub const Batch = struct {
 
     pub fn presented(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, age_us: u32, msg: []const u8) !void {
         _ = encodePresented(try self.frame(gpa, presented_header_len + msg.len), conn_id, age_us, msg);
+    }
+
+    /// A CALL or EVENT frame with already-encoded `args` (ArgWriter).
+    pub fn opFrame(self: *Batch, gpa: std.mem.Allocator, frame_type: FrameType, op: u16, args: []const u8) !void {
+        _ = encodeOpFrame(try self.frame(gpa, op_frame_header_len + args.len), frame_type, op, args);
+    }
+
+    pub fn surface(self: *Batch, gpa: std.mem.Allocator, f: SurfaceFrame) !void {
+        f.encode((try self.frame(gpa, SurfaceFrame.len))[0..SurfaceFrame.len]);
     }
 
     /// Close any open WIRE run and return everything batched so far.
@@ -1371,9 +1590,76 @@ test "hostile lengths are Truncated, never wrapped" {
     _ = encodeFeature(&fh, .linux_dmabuf, &.{});
     std.mem.writeInt(u32, fh[5..9], 0xffff_fffc, .little);
     try std.testing.expectError(error.Truncated, parse(&fh));
-    // the type space ends at 0x0e
-    try std.testing.expectError(error.UnknownType, parse(&.{0x0f}));
+    // a call with a huge len
+    try std.testing.expectError(error.Truncated, parse(&.{ 0x0f, 1, 0, 0xfc, 0xff, 0xff, 0xff }));
+    // the type space ends at 0x11
+    try std.testing.expectError(error.UnknownType, parse(&.{0x12}));
     try std.testing.expectError(error.UnknownType, parse(&.{0x00}));
+}
+
+test "session frames: call and event roundtrip with encoded args, unknown ops frame, truncation" {
+    const gpa = std.testing.allocator;
+    var args: std.ArrayList(u8) = .empty;
+    defer args.deinit(gpa);
+    const w: ArgWriter = .{ .list = &args, .gpa = gpa };
+    try w.u32_(7);
+    try w.i32_(-256);
+    try w.f64_(1234.5);
+    try w.bytes("héllo");
+    var buf: [64]u8 = undefined;
+    const call = encodeOpFrame(&buf, .call, @intFromEnum(CallOp.pointer_motion), args.items);
+    try std.testing.expectEqual(op_frame_header_len + 4 + 4 + 8 + 4 + 6, call.len);
+    const f = (try parse(call)).call;
+    try std.testing.expectEqual(CallOp.pointer_motion, @as(CallOp, @enumFromInt(f.op)));
+    var r: ArgReader = .{ .rest = f.args };
+    try std.testing.expectEqual(@as(u32, 7), try r.u32_());
+    try std.testing.expectEqual(@as(i32, -256), try r.i32_());
+    try std.testing.expectEqual(@as(f64, 1234.5), try r.f64_());
+    try std.testing.expectEqualStrings("héllo", try r.bytes());
+    try std.testing.expectError(error.Truncated, r.u32_());
+    try expectPrefixesTruncated(call);
+    // a bytes field longer than what is left
+    var short: ArgReader = .{ .rest = &.{ 9, 0, 0, 0, 1, 2 } };
+    try std.testing.expectError(error.Truncated, short.bytes());
+
+    // an event; an op nobody knows still frames (and is skipped)
+    const ev = encodeOpFrame(&buf, .event, 999, &.{ 1, 2, 3 });
+    const e = (try parse(ev)).event;
+    try std.testing.expectEqual(@as(u16, 999), e.op);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, e.args);
+    const synced = encodeOpFrame(&buf, .event, @intFromEnum(EventOp.synced), &.{});
+    try std.testing.expectEqual(@as(usize, 7), synced.len);
+    try std.testing.expectEqual(EventOp.synced, @as(EventOp, @enumFromInt((try parse(synced)).event.op)));
+}
+
+test "session frames: surface roundtrip (65 bytes), truncation, batch order" {
+    const gpa = std.testing.allocator;
+    const s: SurfaceFrame = .{
+        .conn_id = 1, .surface_id = 6, .role = 1, .scale = 2, .view_w = 0, .view_h = -1,
+        .toplevel_state = 5, .root = 6, .parent = 0, .abs_x = -25, .abs_y = 30, .z = -2,
+        .geom_x = 10, .geom_y = 11, .geom_w = 800, .geom_h = 600,
+    };
+    var out: [SurfaceFrame.len]u8 = undefined;
+    s.encode(&out);
+    try std.testing.expectEqual(@as(u8, 0x11), out[0]);
+    try std.testing.expectEqual(s, (try parse(&out)).surface);
+    try expectPrefixesTruncated(&out);
+
+    var b: Batch = .{};
+    defer b.deinit(gpa);
+    try b.wire(gpa, 1, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try b.surface(gpa, s);
+    try b.opFrame(gpa, .event, @intFromEnum(EventOp.surface_event), &.{ 1, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0 });
+    try b.wire(gpa, 1, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    var types: [4]FrameType = undefined;
+    var n: usize = 0;
+    var rest = b.finish();
+    while (rest.len > 0) : (n += 1) {
+        const p = try parseNext(rest);
+        types[n] = std.meta.activeTag(p.frame);
+        rest = rest[p.consumed..];
+    }
+    try std.testing.expectEqualSlices(FrameType, &.{ .wire, .surface, .event, .wire }, types[0..n]);
 }
 
 test "batch v2 helpers keep frame order" {

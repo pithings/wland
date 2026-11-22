@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const core = @import("core");
 const relay_mod = @import("relay.zig");
 const WsLink = @import("ws_link.zig").WsLink;
+const Session = @import("session.zig").Session;
 
 pub const Options = struct {
     /// Where HTTP listens: loopback unless asked (`--host`). Port 0: the
@@ -19,6 +20,9 @@ pub const Options = struct {
     address: Io.net.IpAddress = .{ .ip4 = .loopback(8080) },
     /// Directory served over HTTP — the built web client (vite dist output).
     web_root: []const u8 = "dist",
+    /// --profile session: each /ws link is a viewer of this host, not the
+    /// relay's engine
+    session: ?*Session = null,
 };
 
 /// Listen on `address` (IPv4 or IPv6; default 127.0.0.1, see `--host`) with
@@ -70,6 +74,7 @@ pub const Server = struct {
     relay: *relay_mod.Relay,
     web_root: []const u8,
     listener: Io.net.Server,
+    session: ?*Session = null,
 
     /// Heap-allocated because connection threads keep the pointer forever;
     /// a Server is never freed once serving starts.
@@ -79,7 +84,7 @@ pub const Server = struct {
         const web_root = try gpa.dupe(u8, opts.web_root);
         errdefer gpa.free(web_root);
         const listener = try listen(opts.address);
-        self.* = .{ .gpa = gpa, .io = io, .relay = relay, .web_root = web_root, .listener = listener };
+        self.* = .{ .gpa = gpa, .io = io, .relay = relay, .web_root = web_root, .listener = listener, .session = opts.session };
         // the actual port (--port 0): lib/index.ts startServer reads it here
         std.log.info("wlandr (core v{d}) listening on http://{f}", .{ core.version, listener.socket.address });
         return self;
@@ -140,8 +145,9 @@ fn handleConn(server: *Server, stream: Io.net.Stream) void {
                 ws.flush() catch return;
                 var link: WsLink = undefined;
                 link.init(io, &ws, stream);
-                // returns once no relay thread can touch `link` (or `ws`)
-                relay_mod.serveLink(server.relay, &link.link);
+                // returns once no relay (or session) thread can touch
+                // `link` (or `ws`)
+                if (server.session) |s| s.serveViewer(&link.link) else relay_mod.serveLink(server.relay, &link.link);
                 return;
             },
             .other => return,
