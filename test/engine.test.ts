@@ -185,6 +185,81 @@ test('engine runs without a DOM: registry, toplevel, title, commit, destroy', as
   assert.deepEqual(events.at(-1), { type: 'close', takenOver: true });
 });
 
+test('decorations \'server\': a toplevel that asks is configured server_side and a \'decoration\' event precedes its first commit; client_side asked undecorates; setBounds sends configure_bounds (the decorated area) and a configure', async () => {
+  const link = scriptedLink();
+  const events: any[] = [];
+  const engine = await createEngine({
+    wasm, link, decorations: 'server',
+    onEvent: (ev) => { events.push(ev.type === 'commit' ? { ...ev, pixels: null } : ev); },
+  });
+  engine.setOutput(1280, 720);
+  engine.setBounds(1000, 700, 980, 660); // before the link: applied at open
+  engine.start();
+  link.cb!.onOpen();
+  link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, new Uint8Array([...msg(1, 1, 2), ...msg(1, 0, 3)]))));
+  const g = globals(link.sent, 2);
+  const dm = g.zxdg_decoration_manager_v1;
+  assert.ok(dm, 'the decoration manager is advertised');
+  // compositor 4, xdg_wm_base (v6) 5, decoration manager 9; surface 6,
+  // xdg_surface 7, toplevel 8, decoration 10 — then the initial commit
+  link.sent.length = 0;
+  link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+    ...msg(2, 0, g.wl_compositor.name, 'wl_compositor', g.wl_compositor.version, 4),
+    ...msg(2, 0, g.xdg_wm_base.name, 'xdg_wm_base', g.xdg_wm_base.version, 5),
+    ...msg(2, 0, dm.name, 'zxdg_decoration_manager_v1', dm.version, 9),
+    ...msg(4, 0, 6),
+    ...msg(5, 2, 7, 6),
+    ...msg(7, 1, 8),
+    ...msg(9, 1, 10, 8),
+    ...msg(6, 6),
+  ]))));
+  assert.deepEqual(events.filter((e) => e.type === 'decoration'), [{ type: 'decoration', conn: CONN, surface: 6, decorated: true }]);
+  assert.equal(events.find((e) => e.type === 'commit'), undefined, 'told before any buffer');
+  // ([object, opcode, ...args])
+  let wire = wireEvents(link.sent, CONN);
+  assert.equal(wire.find((e) => e[0] === 10 && e[1] === 0)?.[2], 2, 'decoration.configure(server_side)');
+  assert.deepEqual(wire.find((e) => e[0] === 8 && e[1] === 2)?.slice(2), [980, 660], 'the decorated work area');
+
+  // setBounds: one area for both now; configure_bounds then a configure
+  link.sent.length = 0;
+  engine.setBounds(900, 600);
+  wire = wireEvents(link.sent, CONN);
+  assert.deepEqual(wire.map((e) => e.slice(0, 2)), [[8, 2], [8, 0], [7, 0]]);
+  assert.deepEqual(wire[0].slice(2), [900, 600]);
+  link.sent.length = 0;
+  engine.setBounds(900, 600, 0, 0); // the same: nothing
+  assert.equal(link.sent.length, 0);
+
+  // set_mode(client_side): honoured, told
+  events.length = 0;
+  link.cb!.onMessage(pack(wireFrame(CONN, msg(10, 1, 1))));
+  assert.deepEqual(events.filter((e) => e.type === 'decoration'), [{ type: 'decoration', conn: CONN, surface: 6, decorated: false }]);
+  engine.dispose();
+});
+
+test('decorations default (\'client\'): client_side for every toplevel, no \'decoration\' event', async () => {
+  const link = scriptedLink();
+  const events: any[] = [];
+  const engine = await createEngine({ wasm, link, onEvent: (ev) => { events.push(ev); } });
+  engine.start();
+  link.cb!.onOpen();
+  link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, new Uint8Array([...msg(1, 1, 2), ...msg(1, 0, 3)]))));
+  const g = globals(link.sent, 2);
+  const dm = g.zxdg_decoration_manager_v1;
+  link.sent.length = 0;
+  link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+    ...msg(2, 0, g.wl_compositor.name, 'wl_compositor', g.wl_compositor.version, 4),
+    ...msg(2, 0, g.xdg_wm_base.name, 'xdg_wm_base', g.xdg_wm_base.version, 5),
+    ...msg(2, 0, dm.name, 'zxdg_decoration_manager_v1', dm.version, 9),
+    ...msg(4, 0, 6), ...msg(5, 2, 7, 6), ...msg(7, 1, 8), ...msg(9, 1, 10, 8),
+    ...msg(10, 1, 2), // set_mode(server_side): asked, not given
+    ...msg(6, 6),
+  ]))));
+  assert.equal(wireEvents(link.sent, CONN).find((e) => e[0] === 10 && e[1] === 0)?.[2], 1);
+  assert.equal(events.find((e) => e.type === 'decoration'), undefined);
+  engine.dispose();
+});
+
 test('motion is coalesced and held back while the link is backed up', async () => {
   const link = scriptedLink();
   const engine = await createEngine({ wasm, link, onEvent: () => {} });

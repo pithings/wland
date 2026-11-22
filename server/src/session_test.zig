@@ -526,6 +526,113 @@ test "session: an app that leaves goes from the viewer as CONN_CLOSE; one that c
     }.pred);
 }
 
+const DecoWindow = struct { surface: u32, toplevel: u32, decoration: u32 };
+
+/// A toplevel (xdg_wm_base v4: configure_bounds) that makes its decoration
+/// object before its initial commit, as SDL, foot and Qt do; acked.
+fn openDecoWindow(rig: *Rig, c: *Client) !DecoWindow {
+    const registry = c.newId();
+    try c.send(1, comptime op("wl_display", .request, "get_registry"), &.{.{ .new_id = registry }});
+    try rig.roundtrip(c);
+    const compositor = try bind(c, registry, "wl_compositor", 6);
+    const wm = try bind(c, registry, "xdg_wm_base", 4);
+    const manager = try bind(c, registry, "zxdg_decoration_manager_v1", 1);
+    var w: DecoWindow = .{ .surface = c.newId(), .toplevel = undefined, .decoration = undefined };
+    try c.send(compositor, comptime op("wl_compositor", .request, "create_surface"), &.{.{ .new_id = w.surface }});
+    const xdg_surface = c.newId();
+    try c.send(wm, comptime op("xdg_wm_base", .request, "get_xdg_surface"), &.{ .{ .new_id = xdg_surface }, .{ .object = w.surface } });
+    w.toplevel = c.newId();
+    try c.send(xdg_surface, comptime op("xdg_surface", .request, "get_toplevel"), &.{.{ .new_id = w.toplevel }});
+    w.decoration = c.newId();
+    try c.send(manager, comptime op("zxdg_decoration_manager_v1", .request, "get_toplevel_decoration"), &.{ .{ .new_id = w.decoration }, .{ .object = w.toplevel } });
+    try c.send(w.surface, comptime op("wl_surface", .request, "commit"), &.{});
+    try rig.roundtrip(c);
+    const configure = c.last(xdg_surface, comptime op("xdg_surface", .event, "configure")) orelse return error.NoConfigure;
+    try c.send(xdg_surface, comptime op("xdg_surface", .request, "ack_configure"), &.{.{ .uint = std.mem.readInt(u32, configure.body[0..4], .little) }});
+    return w;
+}
+
+const deco_configure = op("zxdg_toplevel_decoration_v1", .event, "configure");
+const bounds_event = op("xdg_toplevel", .event, "configure_bounds");
+
+/// Wait until the app has had `n` decoration configures; the last one's mode.
+fn decoModeAfter(rig: *Rig, c: *Client, w: DecoWindow, n: usize) !u32 {
+    const Dc = struct { c: *Client, d: u32, n: usize };
+    try rig.until(Dc{ .c = c, .d = w.decoration, .n = n }, struct {
+        fn pred(x: Dc) bool {
+            return x.c.count(x.d, deco_configure) >= x.n;
+        }
+    }.pred);
+    return std.mem.readInt(u32, c.last(w.decoration, deco_configure).?.body[0..4], .little);
+}
+
+test "session: init carries the viewer's decorations — apps' toplevels are answered again before the replay, which carries `decorated`; set_bounds reaches the app; the next viewer's mode and bounds replace the last one's" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+
+    // an app maps before any viewer: client-side (the core's default)
+    const c = try rig.connect();
+    const w = try openDecoWindow(&rig, c);
+    try std.testing.expectEqual(@as(u32, 1), try decoModeAfter(&rig, c, w, 1));
+    const conn: u32 = 1;
+
+    // a viewer drawing frames: init's third word; the app is answered
+    // server_side, and the replay says decorated
+    const a = try rig.viewer();
+    try a.call(.init, &(le(1) ++ le(120) ++ le(1)));
+    try rig.synced(a);
+    try std.testing.expectEqual(@as(u32, 2), try decoModeAfter(&rig, c, w, 2));
+    const synced_at = a.findEvent(0, .synced).?;
+    const deco_at = a.findEvent(0, .decoration) orelse return error.NoDecorationEvent;
+    try std.testing.expect(deco_at < synced_at);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(1)), a.frames.items[deco_at].parse().event.args);
+    try std.testing.expect(a.findEvent(deco_at + 1, .decoration) == null); // told once
+
+    // set_bounds: a decorated toplevel gets the decorated area
+    try a.call(.set_bounds, &(le(800) ++ le(600) ++ le(780) ++ le(560)));
+    const Bc = struct { c: *Client, t: u32 };
+    try rig.until(Bc{ .c = c, .t = w.toplevel }, struct {
+        fn pred(x: Bc) bool {
+            const e = x.c.last(x.t, bounds_event) orelse return false;
+            return std.mem.readInt(i32, e.body[0..4], .little) == 780;
+        }
+    }.pred);
+    try std.testing.expectEqual(@as(i32, 560), std.mem.readInt(i32, c.last(w.toplevel, bounds_event).?.body[4..8], .little));
+    // a live change reaches the viewer: client_side asked
+    var mark = a.frames.items.len;
+    try c.send(w.decoration, comptime op("zxdg_toplevel_decoration_v1", .request, "set_mode"), &.{.{ .uint = 1 }});
+    try std.testing.expectEqual(@as(u32, 1), try decoModeAfter(&rig, c, w, 3));
+    const Lc = struct { v: *Viewer, from: usize };
+    try rig.until(Lc{ .v = a, .from = mark }, struct {
+        fn pred(x: Lc) bool {
+            return x.v.findEvent(x.from, .decoration) != null;
+        }
+    }.pred);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(w.surface) ++ le(0)), a.frames.items[a.findEvent(mark, .decoration).?].parse().event.args);
+    mark = a.frames.items.len;
+    try c.send(w.decoration, comptime op("zxdg_toplevel_decoration_v1", .request, "unset_mode"), &.{});
+    try std.testing.expectEqual(@as(u32, 2), try decoModeAfter(&rig, c, w, 4));
+    a.close();
+
+    // a viewer that predates decorations (init without the word): client-
+    // side again, the last viewer's bounds gone (the desktop's size), and
+    // nothing decorated in its replay
+    const b = try rig.viewer();
+    try b.init();
+    try rig.synced(b);
+    try std.testing.expectEqual(@as(u32, 1), try decoModeAfter(&rig, c, w, 5));
+    try std.testing.expect(b.findEvent(0, .decoration) == null);
+    try rig.until(Bc{ .c = c, .t = w.toplevel }, struct {
+        fn pred(x: Bc) bool {
+            const e = x.c.last(x.t, bounds_event) orelse return false;
+            return std.mem.readInt(i32, e.body[0..4], .little) == core.compositor.output_width;
+        }
+    }.pred);
+    try rig.roundtrip(c); // still connected
+}
+
 fn writeAll(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {

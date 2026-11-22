@@ -743,6 +743,7 @@ pub const CallOp = enum(u16) {
     set_selection = 27,
     read_selection = 28,
     close = 29,
+    set_bounds = 30,
     _,
 };
 
@@ -763,6 +764,7 @@ pub const EventOp = enum(u16) {
     synced = 13,
     set_app_id = 14,
     size_limits = 15,
+    decoration = 16,
     _,
 };
 

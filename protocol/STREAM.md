@@ -1109,7 +1109,11 @@ or import of the same name means. A receiver skips an op it does not know
 (the frame is self-delimiting) and ignores bytes past the arguments it
 knows. Ops are only ever added, never renumbered, so a peer that predates
 one just goes without it: a relay before CALL 29 ignores close (the app is
-not asked), a viewer before EVENTs 14–15 has no app ids or size hints.
+not asked), a viewer before EVENTs 14–15 has no app ids or size hints. An
+op's arguments may grow at the end the same way: init's `decorations` is
+ignored by a relay that predates it (toplevels stay client-side), and a
+viewer that predates it sends none (read as 0); a relay before CALL 30 /
+EVENT 16 keeps the output's size as the bounds and tells no decoration.
 
 ### 0x0f CALL — an embedder call, viewer→relay only (session)
 
@@ -1122,7 +1126,7 @@ u8  args[len]
 
 | op | call | args |
 | --- | --- | --- |
-| 1 | init | i32 scale, i32 scale_120 |
+| 1 | init | i32 scale, i32 scale_120, u32 decorations (1 = the viewer draws window frames: EngineOptions.decorations 'server'; 0 or absent = client-side) |
 | 2 | set_gpu_source | u32 has |
 | 3 | set_dpr | i32 scale, i32 scale_120 |
 | 4 | desktop_size | i32 w, i32 h |
@@ -1151,15 +1155,21 @@ u8  args[len]
 | 27 | set_selection | bytes packed (as wland_set_selection takes it; len 0 clears) |
 | 28 | read_selection | bytes mime, u32 read_id, u32 max_bytes |
 | 29 | close | u32 conn, u32 surface (xdg_toplevel.close to that toplevel) |
+| 30 | set_bounds | i32 w, i32 h, i32 decorated_w, i32 decorated_h (the work area: configure_bounds and the maximized size; 0×0 = the desktop's size, decorated 0×0 = w×h) |
 
 **init is the attach.** A viewer sends it once, first, when it has seen
 FEATURE session (followed by its set_gpu_source / desktop_size /
 set_suspended / keyboard_locks as it would call them on a fresh core). It
-does not reset the compositor: the relay applies the scale like set_dpr and
-answers with the **scene replay** — for every app conn a CONN_OPEN, for
+does not reset the compositor: the relay applies the scale like set_dpr,
+sets the decorations mode (apps outlive viewers: running toplevels whose
+mode it changes are answered again — their decoration configure, a
+configure — before the replay, which then carries the new state), drops
+the bounds a previous viewer set (the viewer sends its own set_bounds after
+init when it has any) and answers with the **scene replay** — for every app conn a CONN_OPEN, for
 every surface its SURFACE and the EVENTs that describe it now
 (surface_event with its role, set_title, set_app_id, input_region,
-size_limits unless all 0, the interactive state kinds 2/6/8 that are set),
+size_limits unless all 0, decoration when decorated, the interactive state
+kinds 2/6/8 that are set),
 parents before what hangs from them, then
 for every surface with content one BUFFER (or BUFFER_LZ) holding its whole
 current image as one damage rect, then the current cursor, text_input,
@@ -1218,6 +1228,7 @@ u8  args[len]
 | 13 | synced | — (the scene replay that answered init is complete) |
 | 14 | set_app_id | u32 conn, u32 surface, bytes app_id |
 | 15 | size_limits | u32 conn, u32 surface, i32 min_w, i32 min_h, i32 max_w, i32 max_h (a toplevel's committed set_min_size / set_max_size, window geometry px, 0 = unset; all 0 when its xdg_toplevel goes) |
+| 16 | decoration | u32 conn, u32 surface, u32 decorated (1: the toplevel was configured server_side, the viewer draws its frame; 0: client-side again) |
 
 EVENTs keep the order the compositor made them in, relative to each other
 and to the pixel frames, CONN_OPEN/CONN_CLOSE and SURFACE frames around

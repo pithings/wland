@@ -28,6 +28,9 @@ extern "env" fn js_set_app_id(conn_id: u32, surface_id: u32, ptr: [*]const u8, l
 /// A commit changed a toplevel's size hints (set_min_size / set_max_size),
 /// window geometry px, 0 = unset; all 0 when its xdg_toplevel went.
 extern "env" fn js_size_limits(conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void;
+/// A toplevel's decoration mode changed: decorated 1 = server_side (the
+/// embedder draws its frame), 0 = client-side again.
+extern "env" fn js_decoration(conn_id: u32, surface_id: u32, decorated: u32) void;
 extern "env" fn js_conn_close(conn_id: u32) void;
 /// value = role (0-4) on role change, 0xffffffff when the surface is destroyed.
 extern "env" fn js_surface_event(conn_id: u32, surface_id: u32, value: u32) void;
@@ -98,8 +101,10 @@ export fn wland_version() u32 {
 
 /// scale = browser devicePixelRatio rounded to an integer (≥1), advertised as
 /// wl_output.scale so apps render retina-crisp buffers; scale_120 = the
-/// fractional preferred scale (round(dpr × 120)) for wp_fractional_scale.
-export fn wland_init(scale: i32, scale_120: i32) void {
+/// fractional preferred scale (round(dpr × 120)) for wp_fractional_scale;
+/// decorations = 1 when the embedder draws window frames (toplevels that
+/// ask through xdg-decoration are configured server_side), 0 = never.
+export fn wland_init(scale: i32, scale_120: i32, decorations: u32) void {
     if (compositor_live) compositor.deinit();
     compositor = .init(gpa, null, sendWire, log);
     compositor_live = true;
@@ -110,6 +115,7 @@ export fn wland_init(scale: i32, scale_120: i32) void {
     compositor.title_fn = setTitle;
     compositor.app_id_fn = setAppId;
     compositor.size_limits_fn = sizeLimits;
+    compositor.decoration_fn = decoration;
     compositor.surface_fn = surfaceEvent;
     compositor.interactive_fn = interactive;
     compositor.cursor_shape_fn = cursorShape;
@@ -121,6 +127,7 @@ export fn wland_init(scale: i32, scale_120: i32) void {
     compositor.output_scale = std.math.clamp(scale, 1, 4);
     compositor.scale_120 = @max(1, scale_120);
     compositor.gpu_source = gpu_source;
+    compositor.decorations_server = decorations == 1;
     features_settled = false;
 }
 
@@ -158,6 +165,15 @@ export fn wland_set_dpr(scale: i32, scale_120: i32) void {
 /// Called at init and on browser window resize.
 export fn wland_desktop_size(w: i32, h: i32) void {
     compositor.setDesktopSize(w, h);
+    flushOut();
+}
+
+/// The work area for windows (configure_bounds, and a maximized toplevel's
+/// size), logical px: w×h for client-side toplevels, dw×dh for decorated
+/// ones (the embedder's workspace less its frame; 0×0 = w×h). 0×0 = the
+/// desktop's size. Configured toplevels whose area changed are told.
+export fn wland_set_bounds(w: i32, h: i32, dw: i32, dh: i32) void {
+    compositor.setBounds(w, h, dw, dh);
     flushOut();
 }
 
@@ -800,6 +816,11 @@ fn setAppId(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, app_id: []const u8)
 fn sizeLimits(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
     _ = ctx;
     js_size_limits(conn_id, surface_id, min_w, min_h, max_w, max_h);
+}
+
+fn decoration(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void {
+    _ = ctx;
+    js_decoration(conn_id, surface_id, @intFromBool(decorated));
 }
 
 fn log(ctx: ?*anyopaque, text: []const u8) void {

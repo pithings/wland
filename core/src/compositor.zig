@@ -40,9 +40,11 @@ pub const globals = [_]Global{
     // v3: foot refuses to start below that. Selection (clipboard) works via
     // the FDMSG pipe path; dnd requests are decoded but ignored.
     .{ .name = 7, .interface = "wl_data_device_manager", .version = 3 },
-    // the shell draws no window decorations (see 8bd3949) — every toplevel is answered
-    // client_side, which is what makes SSD-preferring apps (foot) draw their
-    // own CSD instead of mapping a bare window
+    // the core draws no window decorations: with decorations_server unset
+    // (the default) every toplevel is answered client_side (SSD-preferring
+    // apps such as foot draw their own CSD, as they would without the
+    // global); set, the embedder draws the frames and toplevels that hold a
+    // decoration object are answered server_side unless they ask otherwise
     .{ .name = 8, .interface = "zxdg_decoration_manager_v1", .version = 1 },
     // M9: named cursor shapes (fd-free). Apps name a shape; the browser maps
     // it to a CSS cursor on #desktop. v1 only — the XML is upstream's v2,
@@ -169,8 +171,14 @@ const axis_direction_identical: u32 = 0;
 // one logical wheel detent in value120 units
 const value120_per_notch: i32 = 120;
 
-// zxdg_toplevel_decoration_v1.mode — the only mode we ever configure
+// zxdg_toplevel_decoration_v1.mode
 const decoration_mode_client_side: u32 = 1;
+const decoration_mode_server_side: u32 = 2;
+// zxdg_toplevel_decoration_v1.error
+const decoration_err_unconfigured_buffer: u32 = 0;
+const decoration_err_already_constructed: u32 = 1;
+const decoration_err_orphaned: u32 = 2;
+const decoration_err_invalid_mode: u32 = 3;
 
 pub const output_width: i32 = 1280;
 pub const output_height: i32 = 720;
@@ -294,9 +302,15 @@ const Surface = struct {
     /// is the old one and must not be read back as the floating size
     size_serial: ?u32 = null,
     size_acked: bool = false,
-    /// zxdg_toplevel_decoration_v1 object id (0 = none); the mode is always
-    /// client_side, so only the id needs tracking
+    /// zxdg_toplevel_decoration_v1 object id (0 = none)
     decoration_id: u32 = 0,
+    /// The mode the client asked for (set_mode: client_side / server_side),
+    /// 0 = no preference (none yet, unset_mode, or its decoration went)
+    decoration_pref: u32 = 0,
+    /// The last mode configured was server_side: the embedder draws the
+    /// frame (what decoration_fn last told it). Back to false at the commit
+    /// after the decoration object goes, and when the xdg_toplevel goes.
+    decorated: bool = false,
     /// wp_viewport object id (0 = none). Crop+scale state below is
     /// double-buffered: set_source/set_destination write the *pending* copy,
     /// wl_surface.commit latches it into the *current* copy the embedder reads.
@@ -833,6 +847,13 @@ pub const Compositor = struct {
     /// set_max_size, double-buffered), window geometry px, 0 = unset; all
     /// four 0 again when its xdg_toplevel goes (if any was set).
     size_limits_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void = null,
+    /// A toplevel's decoration mode changed (Surface.decorated): true =
+    /// server_side was configured, the embedder draws its frame; false =
+    /// client-side again (set_mode, the embedder's setDecorations, its
+    /// decoration object or xdg_toplevel gone). Told at the configure that
+    /// carries the mode, so before the first buffer of a toplevel that made
+    /// its decoration object before its initial commit.
+    decoration_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void = null,
     /// Surface role changed (value = Role) or surface destroyed (value = destroyed_code).
     surface_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void = null,
     /// App-initiated interactive request the embedder must act on (window
@@ -918,6 +939,17 @@ pub const Compositor = struct {
     /// maximize configures use it. Updated by the embedder on window resize.
     desk_w: i32 = output_width,
     desk_h: i32 = output_height,
+    /// The embedder draws window frames (setDecorations; lib's
+    /// `decorations: 'server'`): a toplevel holding a decoration object is
+    /// configured server_side unless it asks for client_side. false (the
+    /// default): every toplevel is client_side.
+    decorations_server: bool = false,
+    /// The work area the embedder set (setBounds), w×h, 0×0 = unset (the
+    /// desktop's size): configure_bounds, and a maximized toplevel's size.
+    /// `deco_bounds` is the same for decorated toplevels (smaller by the
+    /// embedder's frame; 0×0 = `bounds`). The core adds no frame itself.
+    bounds: [2]i32 = .{ 0, 0 },
+    deco_bounds: [2]i32 = .{ 0, 0 },
     /// true while the browser tab is hidden — mapped v6 toplevels are told
     /// via the xdg_toplevel suspended state so they can stop rendering.
     suspended: bool = false,
@@ -1719,17 +1751,31 @@ pub const Compositor = struct {
         // is handled by the generic destructor block below.
         else if (std.mem.eql(u8, iface.name, "zxdg_decoration_manager_v1") and std.mem.eql(u8, msg.name, "get_toplevel_decoration")) {
             if (surfaceByToplevelId(conn, args[1].object)) |surface| {
+                // (the new object is already tracked: the error names it)
+                if (surface.decoration_id != 0) {
+                    return self.sendError(conn_id, args[0].new_id, decoration_err_already_constructed, "xdg_toplevel already has a decoration object");
+                }
+                // v1: not on a toplevel with a buffer attached or committed
+                if (surface.on_output or (surface.pending_attach orelse 0) != 0) {
+                    return self.sendError(conn_id, args[0].new_id, decoration_err_unconfigured_buffer, "xdg_toplevel has a buffer attached");
+                }
                 surface.decoration_id = args[0].new_id;
-                // mapped toplevels learn the mode now; unmapped ones get it
+                surface.decoration_pref = 0;
+                // configured toplevels learn the mode now; the others get it
                 // with their first configure (configureIfNeeded)
                 if (surface.configured) self.sendDecorationConfigure(conn_id, conn, surface);
             }
         } else if (std.mem.eql(u8, iface.name, "zxdg_toplevel_decoration_v1") and
             (std.mem.eql(u8, msg.name, "set_mode") or std.mem.eql(u8, msg.name, "unset_mode")))
         {
-            // the compositor picks the mode regardless of the request, and we
-            // never draw decorations — re-answer client_side
+            // a preference: the mode is ours to pick (decorationMode), and
+            // every request is answered with a configure once configured
+            const pref: u32 = if (std.mem.eql(u8, msg.name, "set_mode")) args[0].uint else 0;
+            if (pref != 0 and pref != decoration_mode_client_side and pref != decoration_mode_server_side) {
+                return self.sendError(conn_id, header.object_id, decoration_err_invalid_mode, "invalid decoration mode");
+            }
             if (surfaceByDecorationId(conn, header.object_id)) |surface| {
+                surface.decoration_pref = pref;
                 if (surface.configured) self.sendDecorationConfigure(conn_id, conn, surface);
             }
         } else if (std.mem.eql(u8, iface.name, "wp_cursor_shape_device_v1") and std.mem.eql(u8, msg.name, "set_shape")) {
@@ -1840,8 +1886,17 @@ pub const Compositor = struct {
                 latchFrameCallbacks(conn, header.object_id);
                 if (conn.feedbacks.items.len > 0) self.latchFeedbacks(conn_id, conn, header.object_id);
                 self.applyViewport(conn_id, conn, header.object_id);
+                if (conn.surfaces.getPtr(header.object_id)) |surface| {
+                    // xdg-decoration v1: no buffer before the first
+                    // decoration configure
+                    if (surface.decoration_id != 0 and !surface.configured and (surface.pending_attach orelse 0) != 0) {
+                        return self.sendError(conn_id, surface.decoration_id, decoration_err_unconfigured_buffer, "buffer attached before the first decoration configure");
+                    }
+                }
                 self.configureIfNeeded(conn_id, conn, header.object_id);
                 if (conn.surfaces.getPtr(header.object_id)) |surface| {
+                    // its decoration object went: client-side from here
+                    if (surface.decorated and surface.decoration_id == 0) self.setDecorated(conn_id, header.object_id, surface, false);
                     if (surface.geom_pending) |geom| {
                         // popups are placed from it (surfaceAbs)
                         if (!surface.geom_set or !std.mem.eql(i32, &surface.geom, &geom)) self.positions_dirty = true;
@@ -2011,6 +2066,13 @@ pub const Compositor = struct {
                             if (had_limits) {
                                 if (self.size_limits_fn) |f| f(self.ctx, conn_id, kv.key_ptr.*, 0, 0, 0, 0);
                             }
+                            // its decoration object must have gone first
+                            if (surface.decoration_id != 0) {
+                                self.sendError(conn_id, surface.decoration_id, decoration_err_orphaned, "xdg_toplevel destroyed before its decoration object");
+                                surface.decoration_id = 0;
+                                surface.decoration_pref = 0;
+                            }
+                            self.setDecorated(conn_id, kv.key_ptr.*, surface, false);
                         }
                         surface.role = .none;
                         surface.popup_id = 0;
@@ -2123,7 +2185,11 @@ pub const Compositor = struct {
                     self.textInputNotify(conn_id, conn);
                 }
             } else if (std.mem.eql(u8, iface.name, "zxdg_toplevel_decoration_v1")) {
-                if (surfaceByDecorationId(conn, header.object_id)) |surface| surface.decoration_id = 0;
+                // client-side again at the next commit (setDecorated there)
+                if (surfaceByDecorationId(conn, header.object_id)) |surface| {
+                    surface.decoration_id = 0;
+                    surface.decoration_pref = 0;
+                }
             } else if (std.mem.eql(u8, iface.name, "zwp_relative_pointer_v1")) {
                 conn.relative_pointers.remove(header.object_id);
             } else if (std.mem.eql(u8, iface.name, "wl_pointer")) {
@@ -2532,18 +2598,117 @@ pub const Compositor = struct {
         self.sendCurrentConfigure(conn_id, conn, surface);
     }
 
-    /// Answer a decoration-mode request on a mapped toplevel: the decoration
-    /// configure rides an xdg_surface configure cycle of its own. During the
-    /// INITIAL configure the mode is emitted inline instead (configureIfNeeded)
-    /// so it shares the toplevel's first cycle.
-    fn sendDecorationConfigure(self: *Compositor, conn_id: u32, conn: *Conn, surface: *Surface) void {
-        if (surface.decoration_id == 0 or surface.xdg_surface_id == 0) return;
+    /// The decoration mode a toplevel is configured with: server_side when
+    /// the embedder draws frames and the toplevel holds a decoration object
+    /// that didn't ask for client_side; client_side otherwise.
+    fn decorationMode(self: *const Compositor, surface: *const Surface) u32 {
+        if (!self.decorations_server or surface.decoration_id == 0) return decoration_mode_client_side;
+        return if (surface.decoration_pref == decoration_mode_client_side) decoration_mode_client_side else decoration_mode_server_side;
+    }
+
+    /// The work area a toplevel's configure_bounds and maximized size name:
+    /// the embedder's (setBounds; the decorated one for a decorated
+    /// toplevel), else the desktop's size.
+    fn boundsOf(self: *const Compositor, decorated: bool) [2]i32 {
+        return self.workArea(self.bounds, self.deco_bounds, decorated);
+    }
+
+    fn workArea(self: *const Compositor, b: [2]i32, d: [2]i32, decorated: bool) [2]i32 {
+        if (decorated and d[0] > 0) return d;
+        if (b[0] > 0) return b;
+        return .{ self.desk_w, self.desk_h };
+    }
+
+    fn sendBounds(self: *Compositor, conn_id: u32, conn: *Conn, surface: *Surface) void {
+        if (objVersion(conn, surface.toplevel_id) < 4) return;
+        const b = self.boundsOf(surface.decorated);
+        self.sendEvent(conn_id, surface.toplevel_id, "xdg_toplevel", "configure_bounds", &.{
+            .{ .int = b[0] }, .{ .int = b[1] },
+        });
+    }
+
+    /// zxdg_toplevel_decoration_v1.configure with the mode decorationMode
+    /// picks, and the embedder told when that changes `decorated`. The
+    /// caller sends the xdg_surface.configure that carries it.
+    fn sendDecorationMode(self: *Compositor, conn_id: u32, conn: *Conn, surface: *Surface) void {
+        const mode = self.decorationMode(surface);
         self.sendEvent(conn_id, surface.decoration_id, "zxdg_toplevel_decoration_v1", "configure", &.{
-            .{ .uint = decoration_mode_client_side },
+            .{ .uint = mode },
         });
-        self.sendEvent(conn_id, surface.xdg_surface_id, "xdg_surface", "configure", &.{
-            .{ .uint = nextSerial(conn) },
-        });
+        self.setDecorated(conn_id, surfaceIdOf(conn, surface), surface, mode == decoration_mode_server_side);
+    }
+
+    fn setDecorated(self: *Compositor, conn_id: u32, surface_id: u32, surface: *Surface, on: bool) void {
+        if (surface.decorated == on) return;
+        surface.decorated = on;
+        if (self.decoration_fn) |f| f(self.ctx, conn_id, surface_id, on);
+    }
+
+    /// Answer a decoration-mode request (or a mode the embedder changed) on
+    /// a configured toplevel: the decoration configure, the new
+    /// configure_bounds when the mode changed them (v4), then a toplevel
+    /// configure repeating its size and states and the xdg_surface
+    /// configure — a cycle of its own. During the INITIAL configure the
+    /// mode is emitted inline instead (configureIfNeeded) so it shares the
+    /// toplevel's first cycle.
+    fn sendDecorationConfigure(self: *Compositor, conn_id: u32, conn: *Conn, surface: *Surface) void {
+        if (surface.decoration_id == 0 or surface.xdg_surface_id == 0 or surface.toplevel_id == 0) return;
+        const before = self.boundsOf(surface.decorated);
+        self.sendDecorationMode(conn_id, conn, surface);
+        if (!std.mem.eql(i32, &before, &self.boundsOf(surface.decorated))) self.sendBounds(conn_id, conn, surface);
+        self.refreshFloatingSize(conn_id, conn, surface);
+        self.sendCurrentConfigure(conn_id, conn, surface);
+    }
+
+    /// Embedder: whether it draws window frames (lib's `decorations`).
+    /// Configured toplevels holding a decoration object whose mode this
+    /// changes are answered again at once (sendDecorationConfigure); the
+    /// others pick it up at their initial configure.
+    pub fn setDecorations(self: *Compositor, server: bool) void {
+        if (self.decorations_server == server) return;
+        self.decorations_server = server;
+        var it = self.conns.iterator();
+        while (it.next()) |kv| {
+            const conn = kv.value_ptr.*;
+            var sit = conn.surfaces.valueIterator();
+            while (sit.next()) |surface| {
+                if (surface.role != .toplevel or !surface.configured or surface.decoration_id == 0) continue;
+                if ((self.decorationMode(surface) == decoration_mode_server_side) == surface.decorated) continue;
+                self.sendDecorationConfigure(kv.key_ptr.*, conn, surface);
+            }
+        }
+    }
+
+    /// Embedder: the work area for windows (configure_bounds, v4, and the
+    /// size a maximized toplevel is configured to): w×h for client-side
+    /// toplevels, dw×dh for decorated ones (its workspace less its frame;
+    /// 0×0 = w×h). 0×0 = the desktop's size again. Configured toplevels
+    /// whose area changed get the new bounds and a configure (the size
+    /// repeated; a maximized one's is the new area).
+    pub fn setBounds(self: *Compositor, w: i32, h: i32, dw: i32, dh: i32) void {
+        const b: [2]i32 = if (w > 0 and h > 0) .{ w, h } else .{ 0, 0 };
+        const d: [2]i32 = if (dw > 0 and dh > 0) .{ dw, dh } else .{ 0, 0 };
+        if (std.mem.eql(i32, &b, &self.bounds) and std.mem.eql(i32, &d, &self.deco_bounds)) return;
+        const old_b = self.bounds;
+        const old_d = self.deco_bounds;
+        self.bounds = b;
+        self.deco_bounds = d;
+        var it = self.conns.iterator();
+        while (it.next()) |kv| {
+            const conn_id = kv.key_ptr.*;
+            const conn = kv.value_ptr.*;
+            var sit = conn.surfaces.valueIterator();
+            while (sit.next()) |surface| {
+                if (surface.role != .toplevel or !surface.configured or surface.toplevel_id == 0) continue;
+                const before = self.workArea(old_b, old_d, surface.decorated);
+                if (std.mem.eql(i32, &before, &self.boundsOf(surface.decorated))) continue;
+                // (a pre-v4 floating toplevel has nothing to hear)
+                if (objVersion(conn, surface.toplevel_id) < 4 and !surface.maximized) continue;
+                self.sendBounds(conn_id, conn, surface);
+                self.refreshFloatingSize(conn_id, conn, surface);
+                self.sendCurrentConfigure(conn_id, conn, surface);
+            }
+        }
     }
 
     /// Embedder resize handle dragged: ask the toplevel to adopt w×h
@@ -2601,9 +2766,11 @@ pub const Compositor = struct {
     /// maximized the window's box is still the big one (refreshFloatingSize
     /// is for callers that know it has been floating all along).
     fn sendCurrentConfigure(self: *Compositor, conn_id: u32, conn: *Conn, surface: *Surface) void {
+        // fullscreen: the desktop; maximized: the work area (setBounds)
+        const area = if (surface.fullscreen) [2]i32{ self.desk_w, self.desk_h } else self.boundsOf(surface.decorated);
         const big = surface.maximized or surface.fullscreen;
-        const w = if (big) self.desk_w else surface.last_w;
-        const h = if (big) self.desk_h else surface.last_h;
+        const w = if (big) area[0] else surface.last_w;
+        const h = if (big) area[1] else surface.last_h;
         var states: [4]u32 = undefined;
         self.sendToplevelConfigure(conn_id, conn, surface, w, h, self.toplevelStates(conn, surface, &states));
     }
@@ -2846,19 +3013,13 @@ pub const Compositor = struct {
                 for (wm_capabilities, 0..) |cap, i| std.mem.writeInt(u32, caps[i * 4 ..][0..4], cap, .little);
                 self.sendEvent(conn_id, surface.toplevel_id, "xdg_toplevel", "wm_capabilities", &.{.{ .array = &caps }});
             }
-            if (tlv >= 4) {
-                // recommend the usable desktop so apps don't open oversized
-                self.sendEvent(conn_id, surface.toplevel_id, "xdg_toplevel", "configure_bounds", &.{
-                    .{ .int = self.desk_w }, .{ .int = self.desk_h },
-                });
-            }
+            // recommend the work area so apps don't open oversized (the
+            // decorated one if the mode below is server_side)
+            self.setDecorated(conn_id, surface_id, surface, self.decorationMode(surface) == decoration_mode_server_side);
+            if (tlv >= 4) self.sendBounds(conn_id, conn, surface);
             // decoration mode next, so it rides the initial configure cycle
             // (sendToplevelConfigure carries the xdg_surface.configure)
-            if (surface.decoration_id != 0) {
-                self.sendEvent(conn_id, surface.decoration_id, "zxdg_toplevel_decoration_v1", "configure", &.{
-                    .{ .uint = decoration_mode_client_side },
-                });
-            }
+            if (surface.decoration_id != 0) self.sendDecorationMode(conn_id, conn, surface);
             if (surface.maximized or surface.fullscreen) {
                 // the app maximized / fullscreened itself before its first
                 // commit: it maps that way
@@ -3099,11 +3260,7 @@ pub const Compositor = struct {
             while (sit.next()) |surface| {
                 if (surface.role != .toplevel or !surface.configured or surface.toplevel_id == 0) continue;
                 if (!surface.maximized and !surface.fullscreen) continue;
-                if (objVersion(conn, surface.toplevel_id) >= 4) {
-                    self.sendEvent(conn_id, surface.toplevel_id, "xdg_toplevel", "configure_bounds", &.{
-                        .{ .int = nw }, .{ .int = nh },
-                    });
-                }
+                self.sendBounds(conn_id, conn, surface);
                 self.sendCurrentConfigure(conn_id, conn, surface);
             }
         }
@@ -4630,7 +4787,8 @@ pub const Compositor = struct {
     /// through: per conn (ascending), per surface (parents first) the
     /// surface_fn value it was last told (unless none), its title and app
     /// id, its input region (unless infinite, the default), its size hints
-    /// (unless none) and its set window states (interactive kinds 2, 6, 8).
+    /// (unless none), its decoration (when decorated) and its set window
+    /// states (interactive kinds 2, 6, 8).
     /// Pixels are the embedder's.
     pub fn replaySurfaces(self: *Compositor) void {
         const ids = self.connIds(self.gpa) catch return;
@@ -4658,6 +4816,9 @@ pub const Compositor = struct {
                 if (s.role == .toplevel) {
                     if (s.min_w != 0 or s.min_h != 0 or s.max_w != 0 or s.max_h != 0) {
                         if (self.size_limits_fn) |f| f(self.ctx, conn_id, surface_id, s.min_w, s.min_h, s.max_w, s.max_h);
+                    }
+                    if (s.decorated) {
+                        if (self.decoration_fn) |f| f(self.ctx, conn_id, surface_id, true);
                     }
                     if (self.interactive_fn) |f| {
                         if (s.maximized) f(self.ctx, conn_id, surface_id, 2, 0);
@@ -4884,6 +5045,18 @@ const TestSink = struct {
     app_id: [64]u8 = undefined,
     app_id_len: usize = 0,
     app_id_calls: u32 = 0,
+    // decoration_fn: last call + count
+    deco_surface: u32 = 0,
+    decorated: ?bool = null,
+    deco_calls: u32 = 0,
+
+    fn decoration(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        _ = conn_id;
+        self.deco_surface = surface_id;
+        self.decorated = decorated;
+        self.deco_calls += 1;
+    }
 
     fn sizeLimits(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, min_w: i32, min_h: i32, max_w: i32, max_h: i32) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx.?));
@@ -6123,60 +6296,325 @@ test "wp_fractional_scale: preferred_scale on bind, resend on dpr change, exists
     }
 }
 
-test "decoration: client_side rides the initial configure; set_mode re-answered; destroy unhooks" {
+/// wmBaseToplevel, plus zxdg_decoration_manager_v1 bound as 5 and, when
+/// `deco`, a decoration object 9 for toplevel 8 — all before the initial
+/// commit (the usual order: SDL, foot, Qt).
+fn decoToplevel(comp: *Compositor, conn_id: u32, deco: bool) !void {
+    var buf: [128]u8 = undefined;
+    try wmBaseToplevel(comp, conn_id);
+    try comp.onWire(conn_id, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 8 }, .{ .new_id_dynamic = .{ .interface = "zxdg_decoration_manager_v1", .version = 1, .id = 5 } } }));
+    if (deco) try comp.onWire(conn_id, wire.encodeMessage(&buf, 5, 1, &.{ .{ .new_id = 9 }, .{ .object = 8 } }));
+}
+
+const Deco = struct {
+    const tl = protocol.find("xdg_toplevel").?;
+    const caps: u32 = tl.eventIndex("wm_capabilities").?;
+    const bounds: u32 = tl.eventIndex("configure_bounds").?;
+    const cfg: u32 = tl.eventIndex("configure").?;
+    const xdg_cfg: u32 = protocol.find("xdg_surface").?.eventIndex("configure").?;
+    const deco_cfg: u32 = protocol.find("zxdg_toplevel_decoration_v1").?.eventIndex("configure").?;
+    const set_mode: u16 = protocol.find("zxdg_toplevel_decoration_v1").?.requestIndex("set_mode").?;
+    const unset_mode: u16 = protocol.find("zxdg_toplevel_decoration_v1").?.requestIndex("unset_mode").?;
+    const commit: u16 = protocol.find("wl_surface").?.requestIndex("commit").?;
+    const attach: u16 = protocol.find("wl_surface").?.requestIndex("attach").?;
+    const set_maximized: u16 = tl.requestIndex("set_maximized").?;
+
+    /// The sink's events to `conn_id` as (object, opcode) pairs.
+    fn seq(sink: *const TestSink, conn_id: u32, out: [][2]u32) [][2]u32 {
+        var n: usize = 0;
+        for (sink.events.items) |ev| {
+            if (ev.conn_id != conn_id) continue;
+            out[n] = .{ ev.object_id, ev.opcode };
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    fn expectSeq(sink: *const TestSink, conn_id: u32, want: []const [2]u32) !void {
+        var buf: [32][2]u32 = undefined;
+        const got = seq(sink, conn_id, &buf);
+        errdefer for (got) |g| std.debug.print("got: {d}.{d}\n", .{ g[0], g[1] });
+        try std.testing.expectEqualSlices([2]u32, want, got);
+    }
+
+    /// The first two 32-bit args of the last (object, opcode) event to `conn_id`.
+    fn last2(sink: *const TestSink, conn_id: u32, object: u32, opcode: u32) ![2]i32 {
+        var i = sink.events.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ev = sink.events.items[i];
+            if (ev.conn_id != conn_id or ev.object_id != object or ev.opcode != opcode) continue;
+            return .{ std.mem.readInt(i32, ev.bytes[8..12], .little), std.mem.readInt(i32, ev.bytes[12..16], .little) };
+        }
+        return error.NoEvent;
+    }
+
+    /// The mode of the last decoration configure to object `id` of `conn_id`.
+    fn mode(sink: *const TestSink, conn_id: u32, id: u32) !u32 {
+        return @intCast((try last2(sink, conn_id, id, deco_cfg))[0]);
+    }
+
+    fn send(comp: *Compositor, conn_id: u32, obj: u32, op: u16, args: []const wire.Value) !void {
+        var buf: [128]u8 = undefined;
+        try comp.onWire(conn_id, wire.encodeMessage(&buf, obj, op, args));
+    }
+};
+
+test "decoration, client mode (the default): client_side rides the initial configure whatever the app asks; every request re-answered with a configure cycle; never decorated; destroy unhooks" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.decoration_fn = TestSink.decoration;
+
+    try decoToplevel(&comp, 1, true);
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_server_side }}); // pre-map
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len); // nothing before the initial commit
+
+    try Deco.send(&comp, 1, 6, Deco.commit, &.{});
+    // caps, bounds, decoration.configure(client_side), xdg_toplevel.configure, xdg_surface.configure
+    try Deco.expectSeq(&sink, 1, &.{ .{ 8, Deco.caps }, .{ 8, Deco.bounds }, .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_client_side, try Deco.mode(&sink, 1, 9));
+
+    // post-map set_mode(server_side) → client_side again, in a cycle of its own
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_server_side }});
+    try Deco.expectSeq(&sink, 1, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_client_side, try Deco.mode(&sink, 1, 9));
+
+    // destroy → just delete_id; a fresh decoration (no buffer yet: allowed
+    // in v1) is answered at once, and its unset_mode too
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 9, 0, &.{}); // destroy
+    try Deco.expectSeq(&sink, 1, &.{.{ 1, 1 }}); // wl_display.delete_id
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 5, 1, &.{ .{ .new_id = 10 }, .{ .object = 8 } });
+    try Deco.send(&comp, 1, 10, Deco.unset_mode, &.{});
+    try Deco.expectSeq(&sink, 1, &.{ .{ 10, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg }, .{ 10, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_client_side, try Deco.mode(&sink, 1, 10));
+    try std.testing.expectEqual(@as(u32, 0), sink.deco_calls);
+}
+
+test "decoration, server mode: server_side by default at the initial configure (the embedder told then); set_mode(client_side) honoured, set_mode(server_side) and unset_mode give server_side; the object destroyed → client-side at the next commit" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.decoration_fn = TestSink.decoration;
+    comp.setDecorations(true);
+
+    try decoToplevel(&comp, 1, true);
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 6, Deco.commit, &.{});
+    try Deco.expectSeq(&sink, 1, &.{ .{ 8, Deco.caps }, .{ 8, Deco.bounds }, .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_server_side, try Deco.mode(&sink, 1, 9));
+    // known before the first buffer: an embedder picks its frame up front
+    try std.testing.expectEqual(@as(u32, 1), sink.deco_calls);
+    try std.testing.expectEqual(@as(?bool, true), sink.decorated);
+    try std.testing.expectEqual(@as(u32, 6), sink.deco_surface);
+    try Deco.send(&comp, 1, 6, Deco.attach, &.{ .{ .object = 30 }, .{ .int = 0 }, .{ .int = 0 } });
+    try Deco.send(&comp, 1, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(@as(u32, 1), sink.deco_calls);
+
+    // set_mode(client_side): honoured
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_client_side }});
+    try Deco.expectSeq(&sink, 1, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_client_side, try Deco.mode(&sink, 1, 9));
+    try std.testing.expectEqual(@as(u32, 2), sink.deco_calls);
+    try std.testing.expectEqual(@as(?bool, false), sink.decorated);
+    // set_mode(server_side): server_side
+    try Deco.send(&comp, 1, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_server_side }});
+    try std.testing.expectEqual(decoration_mode_server_side, try Deco.mode(&sink, 1, 9));
+    try std.testing.expectEqual(@as(u32, 3), sink.deco_calls);
+    try std.testing.expectEqual(@as(?bool, true), sink.decorated);
+    // unset_mode: our pick, server_side (answered; nothing new to tell)
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 9, Deco.unset_mode, &.{});
+    try Deco.expectSeq(&sink, 1, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_server_side, try Deco.mode(&sink, 1, 9));
+    try std.testing.expectEqual(@as(u32, 3), sink.deco_calls);
+
+    // destroyed: client-side at the next commit, not before
+    try Deco.send(&comp, 1, 9, 0, &.{});
+    try std.testing.expectEqual(@as(u32, 3), sink.deco_calls);
+    try Deco.send(&comp, 1, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(@as(u32, 4), sink.deco_calls);
+    try std.testing.expectEqual(@as(?bool, false), sink.decorated);
+    try Deco.send(&comp, 1, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(@as(u32, 4), sink.deco_calls);
+}
+
+test "decoration, server mode: a toplevel without a decoration object, or one asking client_side before its initial configure, is client-side; an xdg_toplevel going undecorates" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.decoration_fn = TestSink.decoration;
+    comp.setDecorations(true);
+
+    // no decoration object (GTK): nothing about decorations at all
+    try decoToplevel(&comp, 1, false);
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 1, 6, Deco.commit, &.{});
+    try Deco.expectSeq(&sink, 1, &.{ .{ 8, Deco.caps }, .{ 8, Deco.bounds }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(@as(u32, 0), sink.deco_calls);
+
+    // set_mode(client_side) before the initial commit: it maps client_side
+    try decoToplevel(&comp, 2, true);
+    try Deco.send(&comp, 2, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_client_side }});
+    try Deco.send(&comp, 2, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(decoration_mode_client_side, try Deco.mode(&sink, 2, 9));
+    try std.testing.expectEqual(@as(u32, 0), sink.deco_calls);
+
+    // a decorated toplevel whose objects go in order (decoration, then
+    // xdg_toplevel, no commit between): told false when the toplevel goes
+    try decoToplevel(&comp, 3, true);
+    try Deco.send(&comp, 3, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(@as(?bool, true), sink.decorated);
+    try Deco.send(&comp, 3, 9, 0, &.{});
+    try Deco.send(&comp, 3, 8, 0, &.{});
+    try std.testing.expectEqual(@as(?bool, false), sink.decorated);
+    try std.testing.expectEqual(@as(u32, 2), sink.deco_calls);
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+}
+
+test "decoration: setDecorations answers again the configured toplevels whose mode it changes, and only those" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.decoration_fn = TestSink.decoration;
+
+    try decoToplevel(&comp, 1, true); // no preference
+    try decoToplevel(&comp, 2, true);
+    try Deco.send(&comp, 2, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_client_side }});
+    try decoToplevel(&comp, 3, false); // no decoration object
+    try decoToplevel(&comp, 4, true); // not configured yet
+    for ([_]u32{ 1, 2, 3 }) |c| try Deco.send(&comp, c, 6, Deco.commit, &.{});
+
+    sink.events.clearRetainingCapacity();
+    comp.setDecorations(true);
+    try Deco.expectSeq(&sink, 1, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_server_side, try Deco.mode(&sink, 1, 9));
+    for ([_]u32{ 2, 3, 4 }) |c| try Deco.expectSeq(&sink, c, &.{});
+    try std.testing.expectEqual(@as(u32, 1), sink.deco_calls);
+    try std.testing.expectEqual(@as(?bool, true), sink.decorated);
+    // the unconfigured one picks the mode up at its initial configure
+    try Deco.send(&comp, 4, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(decoration_mode_server_side, try Deco.mode(&sink, 4, 9));
+    try std.testing.expectEqual(@as(u32, 2), sink.deco_calls);
+
+    sink.events.clearRetainingCapacity();
+    comp.setDecorations(true); // unchanged: nothing
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    comp.setDecorations(false);
+    try Deco.expectSeq(&sink, 1, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try Deco.expectSeq(&sink, 4, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual(decoration_mode_client_side, try Deco.mode(&sink, 1, 9));
+    for ([_]u32{ 2, 3 }) |c| try Deco.expectSeq(&sink, c, &.{});
+    try std.testing.expectEqual(@as(u32, 4), sink.deco_calls);
+    try std.testing.expectEqual(@as(?bool, false), sink.decorated);
+}
+
+test "decoration errors: already_constructed, a buffer attached before it is made or before its first configure (v1), orphaned, invalid_mode" {
     var sink: TestSink = undefined;
     var comp = testSetup(&sink);
     defer comp.deinit();
     defer sink.events.deinit(sink.gpa);
 
-    try comp.connOpen(1);
-    var buf: [128]u8 = undefined;
-    try comp.onWire(1, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }})); // get_registry
-    try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 1 }, .{ .new_id_dynamic = .{ .interface = "wl_compositor", .version = 4, .id = 3 } } }));
-    try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 6 }, .{ .new_id_dynamic = .{ .interface = "xdg_wm_base", .version = 1, .id = 4 } } }));
-    try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 8 }, .{ .new_id_dynamic = .{ .interface = "zxdg_decoration_manager_v1", .version = 1, .id = 5 } } }));
-    // surface 6 + xdg_surface 7 + toplevel 8 + decoration 9, decoration BEFORE first commit
-    try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 6 }}));
-    try comp.onWire(1, wire.encodeMessage(&buf, 4, 2, &.{ .{ .new_id = 7 }, .{ .object = 6 } })); // get_xdg_surface
-    try comp.onWire(1, wire.encodeMessage(&buf, 7, 1, &.{.{ .new_id = 8 }})); // get_toplevel
-    sink.events.clearRetainingCapacity();
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .new_id = 9 }, .{ .object = 8 } })); // get_toplevel_decoration
-    try comp.onWire(1, wire.encodeMessage(&buf, 9, 1, &.{.{ .uint = 2 }})); // set_mode(server_side), pre-map
-    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len); // nothing before map
+    // a second decoration object for the toplevel
+    try decoToplevel(&comp, 1, true);
+    try Deco.send(&comp, 1, 5, 1, &.{ .{ .new_id = 10 }, .{ .object = 8 } });
+    try std.testing.expectEqual(@as(?u32, decoration_err_already_constructed), lastErrorCode(&sink));
 
-    try comp.onWire(1, wire.encodeMessage(&buf, 6, 6, &.{})); // first commit
-    // decoration.configure(client_side) → xdg_toplevel.configure → xdg_surface.configure
-    try std.testing.expectEqual(@as(usize, 3), sink.events.items.len);
-    try std.testing.expectEqual(@as(u32, 9), sink.events.items[0].object_id);
-    var vals: [wire.max_args]wire.Value = undefined;
-    const ev = sink.events.items[0];
-    const args = try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{.uint}, &vals);
-    try std.testing.expectEqual(decoration_mode_client_side, args[0].uint);
-    try std.testing.expectEqual(@as(u32, 8), sink.events.items[1].object_id);
-    try std.testing.expectEqual(@as(u32, 7), sink.events.items[2].object_id);
+    // made with a buffer attached (pending), or committed
+    sink.events.clearRetainingCapacity();
+    try decoToplevel(&comp, 2, false);
+    try Deco.send(&comp, 2, 6, Deco.attach, &.{ .{ .object = 30 }, .{ .int = 0 }, .{ .int = 0 } });
+    try Deco.send(&comp, 2, 5, 1, &.{ .{ .new_id = 9 }, .{ .object = 8 } });
+    try std.testing.expectEqual(@as(?u32, decoration_err_unconfigured_buffer), lastErrorCode(&sink));
+    sink.events.clearRetainingCapacity();
+    try decoToplevel(&comp, 3, false);
+    try Deco.send(&comp, 3, 6, Deco.commit, &.{});
+    try Deco.send(&comp, 3, 6, Deco.attach, &.{ .{ .object = 30 }, .{ .int = 0 }, .{ .int = 0 } });
+    try Deco.send(&comp, 3, 6, Deco.commit, &.{});
+    try Deco.send(&comp, 3, 5, 1, &.{ .{ .new_id = 9 }, .{ .object = 8 } });
+    try std.testing.expectEqual(@as(?u32, decoration_err_unconfigured_buffer), lastErrorCode(&sink));
 
-    // post-map set_mode(server_side) → re-answered client_side + its own configure cycle
+    // a buffer committed before the first decoration configure
     sink.events.clearRetainingCapacity();
-    try comp.onWire(1, wire.encodeMessage(&buf, 9, 1, &.{.{ .uint = 2 }}));
-    try std.testing.expectEqual(@as(usize, 2), sink.events.items.len);
-    try std.testing.expectEqual(@as(u32, 9), sink.events.items[0].object_id);
-    const ev2 = sink.events.items[0];
-    const args2 = try wire.decodeArgs(ev2.bytes[wire.header_size..ev2.len], &.{.uint}, &vals);
-    try std.testing.expectEqual(decoration_mode_client_side, args2[0].uint);
-    try std.testing.expectEqual(@as(u32, 7), sink.events.items[1].object_id);
+    try decoToplevel(&comp, 4, true);
+    try Deco.send(&comp, 4, 6, Deco.attach, &.{ .{ .object = 30 }, .{ .int = 0 }, .{ .int = 0 } });
+    try Deco.send(&comp, 4, 6, Deco.commit, &.{});
+    try std.testing.expectEqual(@as(?u32, decoration_err_unconfigured_buffer), lastErrorCode(&sink));
 
-    // destroy the decoration object → just delete_id; a later set_mode on a
-    // fresh decoration for the same toplevel still works
+    // the xdg_toplevel destroyed before its decoration object
     sink.events.clearRetainingCapacity();
-    try comp.onWire(1, wire.encodeMessage(&buf, 9, 0, &.{})); // destroy
-    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
-    try std.testing.expectEqual(@as(u32, 1), sink.events.items[0].object_id);
-    try std.testing.expectEqual(@as(u16, 1), sink.events.items[0].opcode); // delete_id
+    try decoToplevel(&comp, 5, true);
+    try Deco.send(&comp, 5, 6, Deco.commit, &.{});
+    try Deco.send(&comp, 5, 8, 0, &.{});
+    try std.testing.expectEqual(@as(?u32, decoration_err_orphaned), lastErrorCode(&sink));
+
+    // a mode that is neither
     sink.events.clearRetainingCapacity();
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .new_id = 10 }, .{ .object = 8 } }));
-    try comp.onWire(1, wire.encodeMessage(&buf, 10, 2, &.{})); // unset_mode
-    try std.testing.expectEqual(@as(usize, 4), sink.events.items.len); // configure cycle × 2 (get + unset)
-    try std.testing.expectEqual(@as(u32, 10), sink.events.items[0].object_id);
+    try decoToplevel(&comp, 6, true);
+    try Deco.send(&comp, 6, 9, Deco.set_mode, &.{.{ .uint = 3 }});
+    try std.testing.expectEqual(@as(?u32, decoration_err_invalid_mode), lastErrorCode(&sink));
+}
+
+test "configure_bounds: setBounds is the work area (client-side and decorated toplevels apart), re-sent with a configure when it changes; a maximized toplevel is configured to it; 0×0 is the desktop again" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.desk_w = 1500;
+    comp.desk_h = 950;
+    comp.setDecorations(true);
+
+    try decoToplevel(&comp, 1, false); // client-side
+    try decoToplevel(&comp, 2, true); // decorated
+    sink.events.clearRetainingCapacity();
+    comp.setBounds(1400, 900, 1380, 860); // nothing configured yet: nothing sent
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    for ([_]u32{ 1, 2 }) |c| try Deco.send(&comp, c, 6, Deco.commit, &.{});
+    try std.testing.expectEqual([2]i32{ 1400, 900 }, try Deco.last2(&sink, 1, 8, Deco.bounds));
+    try std.testing.expectEqual([2]i32{ 1380, 860 }, try Deco.last2(&sink, 2, 8, Deco.bounds));
+
+    sink.events.clearRetainingCapacity();
+    comp.setBounds(1400, 900, 1380, 860); // unchanged
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    // only the client-side area changes: only conn 1 hears of it, bounds
+    // then a configure repeating its size (0×0: its own) and states
+    comp.setBounds(1200, 800, 1380, 860);
+    try Deco.expectSeq(&sink, 1, &.{ .{ 8, Deco.bounds }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual([2]i32{ 1200, 800 }, try Deco.last2(&sink, 1, 8, Deco.bounds));
+    try std.testing.expectEqual([2]i32{ 0, 0 }, try Deco.last2(&sink, 1, 8, Deco.cfg));
+    try Deco.expectSeq(&sink, 2, &.{});
+
+    // maximized: the decorated area, not the desktop
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 2, 8, Deco.set_maximized, &.{});
+    try std.testing.expectEqual([2]i32{ 1380, 860 }, try Deco.last2(&sink, 2, 8, Deco.cfg));
+    // client_side asked: the client-side area, its bounds sent again with it
+    sink.events.clearRetainingCapacity();
+    try Deco.send(&comp, 2, 9, Deco.set_mode, &.{.{ .uint = decoration_mode_client_side }});
+    try Deco.expectSeq(&sink, 2, &.{ .{ 9, Deco.deco_cfg }, .{ 8, Deco.bounds }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual([2]i32{ 1200, 800 }, try Deco.last2(&sink, 2, 8, Deco.bounds));
+    try std.testing.expectEqual([2]i32{ 1200, 800 }, try Deco.last2(&sink, 2, 8, Deco.cfg));
+
+    // 0×0: the desktop's size again, for both
+    sink.events.clearRetainingCapacity();
+    comp.setBounds(0, 0, 0, 0);
+    try std.testing.expectEqual([2]i32{ 1500, 950 }, try Deco.last2(&sink, 1, 8, Deco.bounds));
+    try std.testing.expectEqual([2]i32{ 1500, 950 }, try Deco.last2(&sink, 2, 8, Deco.bounds));
+    try std.testing.expectEqual([2]i32{ 1500, 950 }, try Deco.last2(&sink, 2, 8, Deco.cfg));
+    // and a desktop resize then reaches the maximized one as before
+    sink.events.clearRetainingCapacity();
+    comp.setDesktopSize(1600, 1000);
+    try Deco.expectSeq(&sink, 2, &.{ .{ 8, Deco.bounds }, .{ 8, Deco.cfg }, .{ 7, Deco.xdg_cfg } });
+    try std.testing.expectEqual([2]i32{ 1600, 1000 }, try Deco.last2(&sink, 2, 8, Deco.cfg));
 }
 
 /// Map a v6 toplevel: registry 2, wl_compositor 3, xdg_wm_base(v6) 4,
@@ -10070,6 +10508,9 @@ const ReplayRecorder = struct {
     fn lock(ctx: ?*anyopaque, c: u32, s: u32) void {
         of(ctx).add("lock {d} {d}", .{ c, s });
     }
+    fn decoration(ctx: ?*anyopaque, c: u32, s: u32, on: bool) void {
+        of(ctx).add("decoration {d} {d} {}", .{ c, s, on });
+    }
     fn expect(self: *const ReplayRecorder, want: []const []const u8) !void {
         errdefer for (self.lines.items) |l| std.debug.print("got: {s}\n", .{l});
         try std.testing.expectEqual(want.len, self.lines.items.len);
@@ -10077,7 +10518,7 @@ const ReplayRecorder = struct {
     }
 };
 
-test "replay: an embedder attaching later is told each surface (parents first: role, title, app id, input region, size hints, window states) and the seat (pointer image, lock, selection); embedderGone lets go of the seat and suspends" {
+test "replay: an embedder attaching later is told each surface (parents first: role, title, app id, input region, size hints, decoration, window states) and the seat (pointer image, lock, selection); embedderGone lets go of the seat and suspends" {
     var rec: ReplayRecorder = .{};
     defer rec.deinit();
     var comp = Compositor.init(std.testing.allocator, &rec, ReplayRecorder.send, ReplayRecorder.log);
@@ -10086,6 +10527,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     comp.title_fn = ReplayRecorder.title;
     comp.app_id_fn = ReplayRecorder.appId;
     comp.size_limits_fn = ReplayRecorder.limits;
+    comp.decoration_fn = ReplayRecorder.decoration;
     comp.interactive_fn = ReplayRecorder.interactive;
     comp.input_region_fn = ReplayRecorder.region;
     comp.selection_fn = ReplayRecorder.selection;
@@ -10100,8 +10542,13 @@ test "replay: an embedder attaching later is told each surface (parents first: r
             try c.onWire(1, wire.encodeMessage(b, obj, op, args));
         }
     };
-    // conn 1: toplevel surface 6 (xdg 7, toplevel 8), mapped with content
+    // conn 1: toplevel surface 6 (xdg 7, toplevel 8), mapped with content,
+    // decorated by the embedder (a decoration object 41 before its first
+    // commit)
+    comp.setDecorations(true);
     try wmBaseToplevel(&comp, 1);
+    try S.send(&comp, &buf, 2, 0, &.{ .{ .uint = 8 }, .{ .new_id_dynamic = .{ .interface = "zxdg_decoration_manager_v1", .version = 1, .id = 40 } } });
+    try S.send(&comp, &buf, 40, 1, &.{ .{ .new_id = 41 }, .{ .object = 8 } });
     try S.send(&comp, &buf, 6, comptime surf.requestIndex("commit").?, &.{});
     try S.send(&comp, &buf, 6, comptime surf.requestIndex("attach").?, &.{ .{ .object = 30 }, .{ .int = 0 }, .{ .int = 0 } });
     try S.send(&comp, &buf, 6, comptime surf.requestIndex("commit").?, &.{});
@@ -10130,7 +10577,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
 
     rec.clear();
     comp.replaySurfaces();
-    try rec.expect(&.{ "surface 1 6 1", "title 1 6 Hello", "app_id 1 6 hello.app", "limits 1 6 100 50 0 0", "interactive 1 6 2 0", "surface 1 9 2", "region 1 9 1" });
+    try rec.expect(&.{ "surface 1 6 1", "title 1 6 Hello", "app_id 1 6 hello.app", "limits 1 6 100 50 0 0", "decoration 1 6 true", "interactive 1 6 2 0", "surface 1 9 2", "region 1 9 1" });
     rec.clear();
     comp.replaySeat();
     try rec.expect(&.{"selection 0 0"}); // nobody holds the pointer: no image
@@ -10166,11 +10613,12 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     comp.replaySeat();
     try rec.expect(&.{"selection 0 0"});
 
-    // destroying the xdg_toplevel drops its title, app id and hints; the
-    // role-none surface is not replayed
+    // destroying the xdg_toplevel (its decoration first) drops its title,
+    // app id, hints and decoration; the role-none surface is not replayed
     rec.clear();
+    try S.send(&comp, &buf, 41, 0, &.{});
     try S.send(&comp, &buf, 8, comptime tl.requestIndex("destroy").?, &.{});
-    try rec.expect(&.{ "limits 1 6 0 0 0 0", "surface 1 6 0" });
+    try rec.expect(&.{ "limits 1 6 0 0 0 0", "decoration 1 6 false", "surface 1 6 0" });
     rec.clear();
     comp.replaySurfaces();
     try rec.expect(&.{ "surface 1 9 2", "region 1 9 1" });

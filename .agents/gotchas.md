@@ -473,6 +473,28 @@ with it. New findings go in the matching section.
   the commit (a client may set the pair in either order before it), and
   then nothing is applied. Title and app id are not double-buffered: they
   go out at the request.
+- **Decoration mode is the embedder's** (`decorations_server`, wasm
+  `wland_init`'s third arg / session CALL init's third word): unset, every
+  zxdg_toplevel_decoration_v1 is answered client_side (the global stays
+  advertised: see plan.md, it changes nothing for apps but is what SDL
+  2.32.4 hangs on); set, server_side unless the app asked client_side
+  (`decorationMode`). `Surface.decorated` is what the embedder was told
+  (decoration_fn → 'decoration'): set at the configure that carries the
+  mode — the initial one rides configureIfNeeded, so an app that made its
+  decoration object first is decorated before its first buffer — false at
+  the commit after the object goes and when the xdg_toplevel goes. Every
+  later answer (set_mode, unset_mode, a new object, setDecorations) is
+  decoration.configure + configure_bounds when the area changed + a
+  toplevel configure repeating the size + xdg_surface.configure. v1 errors
+  are enforced: already_constructed, unconfigured_buffer (made on a
+  toplevel with a buffer attached/committed, or a buffer before its first
+  configure), orphaned (xdg_toplevel destroyed first), invalid_mode.
+- **Bounds are the work area** (`setBounds`, `boundsOf`): configure_bounds
+  AND the maximized size (sendCurrentConfigure), with a separate pair for
+  decorated toplevels (the embedder's frame is outside their geometry);
+  fullscreen is always the desktop. 0×0 = the desktop's size. One area for
+  all windows, not per toplevel: a per-window value would arrive only
+  after the initial configure the embedder hears of the window at.
 - **`activated` is keyboard focus** (`toplevelStates`, in every toplevel
   configure): keyboardEnter/Leave send a configure repeating the size.
   Chromium reads "is this window active" from it, not from wl_keyboard. The
@@ -654,7 +676,12 @@ with it. New findings go in the matching section.
   `replaySurfaces` (a viewer that attaches later is told it). CALLs are
   one-way: nothing may need a return value. Getters answer from the
   SURFACE mirror, a fixed 65-byte frame: new per-surface state travels as
-  an EVENT instead (size hints did), which an older peer skips.
+  an EVENT instead (size hints did), which an older peer skips. State the
+  replay must already reflect (the decorations mode) rides init itself, as
+  an argument appended at the end (an older relay ignores it, an older
+  viewer sends none): a CALL after init would reach the relay after the
+  replay, and the apps would be answered twice. What a viewer sets that the
+  next viewer may not (bounds) is reset by the relay at init.
 - **wasm `u32` import args arrive in JS as signed `i32`.** Compare sentinels and
   conn ids with `>>> 0` (`0xffffffff` arrived as −1: the destroy path was dead
   code since day one).

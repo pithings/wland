@@ -65,7 +65,7 @@ const MAX_MIME = 256, MAX_MIMES = 32, MAX_SELECTION = 64 << 20; // core/src/comp
 // CALL ops whose arguments are numbers only: export → [op, argument kinds]
 // (u u32, i i32, d f64), in the export's argument order
 const CALLS: Record<string, readonly [number, string]> = {
-  wland_init: [1, 'ii'],
+  wland_init: [1, 'iiu'],
   wland_set_gpu_source: [2, 'u'],
   wland_set_dpr: [3, 'ii'],
   wland_desktop_size: [4, 'ii'],
@@ -90,6 +90,7 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_drag_drop: [25, ''],
   wland_drag_cancel: [26, ''],
   wland_close: [29, 'uu'],
+  wland_set_bounds: [30, 'iiii'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
 
@@ -255,6 +256,10 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
       case 15: {
         const conn = a.u32(), surface = a.u32(), minW = a.i32(), minH = a.i32(), maxW = a.i32(), maxH = a.i32();
         return env.js_size_limits(conn, surface, minW, minH, maxW, maxH);
+      }
+      case 16: {
+        const conn = a.u32(), surface = a.u32(), decorated = a.u32();
+        return env.js_decoration(conn, surface, decorated);
       }
       default: return; // an op this viewer does not know: skipped
     }

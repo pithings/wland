@@ -84,12 +84,12 @@ function taker(link: ScriptedLink) {
   return () => framesOf(link.sent.splice(0)).map(hex);
 }
 
-async function setup(prepare?: (engine: Engine) => void) {
+async function setup(prepare?: (engine: Engine) => void, decorations?: 'client' | 'server') {
   const link = scriptedLink();
   const events: any[] = [];
   let engine!: Engine;
   engine = await createEngine({
-    wasm, link,
+    wasm, link, decorations,
     onEvent: (ev: Event) => {
       // pixels are a view valid during dispatch only; session() as seen then
       events.push(ev.type === 'commit' ? { ...ev, pixels: ev.pixels.slice() } : ev.type === 'disconnect' ? { ...ev, session: engine.session() } : ev);
@@ -115,13 +115,35 @@ test('FEATURE session: init goes out first, then the attach calls; session() has
   link.cb!.onMessage(msg(feature(3), feature(4, u64(SID))));
   assert.deepEqual(engine.session(), { id: '0123456789abcdef' });
   assert.deepEqual(take(), [
-    call(1, i32(2, 240)),
+    call(1, i32(2, 240), u32(0)),
     call(2, u32(0)),
     call(4, i32(1280, 720)),
     call(5, u32(1)),
     call(16, u32(3)),
   ].map(hex));
   assert.equal(engine.selectionBridged(), true);
+});
+
+test('decorations \'server\' rides init (its third word), bounds follow as set_bounds; later setBounds is CALL 30; EVENT 16 is a decoration event', async () => {
+  const { link, events, engine, take } = await setup((e) => {
+    e.setOutput(1280, 720);
+    e.setBounds(1200, 700, 1180, 660);
+  }, 'server');
+  link.cb!.onMessage(msg(feature(4, u64(SID))));
+  assert.deepEqual(take(), [
+    call(1, i32(1, 120), u32(1)),
+    call(2, u32(0)),
+    call(4, i32(1280, 720)),
+    call(30, i32(1200, 700, 1180, 660)),
+  ].map(hex));
+  engine.setBounds(0, 0);
+  assert.deepEqual(take(), [call(30, i32(0, 0, 0, 0))].map(hex));
+  events.length = 0;
+  link.cb!.onMessage(msg(connOpen(7), surface(7, 10, { role: 1, root: 10 }), event(16, u32(7, 10, 1)), event(16, u32(7, 10, 0)), event(13)));
+  assert.deepEqual(events.filter((e) => e.type === 'decoration'), [
+    { type: 'decoration', conn: 7, surface: 10, decorated: true },
+    { type: 'decoration', conn: 7, surface: 10, decorated: false },
+  ]);
 });
 
 test('scene replay: surfaces, titles, regions, states and commits from the SURFACE mirror, then synced', async () => {
@@ -137,6 +159,7 @@ test('scene replay: surfaces, titles, regions, states and commits from the SURFA
     event(14, u32(7, 10), bytes('org.codeberg.dnkl.foot')),
     event(8, u32(7, 10, 0, 2), i32(1, 2, 3, 4, 10, 20, 30, 40)),
     event(15, u32(7, 10), i32(120, 40, 0, 0)),
+    event(16, u32(7, 10, 1)),
     event(4, u32(7, 10, 2, 0)),
     surface(7, 11, { role: 2, scale: 2, root: 10, parent: 10, x: 4, y: 5, z: 1 }),
     event(3, u32(7, 11, 2)),
@@ -149,14 +172,15 @@ test('scene replay: surfaces, titles, regions, states and commits from the SURFA
     event(13),
   ));
   const types = events.map((e) => e.type);
-  assert.deepEqual(types, ['surface', 'title', 'app-id', 'input-region', 'size-limits', 'maximize', 'surface', 'commit', 'commit', 'cursor', 'selection', 'synced']);
+  assert.deepEqual(types, ['surface', 'title', 'app-id', 'input-region', 'size-limits', 'decoration', 'maximize', 'surface', 'commit', 'commit', 'cursor', 'selection', 'synced']);
   assert.deepEqual(events[0], { type: 'surface', conn: 7, surface: 10, role: 1, root: 10, parent: 0, z: 0 });
   assert.deepEqual(events[1], { type: 'title', conn: 7, surface: 10, title: 'foot' });
   assert.deepEqual(events[2], { type: 'app-id', conn: 7, surface: 10, appId: 'org.codeberg.dnkl.foot' });
   assert.deepEqual(events[3].region && [...events[3].region], [1, 2, 3, 4, 10, 20, 30, 40]);
   assert.deepEqual(events[4], { type: 'size-limits', conn: 7, surface: 10, minW: 120, minH: 40, maxW: 0, maxH: 0 });
+  assert.deepEqual(events.at(5), { type: 'decoration', conn: 7, surface: 10, decorated: true });
   events.splice(2, 1);
-  events.splice(3, 1);
+  events.splice(3, 2);
   assert.deepEqual(events[3], { type: 'maximize', conn: 7, surface: 10, maximized: true });
   assert.deepEqual(events[4], { type: 'surface', conn: 7, surface: 11, role: 2, root: 10, parent: 10, z: 1 });
   const top = events[5];
@@ -326,7 +350,7 @@ test('link close in session: disconnects stay local (session() null), nothing se
   link.cb!.onMessage(msg(feature(4, u64(SID + 1n))));
   assert.deepEqual(engine.session(), { id: '0123456789abcdf0' });
   const attach = take();
-  assert.equal(attach[0], hex(call(1, i32(1, 120))));
+  assert.equal(attach[0], hex(call(1, i32(1, 120), u32(0))));
   assert.equal(attach.at(-1), hex(call(16, u32(1))));
 });
 

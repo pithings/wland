@@ -154,6 +154,7 @@ pub const Session = struct {
         c.title_fn = evTitle;
         c.app_id_fn = evAppId;
         c.size_limits_fn = evSizeLimits;
+        c.decoration_fn = evDecoration;
         c.surface_fn = evSurface;
         c.interactive_fn = evInteractive;
         c.cursor_shape_fn = evCursorShape;
@@ -529,6 +530,14 @@ pub const Session = struct {
         self.endEvent(.size_limits);
     }
 
+    fn evDecoration(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, decorated: bool) void {
+        const self = of(ctx);
+        self.noteNamed(conn_id, surface_id);
+        const w = self.beginEvent() orelse return;
+        inline for (.{ conn_id, surface_id, @as(u32, @intFromBool(decorated)) }) |v| w.u32_(v) catch return;
+        self.endEvent(.decoration);
+    }
+
     fn evSurface(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void {
         const self = of(ctx);
         if (value != core.compositor.surface_destroyed_code) self.noteNamed(conn_id, surface_id);
@@ -800,7 +809,9 @@ pub const Session = struct {
         if (op == .init) {
             const scale = try a.i32_();
             const scale_120 = try a.i32_();
-            return self.attach(scale, scale_120);
+            // (a viewer before decorations sends no more: client-side)
+            const decorations = a.u32_() catch 0;
+            return self.attach(scale, scale_120, decorations == 1);
         }
         if (!self.synced) return; // nothing before init
         switch (op) {
@@ -842,6 +853,7 @@ pub const Session = struct {
             .set_minimized => c.setMinimized(try a.u32_(), try a.u32_(), try a.u32_() != 0),
             .popup_dismiss => c.popupDismiss(try a.u32_(), try a.u32_()),
             .close => c.closeToplevel(try a.u32_(), try a.u32_()),
+            .set_bounds => c.setBounds(try a.i32_(), try a.i32_(), try a.i32_(), try a.i32_()),
             .request_resize => c.requestResize(try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_motion => c.dragMotion(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
             .drag_drop => c.dragDrop(),
@@ -870,11 +882,16 @@ pub const Session = struct {
     }
 
     /// CALL init: the viewer attaches — the scale as set_dpr, un-suspended,
-    /// then the scene replay (STREAM.md), ending in EVENT synced.
-    fn attach(self: *Session, scale: i32, scale_120: i32) void {
+    /// its decorations mode (toplevels it changes answered again: apps
+    /// outlive viewers) and no bounds of the last viewer's (it sends its
+    /// own), then the scene replay (STREAM.md), ending in EVENT synced. The
+    /// mode is set before `synced`, so the replay carries what it made.
+    fn attach(self: *Session, scale: i32, scale_120: i32, decorations_server: bool) void {
         const c = &self.comp;
         c.setScale(scale, scale_120);
         c.setSuspended(false);
+        c.setDecorations(decorations_server);
+        c.setBounds(0, 0, 0, 0);
         self.synced = true;
         self.records.clearRetainingCapacity();
         self.locks_sent = null;

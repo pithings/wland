@@ -147,6 +147,21 @@ export interface EngineOptions {
    *  WebGL). Default false: rows as the client wrote them, which a GL
    *  presenter uploads without any per-pixel CPU work. */
   rgba?: boolean;
+  /** Who draws window frames (title bar, borders) for apps that let the
+   *  compositor choose (xdg-decoration: SDL, foot, Qt, mpv, …):
+   *  - 'client' (default): every app draws its own, or has none (SDL games
+   *    then show as bare rectangles). wland draws no frames.
+   *  - 'server': the embedder does. A toplevel that asks through
+   *    xdg-decoration is configured server_side (unless it asks for
+   *    client_side) and reported `decorated` ('decoration' events,
+   *    ViewWindow.decorated); the others (GTK, which ignores the protocol)
+   *    keep drawing their own. For embedders that draw frames around
+   *    windows (a `mount` of their own): wland's default view draws none,
+   *    so decorated windows would be frameless.
+   *  On a session link (the relay's compositor, apps outliving viewers) the
+   *  attach carries it: toplevels of running apps whose mode it changes are
+   *  answered again. A relay that predates it keeps 'client'. */
+  decorations?: 'client' | 'server';
 }
 
 // --- buffer handles (STREAM.md v2: HANDLE_OPEN / HANDLE_CLOSE / COMMIT / ACK)
@@ -363,6 +378,18 @@ export interface Engine {
   setOutput(width: number, height: number): void;
   /** Hidden tab: suspends mapped toplevels. */
   setSuspended(suspended: boolean): void;
+  /** The work area for windows, logical px: what xdg_toplevel.
+   *  configure_bounds recommends (v4: apps open no larger) and the size a
+   *  maximized window is configured to. `width`×`height` for client-side
+   *  windows, `decoratedWidth`×`decoratedHeight` for decorated ones
+   *  (DecorationEvent: your workspace less your frame, as the app's window
+   *  geometry is its content; omitted or 0 = width×height). 0×0 = the
+   *  output's size again (the default). One area for all windows, not one
+   *  per window: it is known before a window's first configure, so a new
+   *  window opens within it. Changes are sent to mapped windows whose area
+   *  changed (configure_bounds, then a configure); fullscreen is always
+   *  the whole output. */
+  setBounds(width: number, height: number, decoratedWidth?: number, decoratedHeight?: number): void;
   /** Frame clock (ms): what was committed since the last tick is now on
    *  screen. Ends presentation feedback (wp_presentation: presented or
    *  discarded), fires frame callbacks and ships coalesced motion. Drive
@@ -507,7 +534,7 @@ export interface Engine {
 export type Event =
   | OpenEvent | ErrorEvent | CloseEvent | LogEvent
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
-  | TitleEvent | AppIdEvent | SizeLimitsEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
+  | TitleEvent | AppIdEvent | SizeLimitsEvent | DecorationEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
   | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
   | SelectionEvent | PositionEvent | SyncedEvent;
 
@@ -675,6 +702,16 @@ export interface SizeLimitsEvent {
   maxW: number;
   maxH: number;
 }
+/** A toplevel's decoration mode changed (EngineOptions.decorations
+ *  'server' only): `decorated` true = it was configured server_side and
+ *  draws no frame of its own, the embedder is expected to draw one; false =
+ *  client-side again (it asked for client_side, destroyed its decoration
+ *  object, or its xdg_toplevel went). An app that makes its decoration
+ *  object before its first commit (the usual order) is told at its initial
+ *  configure, before its first buffer: before the window's first commit
+ *  event. Toplevels never told are client-side. Sizes stay the app's
+ *  content: the core adds no frame (Engine.setBounds is for that). */
+export interface DecorationEvent { type: 'decoration'; conn: number; surface: number; decorated: boolean }
 /** The pointer image `conn` set while its surface holds the pointer; the
  *  last of these wins until the pointer leaves the client's surfaces.
  *  - wp_cursor_shape: `cursor` is a CSS cursor name, `surface` 0.
@@ -923,6 +960,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   // output state, kept so it can be set before the link opens and re-applied
   // when it does (wland_init resets the compositor)
   const output = { scale: 1, scale120: 120, width: 0, height: 0, suspended: false };
+  const decorations = options.decorations === 'server' ? 1 : 0;
+  // setBounds: [width, height, decoratedWidth, decoratedHeight], 0 = unset
+  const bounds = [0, 0, 0, 0];
   // the lock state the next link's compositor starts from (bit 0 Caps Lock,
   // bit 1 NumLock): the embedder's last keyboardLocks, or the core's state
   // as the last link closed (the lock keys toggle it there); -1 none
@@ -1063,6 +1103,8 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
         emit({ type: 'app-id', conn: conn >>> 0, surface, appId: str(ptr, len) }),
       js_size_limits: (conn, surface, minW, minH, maxW, maxH) =>
         emit({ type: 'size-limits', conn: conn >>> 0, surface, minW, minH, maxW, maxH }),
+      js_decoration: (conn, surface, decorated) =>
+        emit({ type: 'decoration', conn: conn >>> 0, surface, decorated: decorated !== 0 }),
       js_conn_close: (conn) => {
         conn >>>= 0;
         conns.delete(conn);
@@ -1158,9 +1200,10 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       locks: real.wland_keyboard_locks_state(),
     });
     bridge = true; // a session relay bridges the clipboard (its core does)
-    run(ex.wland_init, output.scale, output.scale120);
+    run(ex.wland_init, output.scale, output.scale120, decorations);
     run(ex.wland_set_gpu_source, gpu ? 1 : 0);
     if (output.width > 0 && output.height > 0) run(ex.wland_desktop_size, output.width, output.height);
+    if (bounds.some((v) => v > 0)) run(ex.wland_set_bounds, bounds[0], bounds[1], bounds[2], bounds[3]);
     if (output.suspended) run(ex.wland_set_suspended, 1);
     if (locks >= 0) run(ex.wland_keyboard_locks, locks);
   }
@@ -1703,8 +1746,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       // no GPU source: a relay whose dmabufs are GPU resources gets no
       // linux-dmabuf (its FEATURE frames come next), so GPU clients use wl_shm
       run(ex.wland_set_gpu_source, gpu ? 1 : 0);
-      run(ex.wland_init, output.scale, output.scale120);
+      run(ex.wland_init, output.scale, output.scale120, decorations);
       if (output.width > 0 && output.height > 0) run(ex.wland_desktop_size, output.width, output.height);
+      if (bounds.some((v) => v > 0)) run(ex.wland_set_bounds, bounds[0], bounds[1], bounds[2], bounds[3]);
       if (output.suspended) run(ex.wland_set_suspended, 1);
       if (locks >= 0) run(ex.wland_keyboard_locks, locks);
       emit({ type: 'open' });
@@ -1805,6 +1849,16 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     setSuspended(suspended) {
       output.suspended = !!suspended;
       if (live) run(ex.wland_set_suspended, output.suspended ? 1 : 0);
+    },
+    setBounds(width, height, decoratedWidth = 0, decoratedHeight = 0) {
+      const pair = (w: number, h: number) => {
+        const rw = Math.round(w) || 0, rh = Math.round(h) || 0;
+        return rw > 0 && rh > 0 ? [rw, rh] : [0, 0];
+      };
+      const next = [...pair(width, height), ...pair(decoratedWidth, decoratedHeight)];
+      if (next.every((v, i) => v === bounds[i])) return;
+      bounds.splice(0, 4, ...next);
+      if (live) run(ex.wland_set_bounds, bounds[0], bounds[1], bounds[2], bounds[3]);
     },
     tick(time, refresh) {
       if (!live) return;
