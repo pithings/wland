@@ -65,12 +65,27 @@ extern "env" fn js_pointer_lock(conn_id: u32, surface_id: u32) void;
 extern "env" fn js_handle_open(conn_id: u32, handle_id: u32, kind: u32, a: u32, b: u32, offset: f64, size: f64) void;
 /// HANDLE_CLOSE (0x09): JS closes the handle and forgets it.
 extern "env" fn js_handle_close(conn_id: u32, handle_id: u32) void;
+/// The clipboard selection changed: conn_id owns it now (0 = the embedder's
+/// own, wland_set_selection, or none when len = 0; an app's conn with len 0:
+/// it cleared the selection); ptr/len = the mime types it offers,
+/// NUL-separated, valid only during the call.
+extern "env" fn js_selection(conn_id: u32, ptr: [*]const u8, len: usize) void;
+/// A wland_read_selection answered (FDMSG pipe_read from the relay): status
+/// 0 = the bytes at ptr/len are all of it, 1 = too large, 2 = the source
+/// timed out, 3 = failed. ptr valid only during the call.
+extern "env" fn js_selection_data(read_id: u32, status: u32, ptr: [*]const u8, len: usize) void;
 
 const gpa = std.heap.wasm_allocator;
 
 var compositor: core.compositor.Compositor = undefined;
 /// wland_init has run: a link that opens again re-inits, freeing the old one
 var compositor_live = false;
+/// wland_set_gpu_source's last word; outlives wland_init (every link's
+/// compositor gets it). true until said otherwise.
+var gpu_source = true;
+/// A frame other than FEATURE arrived on this link: the relay's FEATURE
+/// frames (all first on a link) are in, what it can't do is settled.
+var features_settled = false;
 
 export fn wland_version() u32 {
     return core.version;
@@ -95,8 +110,33 @@ export fn wland_init(scale: i32, scale_120: i32) void {
     compositor.text_input_fn = textInput;
     compositor.input_region_fn = inputRegion;
     compositor.pointer_lock_fn = pointerLock;
+    compositor.selection_fn = selectionEvent;
     compositor.output_scale = std.math.clamp(scale, 1, 4);
     compositor.scale_120 = @max(1, scale_120);
+    compositor.gpu_source = gpu_source;
+    features_settled = false;
+}
+
+/// Whether this link's relay bridges the clipboard for the embedder
+/// (FEATURE selection_cache: wland_read_selection / wland_set_selection
+/// work): 1 yes, 0 no (its FEATURE frames are in without it: a relay that
+/// predates it, wlandr 0.1.0), 2 not known yet (no frame but FEATURE has
+/// arrived on this link). A getter: sends nothing.
+export fn wland_selection_bridged() u32 {
+    if (!compositor_live) return 2;
+    if (compositor.selection_bridge) return 1;
+    return if (features_settled) 0 else 2;
+}
+
+/// Whether the embedder can draw GPU buffers (COMMIT kind virtgpu; 1 yes,
+/// 0 no). Without, a relay whose dmabuf commits are GPU resources (FEATURE
+/// dmabuf_kind) gets no linux-dmabuf from the compositor: GPU clients fall
+/// back to wl_shm instead of drawing windows nothing shows. Default 1 (an
+/// embedder that never calls this is unchanged). Kept across wland_init;
+/// call it before the link's FEATURE frames arrive. Sends nothing.
+export fn wland_set_gpu_source(has: u32) void {
+    gpu_source = has != 0;
+    if (compositor_live) compositor.gpu_source = gpu_source;
 }
 
 /// Browser devicePixelRatio changed (matchMedia resolution listener): resend
@@ -185,6 +225,21 @@ export fn wland_key(conn_id: u32, time_ms: u32, evdev_key: u32, pressed: u32) vo
     flushOut();
 }
 
+/// The browser's Caps Lock / NumLock state (bit 0 Caps Lock, bit 1 NumLock):
+/// the seat's locked modifiers follow it (focused clients get `modifiers`).
+export fn wland_keyboard_locks(locks: u32) void {
+    compositor.keyboardLocks(locks & 1 != 0, locks & 2 != 0);
+    flushOut();
+}
+
+/// The seat's lock state now, as wland_keyboard_locks takes it (bit 0 Caps
+/// Lock, bit 1 NumLock): its last word or the lock keys' toggles since.
+/// JS reads it as a link closes, to carry it over to the next compositor.
+export fn wland_keyboard_locks_state() u32 {
+    const l = compositor.lockState();
+    return @as(u32, @intFromBool(l.caps_lock)) | @as(u32, @intFromBool(l.num_lock)) << 1;
+}
+
 // zwp_text_input_v3 composition, pushed from the browser (M12). The string
 // is UTF-8 bytes JS wrote into wasm memory (wland_alloc); only an entered +
 // enabled text input is fed, so plain keystrokes (which never compose) keep
@@ -258,6 +313,35 @@ export fn wland_surface_root(conn_id: u32, surface_id: u32) u32 {
     return compositor.surfaceRoot(conn_id, surface_id);
 }
 
+/// What the surface hangs from (a subsurface's parent, a popup's parent
+/// xdg surface), 0 if nothing: the embedder stacks a window's surfaces by it.
+export fn wland_surface_parent(conn_id: u32, surface_id: u32) u32 {
+    return compositor.surfaceParent(conn_id, surface_id);
+}
+
+/// A subsurface's rank in its parent's stack: 1, 2, … above the parent,
+/// −1, −2, … below it; 0 for any other surface.
+export fn wland_surface_z(conn_id: u32, surface_id: u32) i32 {
+    return compositor.surfaceZ(conn_id, surface_id);
+}
+
+/// 1 when a subsurface's or popup's position or rank may have changed
+/// since the last call (Compositor.positions_dirty), else 0; clears it.
+/// The embedder re-reads its placed surfaces only then.
+export fn wland_take_positions_dirty() u32 {
+    return @intFromBool(compositor.takePositionsDirty());
+}
+
+/// A placed surface's abs x, abs y and rank (wland_surface_abs_x/_y,
+/// wland_surface_z) in one call: a pointer to 3 × i32, valid until the
+/// next call. What the embedder re-reads for every subsurface and popup.
+var place_out: [3]i32 = @splat(0);
+export fn wland_surface_place(conn_id: u32, surface_id: u32) usize {
+    const abs = compositor.surfaceAbs(conn_id, surface_id);
+    place_out = .{ abs.x, abs.y, compositor.surfaceZ(conn_id, surface_id) };
+    return @intFromPtr(&place_out);
+}
+
 export fn wland_surface_abs_x(conn_id: u32, surface_id: u32) i32 {
     return compositor.surfaceAbs(conn_id, surface_id).x;
 }
@@ -324,6 +408,7 @@ export fn wland_on_frame(ptr: [*]const u8, len: usize) void {
             break;
         };
         rest = rest[p.consumed..];
+        if (p.frame != .feature) features_settled = true;
         switch (p.frame) {
             .conn_open => |conn_id| compositor.connOpen(conn_id) catch |err| logf("conn_open: {t}", .{err}),
             .conn_close => |conn_id| {
@@ -332,7 +417,14 @@ export fn wland_on_frame(ptr: [*]const u8, len: usize) void {
             },
             .wire => |w| compositor.onWire(w.conn_id, w.bytes) catch |err| logf("onWire: {t}", .{err}),
             // fd itself stays in the server; the wire message keeps our object map correct
-            .fdmsg => |f| if (f.kind == 3) { // pipe: clipboard receive, aux = fd token
+            .fdmsg => |f| if (f.kind == @intFromEnum(core.stream.FdMsgKind.pipe_read)) {
+                // a wland_read_selection's answer: aux = read id ++ status ++ bytes
+                if (f.aux.len >= 8) {
+                    js_selection_data(std.mem.readInt(u32, f.aux[0..4], .little), std.mem.readInt(u32, f.aux[4..8], .little), f.aux[8..].ptr, f.aux.len - 8);
+                } else {
+                    logf("pipe_read fdmsg with bad aux len {d}", .{f.aux.len});
+                }
+            } else if (f.kind == 3) { // pipe: clipboard receive, aux = fd token
                 if (f.aux.len == 4) {
                     compositor.onPipeReceive(f.conn_id, f.wire_bytes, std.mem.readInt(u32, f.aux[0..4], .little));
                 } else {
@@ -360,7 +452,7 @@ export fn wland_on_frame(ptr: [*]const u8, len: usize) void {
                 appendAck(c.conn_id, c.serial);
             },
             .ack => logf("ACK frame reached wasm — engine→relay only", .{}),
-            .feature => |f| feature(f.feature, f.bytes),
+            .feature => |f| compositor.applyFeature(f.feature, f.bytes), // FEATURE: what the relay can do
             .dmabuf_created => logf("DMABUF_CREATED frame reached wasm — engine→relay only", .{}),
             .presented => logf("PRESENTED frame reached wasm — engine→relay only", .{}),
         }
@@ -368,17 +460,27 @@ export fn wland_on_frame(ptr: [*]const u8, len: usize) void {
     flushOut();
 }
 
-/// FEATURE (0x0c): what the relay can do. Unknown features are skipped.
-fn feature(kind: u32, bytes: []const u8) void {
-    if (kind != @intFromEnum(core.stream.FeatureKind.linux_dmabuf)) {
-        logf("FEATURE {d}: unknown, skipped", .{kind});
-        return;
-    }
-    const d = core.stream.DmabufFeature.decode(bytes) catch {
-        logf("FEATURE linux_dmabuf: bad bytes ({d}); dmabuf not offered", .{bytes.len});
-        return;
+/// The embedder's own clipboard selection (Compositor.setOwnSelection: the
+/// packed { u32 mime_len, mime, u32 data_len | 0xffffffff, data } entries;
+/// len 0 clears it if it is the embedder's). 1 = set, 0 = refused (bad, too
+/// large, or the relay can't bridge it — wland_selection_bridged: the
+/// selection is unchanged).
+export fn wland_set_selection(ptr: [*]const u8, len: usize) u32 {
+    defer flushOut();
+    compositor.setOwnSelection(ptr[0..len]) catch |err| {
+        logf("set_selection: {t}", .{err});
+        return 0;
     };
-    compositor.setDmabuf(d.main_device, d.table) catch |err| logf("FEATURE linux_dmabuf: {t}", .{err});
+    return 1;
+}
+
+/// Ask the clipboard selection's source client for `mime` (ptr/len); the
+/// answer comes as js_selection_data(read_id, ...). 1 = asked, 0 = nothing
+/// to ask (no client selection, it does not offer `mime`, or the relay
+/// can't read it — wland_selection_bridged).
+export fn wland_read_selection(ptr: [*]const u8, len: usize, read_id: u32, max_bytes: u32) u32 {
+    defer flushOut();
+    return @intFromBool(compositor.readSelection(ptr[0..len], read_id, max_bytes));
 }
 
 /// Largest integer an f64 holds exactly; handle sizes/offsets past it are
@@ -616,6 +718,17 @@ fn sendPresented(ctx: ?*anyopaque, conn_id: u32, age_us: u32, msg: []const u8) v
     const start = out_buf.items.len;
     out_buf.resize(gpa, start + core.stream.presented_header_len + msg.len) catch return;
     _ = core.stream.encodePresented(out_buf.items[start..], conn_id, age_us, msg);
+}
+
+fn selectionEvent(ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void {
+    _ = ctx;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(gpa);
+    for (mimes, 0..) |m, i| {
+        if (i > 0) joined.append(gpa, 0) catch return;
+        joined.appendSlice(gpa, m) catch return;
+    }
+    js_selection(conn_id, joined.items.ptr, joined.items.len);
 }
 
 fn surfaceEvent(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void {

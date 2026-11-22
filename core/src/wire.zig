@@ -111,9 +111,44 @@ fn takeArray(body: []const u8, off: *usize) DecodeError![]const u8 {
     return a;
 }
 
-/// Serialize a message (header + args) into `buf`; returns the written slice.
-/// Asserts the message fits.
+/// Largest message the header's 16-bit size can name (a multiple of 4).
+pub const max_message_size = 0xfffc;
+
+pub const EncodeError = error{MessageTooLarge};
+
+/// The encoded size of a message with `args` (header included), in u64 so
+/// no client-sized string or array can wrap it.
+pub fn messageSize(args: []const Value) u64 {
+    var size: u64 = header_size;
+    for (args) |arg| {
+        size += switch (arg) {
+            .int, .uint, .fixed, .object, .new_id => 4,
+            .string => |opt| if (opt) |s| 4 + std.mem.alignForward(u64, @as(u64, s.len) + 1, 4) else 4,
+            .array => |a| 4 + std.mem.alignForward(u64, a.len, 4),
+            .new_id_dynamic => |v| 4 + std.mem.alignForward(u64, @as(u64, v.interface.len) + 1, 4) + 8,
+            .fd => 0,
+        };
+    }
+    return size;
+}
+
+/// Serialize a message (header + args) into `buf`; returns the written
+/// slice. A message larger than `buf` (or than a header can name) is
+/// refused before anything is written: strings and arrays may be sized by a
+/// client, and ReleaseFast (the wasm build) does not bounds-check slices.
+pub fn encode(buf: []u8, object_id: u32, opcode: u16, args: []const Value) EncodeError![]u8 {
+    const size = messageSize(args);
+    if (size > buf.len or size > max_message_size) return error.MessageTooLarge;
+    return encodeUnchecked(buf, object_id, opcode, args);
+}
+
+/// `encode` for messages whose size the caller fixed (constant args, tests):
+/// one that does not fit panics (a trap in wasm) — never a write past `buf`.
 pub fn encodeMessage(buf: []u8, object_id: u32, opcode: u16, args: []const Value) []u8 {
+    return encode(buf, object_id, opcode, args) catch @panic("wire.encodeMessage: message larger than its buffer");
+}
+
+fn encodeUnchecked(buf: []u8, object_id: u32, opcode: u16, args: []const Value) []u8 {
     var off: usize = header_size;
     for (args) |arg| {
         switch (arg) {
@@ -232,6 +267,26 @@ test "decode rejects truncated body" {
     // string claiming 100 bytes but body ends
     const bad = [_]u8{ 100, 0, 0, 0, 'a', 'b', 0, 0 };
     try std.testing.expectError(error.Truncated, decodeArgs(&bad, &.{.string}, &vals));
+}
+
+test "encode refuses a message larger than its buffer, writing nothing past it" {
+    var buf: [64 + 16]u8 = @splat(0xaa);
+    const out = buf[0..64];
+    const long = [_]u8{'m'} ** 100;
+    try std.testing.expectError(error.MessageTooLarge, encode(out, 1, 0, &.{.{ .string = &long }}));
+    try std.testing.expectError(error.MessageTooLarge, encode(out, 1, 0, &.{.{ .array = &long }}));
+    try std.testing.expectError(error.MessageTooLarge, encode(out, 1, 0, &.{.{ .new_id_dynamic = .{ .interface = &long, .version = 1, .id = 2 } }}));
+    // exactly full fits: 8 header + 4 len + 52 (51 chars + NUL) = 64
+    const fits = [_]u8{'m'} ** 51;
+    try std.testing.expectEqual(@as(usize, 64), (try encode(out, 1, 0, &.{.{ .string = &fits }})).len);
+    const one_more = [_]u8{'m'} ** 52;
+    try std.testing.expectError(error.MessageTooLarge, encode(out, 1, 0, &.{.{ .string = &one_more }}));
+    for (buf[64..]) |b| try std.testing.expectEqual(@as(u8, 0xaa), b);
+    // past what a header's u16 size can say, whatever the buffer
+    var big: [max_message_size + 8]u8 = undefined;
+    const huge = [_]u8{'m'} ** max_message_size;
+    try std.testing.expectError(error.MessageTooLarge, encode(&big, 1, 0, &.{.{ .array = &huge }}));
+    try std.testing.expectEqual(@as(u64, 8 + (4 + 52) + 4 + (4 + 8)), messageSize(&.{ .{ .string = &fits }, .{ .uint = 1 }, .{ .array = &.{ 1, 2, 3, 4, 5 } }, .fd }));
 }
 
 test "fixed point is 24.8 two's complement" {

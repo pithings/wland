@@ -92,8 +92,61 @@ pub const BufferLzFrame = struct {
 /// FDMSG `kind`. shm_pool and dmabuf travel relay→engine (the relay kept the
 /// client's fd); memfd engine→relay (the relay makes a memfd from the aux
 /// bytes: wl_keyboard.keymap, zwp_linux_dmabuf_feedback_v1.format_table);
-/// pipe both ways (clipboard, token in aux).
-pub const FdMsgKind = enum(u32) { shm_pool = 1, memfd = 2, pipe = 3, dmabuf = 4 };
+/// pipe both ways (clipboard, token in aux); pipe_read both ways (the
+/// engine reads the selection: engine→relay the source's send event, aux =
+/// read id ++ max bytes; relay→engine the bytes, aux = read id ++ status ++
+/// bytes, no wire message); own_pipe engine→relay only, to a relay that
+/// announced FEATURE selection_cache (`OwnPipe`).
+pub const FdMsgKind = enum(u32) { shm_pool = 1, memfd = 2, pipe = 3, dmabuf = 4, pipe_read = 5, own_pipe = 6 };
+
+/// FDMSG own_pipe aux (engine→relay, no wire message): a receive of the
+/// engine's own selection answered from the relay's copy of its payload.
+/// `token` = the parked receive (0: none), `gen` = the own selection's
+/// generation (0: the own selection is gone — drop the copy), `blob` = which
+/// payload (< 32), `flags` bit 0 = the payload's bytes follow (the first
+/// receive of it on this link): the relay keeps them (replacing what it
+/// kept of an older generation) and serves this receive and later ones
+/// from them. Without the bit, a payload the relay doesn't have reads EOF.
+pub const OwnPipe = struct {
+    token: u32,
+    gen: u32,
+    blob: u32,
+    flags: u32,
+    bytes: []const u8,
+
+    pub const header_len = 16;
+    pub const has_bytes: u32 = 1;
+
+    pub fn writeHeader(self: OwnPipe, out: *[header_len]u8) void {
+        std.mem.writeInt(u32, out[0..4], self.token, .little);
+        std.mem.writeInt(u32, out[4..8], self.gen, .little);
+        std.mem.writeInt(u32, out[8..12], self.blob, .little);
+        std.mem.writeInt(u32, out[12..16], self.flags, .little);
+    }
+
+    pub fn decode(aux: []const u8) error{BadLength}!OwnPipe {
+        if (aux.len < header_len) return error.BadLength;
+        return .{
+            .token = std.mem.readInt(u32, aux[0..4], .little),
+            .gen = std.mem.readInt(u32, aux[4..8], .little),
+            .blob = std.mem.readInt(u32, aux[8..12], .little),
+            .flags = std.mem.readInt(u32, aux[12..16], .little),
+            .bytes = aux[header_len..],
+        };
+    }
+};
+
+/// pipe_read reply `status` (relay→engine aux bytes 4..8).
+pub const PipeReadStatus = enum(u32) {
+    /// the source wrote, then closed: the bytes are all of it
+    ok = 0,
+    /// the source wrote more than max_bytes: no bytes sent
+    too_large = 1,
+    /// the source did not close the pipe before the relay's deadline
+    timeout = 2,
+    /// no such conn any more, or the pipe failed
+    failed = 3,
+};
 
 /// FEATURE `feature`: which capability the frame announces. An engine that
 /// does not know one skips it (the frame is self-delimiting).
@@ -101,6 +154,39 @@ pub const FeatureKind = enum(u32) {
     /// The relay takes dmabufs (zwp_linux_buffer_params_v1.add fds): the
     /// compositor advertises zwp_linux_dmabuf_v1. Bytes: `DmabufFeature`.
     linux_dmabuf = 1,
+    /// How the relay's dmabuf commits reach the engine: as COMMITs of one
+    /// buffer kind (today virtgpu — GPU resources only the embedder's
+    /// renderer can draw). Sent just before linux_dmabuf; absent, dmabuf
+    /// commits travel as pixels (readback), which every engine shows. An
+    /// engine that can't show that kind does not offer linux-dmabuf.
+    /// Bytes: `DmabufKindFeature`.
+    dmabuf_kind = 2,
+    /// The relay bridges the clipboard for the engine: it reads selections
+    /// for it (FDMSG pipe_read) and keeps a copy of each payload of the
+    /// engine's own selection it is sent (FDMSG own_pipe), serving every
+    /// receive of it from that copy (each payload crosses once per link).
+    /// Without it (a relay that predates it: wlandr 0.1.0) the engine sends
+    /// neither and offers clients no selection of its own. Bytes: none (any
+    /// are ignored).
+    selection_cache = 3,
+};
+
+/// FEATURE bytes of kind dmabuf_kind: `u32 buffer_kind` (BufferKind, the
+/// COMMIT kind every dmabuf commit carries). Fields are only ever
+/// appended: a receiver reads the first 4 bytes and ignores the rest.
+pub const DmabufKindFeature = struct {
+    buffer_kind: u32,
+
+    pub const len = 4;
+
+    pub fn encode(self: DmabufKindFeature, out: *[len]u8) void {
+        std.mem.writeInt(u32, out, self.buffer_kind, .little);
+    }
+
+    pub fn decode(bytes: []const u8) error{BadLength}!DmabufKindFeature {
+        if (bytes.len < len) return error.BadLength;
+        return .{ .buffer_kind = std.mem.readInt(u32, bytes[0..4], .little) };
+    }
 };
 
 /// FEATURE bytes of kind linux_dmabuf: the dev_t clients should allocate on
@@ -234,7 +320,7 @@ pub const BufferKind = enum(u32) {
     shm = 1,
     /// A GPU resource the embedder's renderer holds: `VirtgpuRef`. No
     /// pixels anywhere on the link; the engine's embedder resolves the
-    /// resource id. No relay in this repo emits it yet.
+    /// resource id. wlandr `--dmabuf virtgpu` emits it.
     virtgpu = 2,
 };
 
@@ -261,6 +347,12 @@ pub const VirtgpuRef = struct {
     modifier: u64,
 
     pub const len = 36;
+
+    pub fn encode(self: VirtgpuRef, out: *[len]u8) void {
+        inline for (.{ self.resource, self.width, self.height, self.format, self.flags, self.offset, self.stride }, 0..) |v, i|
+            std.mem.writeInt(u32, out[i * 4 ..][0..4], v, .little);
+        std.mem.writeInt(u64, out[28..36], self.modifier, .little);
+    }
 
     pub fn decode(bytes: []const u8) error{BadLength}!VirtgpuRef {
         if (bytes.len < len) return error.BadLength;
@@ -771,6 +863,17 @@ pub fn encodeShmCommit(out: []u8, conn_id: u32, surface_id: u32, serial: u32, re
     return encodeCommit(out, conn_id, surface_id, serial, .shm, &ref_bytes, rects);
 }
 
+pub fn virtgpuCommitLen(n_rects: usize) usize {
+    return commit_header_len + VirtgpuRef.len + n_rects * 16;
+}
+
+/// Write a kind-virtgpu COMMIT into `out` (≥ virtgpuCommitLen); returns it.
+pub fn encodeVirtgpuCommit(out: []u8, conn_id: u32, surface_id: u32, serial: u32, ref: VirtgpuRef, rects: anytype) []u8 {
+    var ref_bytes: [VirtgpuRef.len]u8 = undefined;
+    ref.encode(&ref_bytes);
+    return encodeCommit(out, conn_id, surface_id, serial, .virtgpu, &ref_bytes, rects);
+}
+
 fn encodeCommit(out: []u8, conn_id: u32, surface_id: u32, serial: u32, kind: BufferKind, ref: []const u8, rects: anytype) []u8 {
     const total = commit_header_len + ref.len + rects.len * 16;
     std.debug.assert(out.len >= total);
@@ -849,6 +952,10 @@ pub const Batch = struct {
 
     pub fn shmCommit(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, surface_id: u32, serial: u32, ref: ShmRef, rects: anytype) !void {
         _ = encodeShmCommit(try self.frame(gpa, shmCommitLen(rects.len)), conn_id, surface_id, serial, ref, rects);
+    }
+
+    pub fn virtgpuCommit(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, surface_id: u32, serial: u32, ref: VirtgpuRef, rects: anytype) !void {
+        _ = encodeVirtgpuCommit(try self.frame(gpa, virtgpuCommitLen(rects.len)), conn_id, surface_id, serial, ref, rects);
     }
 
     pub fn ack(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, serial: u32) !void {
@@ -1042,6 +1149,14 @@ test "feature and dmabuf_created roundtrip, truncation" {
     try std.testing.expectError(error.BadLength, DmabufFeature.decode(bytes[0..8]));
     try std.testing.expectError(error.BadLength, DmabufFeature.decode(bytes[0..20]));
 
+    // dmabuf_kind: a u32 buffer kind; appended bytes are ignored
+    var kb: [DmabufKindFeature.len + 4]u8 = @splat(0xee);
+    (DmabufKindFeature{ .buffer_kind = @intFromEnum(BufferKind.virtgpu) }).encode(kb[0..4]);
+    const kf = (try parse(encodeFeature(&out, .dmabuf_kind, &kb))).feature;
+    try std.testing.expectEqual(@as(u32, 2), kf.feature);
+    try std.testing.expectEqual(@as(u32, 2), (try DmabufKindFeature.decode(kf.bytes)).buffer_kind);
+    try std.testing.expectError(error.BadLength, DmabufKindFeature.decode(kb[0..3]));
+
     var c: [dmabuf_created_len]u8 = undefined;
     writeDmabufCreated(&c, 4, 9, 0xff000002);
     try expectPrefixesTruncated(&c);
@@ -1199,13 +1314,9 @@ test "shm commit roundtrip and validation" {
     try std.testing.expectError(error.BadLength, (try parse(&gpu)).commit.virtgpu());
 }
 
-/// Test-only: no relay in this repo emits kind virtgpu, so the codec has a
-/// decoder and no encoder.
 fn testVirtgpuRef(ref: VirtgpuRef) [VirtgpuRef.len]u8 {
     var out: [VirtgpuRef.len]u8 = undefined;
-    inline for (.{ ref.resource, ref.width, ref.height, ref.format, ref.flags, ref.offset, ref.stride }, 0..) |v, i|
-        std.mem.writeInt(u32, out[i * 4 ..][0..4], v, .little);
-    std.mem.writeInt(u64, out[28..36], ref.modifier, .little);
+    ref.encode(&out);
     return out;
 }
 
@@ -1213,8 +1324,8 @@ test "virtgpu commit roundtrip, validation, a longer ref from a later relay" {
     const ref: VirtgpuRef = .{ .resource = 42, .width = 64, .height = 32, .format = 0x34325258, .flags = 1, .offset = 0, .stride = 256, .modifier = 0x00ff_ffff_ffff_ffff };
     const rects = [_]Rect{ .{ .x = 0, .y = 0, .w = 64, .h = 32 }, .{ .x = 3, .y = 4, .w = 5, .h = 6 } };
     var buf: [25 + 36 + 32]u8 = undefined;
-    const f = encodeCommit(&buf, 3, 9, 11, .virtgpu, &testVirtgpuRef(ref), &rects);
-    try std.testing.expectEqual(@as(usize, 25 + 36 + 32), f.len);
+    const f = encodeVirtgpuCommit(&buf, 3, 9, 11, ref, &rects);
+    try std.testing.expectEqual(virtgpuCommitLen(2), f.len);
     const c = (try parse(f)).commit;
     try std.testing.expectEqual(@as(u32, 2), c.kind);
     try std.testing.expectEqual(ref, try c.virtgpu());

@@ -10,6 +10,7 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const protocol = @import("protocol_gen.zig");
 const objects = @import("objects.zig");
+const stream = @import("stream.zig");
 
 pub const Global = struct { name: u32, interface: []const u8, version: u32 };
 
@@ -100,8 +101,13 @@ const dmabuf_err_incomplete: u32 = 3;
 const dmabuf_err_invalid_format: u32 = 4;
 const dmabuf_err_invalid_dimensions: u32 = 5;
 const dmabuf_max_planes = 4;
+/// DRM_FORMAT_MOD_INVALID: the implicit modifier (a table entry with it
+/// offers the driver's own layout)
+const dmabuf_mod_invalid: u64 = 0x00ff_ffff_ffff_ffff;
 // wl_display.error
 const display_err_invalid_object: u32 = 0;
+// wl_subsurface.error
+const subsurface_err_bad_surface: u32 = 0;
 
 /// Planes a DRM format takes (create/create_immed: a mismatch is
 /// `incomplete`). Single-plane unless listed; extend with the format table.
@@ -195,12 +201,14 @@ const key_rightalt = 100;
 const key_leftmeta = 125;
 const key_rightmeta = 126;
 const key_capslock = 58;
+const key_numlock = 69;
 
 // mod masks matching the canned us keymap
 const mod_shift: u32 = 1 << 0;
 const mod_lock: u32 = 1 << 1;
 const mod_ctrl: u32 = 1 << 2;
 const mod_alt: u32 = 1 << 3;
+const mod_num: u32 = 1 << 4; // Mod2: `modifier_map Mod2 { <NMLK> }`, the keypad types' NumLock
 const mod_super: u32 = 1 << 6;
 
 pub const Role = enum(u32) { none = 0, toplevel = 1, subsurface = 2, cursor = 3, popup = 4, dnd_icon = 5 };
@@ -221,6 +229,20 @@ const Surface = struct {
     sub_obj_id: u32 = 0,
     /// parent wl_surface id for subsurfaces and popups
     parent_id: u32 = 0,
+    /// role .subsurface: its place in the parent's stack (wl_subsurface
+    /// z-order), as an ordering key — the parent is 0, a sibling below it
+    /// negative, above it positive; only the order counts (gaps are left
+    /// where siblings went). A new subsurface goes on top. place_above /
+    /// place_below edit `z_pending`, which the PARENT's commit latches into
+    /// `z` (double-buffered state of the parent; `stack_pending` on it).
+    /// surfaceZ hands the embedder the rank, not the key.
+    z: i64 = 0,
+    z_pending: i64 = 0,
+    /// `z` as a rank among its siblings (surfaceZ's answer), cached:
+    /// valid while the conn's `ranks_dirty` is clear (rerank)
+    z_rank: i32 = 0,
+    /// a child's place_above / place_below since this surface last committed
+    stack_pending: bool = false,
     /// offset relative to parent (subsurface set_position / popup positioner)
     x: i32 = 0,
     y: i32 = 0,
@@ -443,21 +465,69 @@ const Positioner = struct {
         return v == 2 or v == 6 or v == 8;
     }
 
-    /// Popup position relative to the parent SURFACE's origin. xdg-shell
-    /// says the parent's window geometry; that offset is left out on purpose
-    /// for now (xwayland-satellite places menus from the surface origin while
-    /// its default geometry starts at its titlebar — plan.md).
+    /// Popup position: the top-left of the popup's window geometry from the
+    /// parent's window geometry (xdg-shell; the anchor rect counts from it
+    /// too) — what xdg_popup.configure says. Where that puts the surfaces
+    /// is surfaceAbs's. No constraint adjustment: window positions are the
+    /// embedder's, so the core can't tell where the output's edges are.
+    /// Every input is a client's i32, so the sums saturate (as does every
+    /// step of the placement chain: surfaceAbs, windowGeometry).
     fn place(p: *const Positioner) struct { x: i32, y: i32 } {
-        const ax = p.anchor_x + if (isRight(p.anchor)) p.anchor_w else if (isLeft(p.anchor)) 0 else @divTrunc(p.anchor_w, 2);
-        const ay = p.anchor_y + if (isBottom(p.anchor)) p.anchor_h else if (isTop(p.anchor)) 0 else @divTrunc(p.anchor_h, 2);
-        const x = ax + p.dx - (if (isLeft(p.gravity)) p.w else if (isRight(p.gravity)) 0 else @divTrunc(p.w, 2));
-        const y = ay + p.dy - (if (isTop(p.gravity)) p.h else if (isBottom(p.gravity)) 0 else @divTrunc(p.h, 2));
+        const ax = p.anchor_x +| if (isRight(p.anchor)) p.anchor_w else if (isLeft(p.anchor)) 0 else @divTrunc(p.anchor_w, 2);
+        const ay = p.anchor_y +| if (isBottom(p.anchor)) p.anchor_h else if (isTop(p.anchor)) 0 else @divTrunc(p.anchor_h, 2);
+        const x = (ax +| p.dx) -| (if (isLeft(p.gravity)) p.w else if (isRight(p.gravity)) 0 else @divTrunc(p.w, 2));
+        const y = (ay +| p.dy) -| (if (isTop(p.gravity)) p.h else if (isBottom(p.gravity)) 0 else @divTrunc(p.h, 2));
         return .{ .x = x, .y = y };
     }
 };
 
 /// The selection: which conn's wl_data_source currently owns the clipboard.
+/// conn 0 (no relay conn has it) = the embedder's own selection
+/// (setOwnSelection), `source` then its generation (`own_gen`).
 const Selection = struct { conn: u32, source: u32 };
+
+/// The embedder's own clipboard selection (setOwnSelection): data the core
+/// holds; the relay writes it into a receiver's pipe from its copy (FDMSG
+/// own_pipe — STREAM.md). Mime types may share a blob.
+const OwnSelection = struct {
+    /// owned copies, one per distinct payload
+    blobs: std.ArrayList([]u8) = .empty,
+    /// mime (owned) → index into `blobs`
+    entries: std.ArrayList(struct { mime: []u8, blob: u32 }) = .empty,
+    /// bit i: blob i went to the relay on this link (FDMSG own_pipe with
+    /// its bytes; the relay keeps it). At most
+    /// own_selection_max_mimes blobs exist (one per distinct mime at most).
+    sent: u32 = 0,
+
+    fn deinit(self: *OwnSelection, gpa: std.mem.Allocator) void {
+        for (self.blobs.items) |b| gpa.free(b);
+        for (self.entries.items) |e| gpa.free(e.mime);
+        self.blobs.deinit(gpa);
+        self.entries.deinit(gpa);
+    }
+
+    fn data(self: *const OwnSelection, mime: []const u8) ?[]const u8 {
+        return self.blobs.items[self.blobOf(mime) orelse return null];
+    }
+
+    fn blobOf(self: *const OwnSelection, mime: []const u8) ?u32 {
+        for (self.entries.items) |e| if (std.mem.eql(u8, e.mime, mime)) return e.blob;
+        return null;
+    }
+};
+
+/// Largest own selection (all its blobs) the embedder may set: a pipe write
+/// is one FDMSG frame, well inside a link record (256 MiB).
+pub const own_selection_max: usize = 64 << 20;
+/// Most mime types an own selection may offer.
+pub const own_selection_max_mimes = 32;
+/// Longest mime type (bytes) the core keeps or routes: a source's longer
+/// `offer` is ignored, a `receive` naming one reads EOF. Mime types are
+/// echoed in events (offer, target, send) whose encode buffers are fixed;
+/// RFC 6838 allows 127 + "/" + 127.
+pub const max_mime_len = 256;
+/// Most mime types one client source keeps (each is an event per offer).
+pub const max_source_mimes = 128;
 
 /// An in-flight dnd session (wl_data_device.start_drag). The embedder owns
 /// pointer tracking — it drives dragMotion/dragDrop/dragCancel like a
@@ -487,6 +557,9 @@ const Conn = struct {
     objects: objects.ObjectMap = .{},
     serial: u32 = 0,
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
+    /// a subsurface's current stack (z), parent or role changed since the
+    /// cached ranks (`Surface.z_rank`) were computed (restacked)
+    ranks_dirty: bool = false,
     positioners: std.AutoHashMapUnmanaged(u32, Positioner) = .empty,
     /// wl_region id → its content (copied into a surface by set_input_region)
     regions: std.AutoHashMapUnmanaged(u32, Region) = .empty,
@@ -507,6 +580,21 @@ const Conn = struct {
     /// wp_cursor_shape_device_v1.set_shape and wl_pointer.set_cursor must
     /// echo it or be ignored
     pointer_enter_serial: u32 = 0,
+    /// The implicit grab (see `inImplicitGrab`): the buttons this conn saw
+    /// pressed and not yet released (bit = evdev code & 31), the serials of
+    /// the presses that made it (first and latest: wrapping range) and the
+    /// surface the first went to. An enter or leave ends it (the embedder
+    /// handed the pointer elsewhere: the release goes elsewhere too).
+    buttons_held: u32 = 0,
+    grab_serial_first: u32 = 0,
+    grab_serial_last: u32 = 0,
+    grab_surface: u32 = 0,
+    /// The serials of this conn's latest input events (key, button,
+    /// keyboard and pointer enter), a ring written at input_serial_next:
+    /// what a selection request from it may name once it lost keyboard
+    /// focus (maySetSelection). 0 = unused (serials start at 1).
+    input_serials: [8]u32 = @splat(0),
+    input_serial_next: u8 = 0,
     /// The cursor surface set_cursor named for the current enter (0 = none:
     /// a shape, hidden, or nothing set yet) and its hotspot, surface-local
     /// logical px (offsets committed to the surface move it, per spec).
@@ -528,7 +616,6 @@ const Conn = struct {
     lock_surface: u32 = 0,
     keyboard_focus: u32 = 0,
     mods_depressed: u32 = 0,
-    mods_locked: u32 = 0,
     data_device_id: u32 = 0,
     /// wl_data_source id → MIME types it offered (owned copies)
     source_mimes: std.AutoHashMapUnmanaged(u32, std.ArrayList([]u8)) = .empty,
@@ -698,11 +785,32 @@ pub const Compositor = struct {
     /// began, on the page's clock). Null: sent as is (unit tests).
     presented_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, age_us: u32, msg: []const u8) void = null,
     conns: std.AutoHashMapUnmanaged(u32, *Conn) = .empty,
+    /// Something a subsurface's or popup's place hangs on may have changed
+    /// since takePositionsDirty last cleared it: an offset (set_position,
+    /// a popup's placement), a window-geometry offset, a stack order, a
+    /// role or parent, a surface made or destroyed. The embedder reads
+    /// positions and ranks again only then (its 'position' events).
+    positions_dirty: bool = false,
     /// clipboard: the current selection source, if any
     selection: ?Selection = null,
     /// primary selection (M13): the current source, if any. Independent of the
     /// clipboard selection but structurally identical.
     primary_selection: ?Selection = null,
+    /// The conn the latest key, button or keyboard enter went to (0: none
+    /// yet): a selection request without keyboard focus is honoured only
+    /// from it (maySetSelection).
+    last_input_conn: u32 = 0,
+    /// The embedder's own clipboard selection, while `selection` names it
+    /// (conn 0, source = own_gen); freed when a client replaces it.
+    own_selection: ?OwnSelection = null,
+    /// Generation of the own selection (never 0: offer source 0 = orphaned).
+    own_gen: u32 = 0,
+    /// The clipboard selection changed (a client set or cleared it, its
+    /// source or conn went, or the embedder set its own): `conn_id` owns it
+    /// now (0 = the embedder's own, or none when `mimes` is empty; a client
+    /// with no `mimes`: it cleared the selection), `mimes` what it offers,
+    /// valid only during the call. Not the primary.
+    selection_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void = null,
     /// in-flight dnd session, if any (normal pointer delivery is suppressed)
     drag: ?Drag = null,
     /// wl_output scale advertised to clients (browser devicePixelRatio,
@@ -721,6 +829,30 @@ pub const Compositor = struct {
     /// linux-dmabuf as the relay offers it (its FEATURE frame); null = the
     /// relay takes no dmabufs and zwp_linux_dmabuf_v1 is not advertised.
     dmabuf: ?Dmabuf = null,
+    /// The embedder can draw GPU buffers (COMMIT kind virtgpu: lib/engine.ts
+    /// `EngineOptions.gpu`). false: a relay whose dmabuf commits are GPU
+    /// resources (FEATURE dmabuf_kind) gets no linux-dmabuf here, so GPU
+    /// clients fall back to wl_shm instead of drawing windows nobody can
+    /// show. Default true: an embedder that doesn't say is trusted to.
+    gpu_source: bool = true,
+    /// The relay bridges the clipboard for the embedder (FEATURE
+    /// selection_cache, first on the link): it reads selections for it
+    /// (FDMSG pipe_read) and serves receives of its own selection from a
+    /// copy (own_pipe; serveOwn sends each payload once). false (a relay
+    /// that predates it, wlandr 0.1.0): neither frame is ever sent —
+    /// readSelection is false, setOwnSelection refuses, so no client is
+    /// offered a selection the relay can't serve (its paste would block on
+    /// a pipe nobody writes).
+    selection_bridge: bool = false,
+    /// FEATURE dmabuf_kind named a buffer kind this embedder can't show
+    /// (the kind): linux-dmabuf is not offered on this link.
+    dmabuf_unshowable: ?u32 = null,
+    /// The seat's locked modifiers (wl_keyboard.modifiers `locked`): Caps
+    /// Lock (mod_lock) and NumLock (mod_num), one keyboard for every client.
+    /// NumLock starts on (a PC's usual state; keypad keys type digits), the
+    /// lock keys toggle them, and the embedder sets both from the browser's
+    /// real state (keyboardLocks) before the keys that depend on them.
+    mods_locked: u32 = mod_num,
     /// zwp_linux_buffer_params_v1.create made server-allocated wl_buffer
     /// `buffer_id` from `params_id` (the transport sends DMABUF_CREATED:
     /// the relay ties the params' fds to the new id). Called just before
@@ -763,6 +895,7 @@ pub const Compositor = struct {
         }
         self.conns.deinit(self.gpa);
         if (self.dmabuf) |d| self.gpa.free(d.table);
+        if (self.own_selection) |*own| own.deinit(self.gpa);
     }
 
     /// The relay takes dmabufs (FEATURE linux_dmabuf, before any conn):
@@ -775,6 +908,48 @@ pub const Compositor = struct {
         if (self.dmabuf) |d| self.gpa.free(d.table);
         self.dmabuf = .{ .main_device = main_device, .table = owned };
         self.logf("linux-dmabuf: {d} formats, main device 0x{x}", .{ owned.len / 16, main_device });
+    }
+
+    /// A FEATURE frame (STREAM.md 0x0c), `kind` and `bytes` raw: what the
+    /// relay can do. linux_dmabuf → setDmabuf, unless dmabuf_kind named a
+    /// buffer kind this embedder can't show (then linux-dmabuf stays off,
+    /// whichever of the two came first; one log line). Unknown kinds and
+    /// bad bytes are logged and skipped — never fatal to the link.
+    pub fn applyFeature(self: *Compositor, kind: u32, bytes: []const u8) void {
+        switch (kind) {
+            @intFromEnum(stream.FeatureKind.linux_dmabuf) => {
+                const d = stream.DmabufFeature.decode(bytes) catch {
+                    self.logf("FEATURE linux_dmabuf: bad bytes ({d}); dmabuf not offered", .{bytes.len});
+                    return;
+                };
+                if (self.dmabuf_unshowable != null) return; // logged at dmabuf_kind
+                self.setDmabuf(d.main_device, d.table) catch |err| self.logf("FEATURE linux_dmabuf: {t}", .{err});
+            },
+            @intFromEnum(stream.FeatureKind.dmabuf_kind) => {
+                // bad bytes: how dmabuf commits arrive is unknown — don't offer it
+                const k: u32 = if (stream.DmabufKindFeature.decode(bytes)) |f| f.buffer_kind else |_| 0;
+                const showable = switch (k) {
+                    @intFromEnum(stream.BufferKind.shm) => true,
+                    @intFromEnum(stream.BufferKind.virtgpu) => self.gpu_source,
+                    else => false,
+                };
+                if (showable or self.dmabuf_unshowable != null) return;
+                self.dmabuf_unshowable = k;
+                if (self.dmabuf) |d| self.gpa.free(d.table);
+                self.dmabuf = null;
+                if (k == @intFromEnum(stream.BufferKind.virtgpu)) {
+                    self.logf("linux-dmabuf not offered: the relay's dmabuf buffers are GPU resources (COMMIT kind virtgpu) and this embedder has no GPU source; GPU clients fall back to wl_shm", .{});
+                } else {
+                    self.logf("linux-dmabuf not offered: the relay's dmabuf commits are buffer kind {d}, which this engine cannot show ({d} feature bytes)", .{ k, bytes.len });
+                }
+            },
+            @intFromEnum(stream.FeatureKind.selection_cache) => {
+                self.selection_bridge = true;
+                // a new link's relay holds nothing yet
+                if (self.own_selection) |*own| own.sent = 0;
+            },
+            else => self.logf("FEATURE {d}: unknown, skipped", .{kind}),
+        }
     }
 
     fn destroyConn(self: *Compositor, conn: *Conn) void {
@@ -807,15 +982,23 @@ pub const Compositor = struct {
         list.deinit(self.gpa);
     }
 
+    /// A CONN_OPEN. conn 0 is never a client (STREAM.md: it names the
+    /// embedder's own selection — Selection.conn, the 'selection' event)
+    /// and an open conn can't be opened again (its state would leak).
     pub fn connOpen(self: *Compositor, conn_id: u32) !void {
+        if (conn_id == 0) return error.ReservedConnId;
+        if (self.conns.contains(conn_id)) return error.ConnAlreadyOpen;
         const conn = try self.gpa.create(Conn);
+        errdefer self.gpa.destroy(conn);
         conn.* = .{};
+        errdefer conn.objects.deinit(self.gpa);
         try conn.objects.put(self.gpa, 1, protocol.find("wl_display").?, 1);
         try self.conns.put(self.gpa, conn_id, conn);
         self.logf("conn {d} open", .{conn_id});
     }
 
     pub fn connClose(self: *Compositor, conn_id: u32) void {
+        if (self.last_input_conn == conn_id) self.last_input_conn = 0;
         if (self.conns.fetchRemove(conn_id)) |kv| {
             // a lock it wanted or held is the embedder's to let go
             if (kv.value.lock_surface != 0) {
@@ -827,6 +1010,7 @@ pub const Compositor = struct {
             if (sel.conn == conn_id) {
                 self.selection = null;
                 self.broadcastSelection();
+                self.notifySelection();
             }
         }
         if (self.primary_selection) |sel| {
@@ -1211,21 +1395,23 @@ pub const Compositor = struct {
                 surface.max_w = args[0].int;
                 surface.max_h = args[1].int;
             }
-        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "move")) {
-            // CSD titlebar drag; the embedder owns the drag (serial unchecked,
-            // POC). A fullscreen window doesn't move.
+        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and
+            (std.mem.eql(u8, msg.name, "move") or std.mem.eql(u8, msg.name, "resize")))
+        {
+            // CSD titlebar / border drag; args = seat, serial[, edges]. The
+            // embedder owns the drag, and starts it only for a press still
+            // held on this window (inImplicitGrab): the request of a slow
+            // client can arrive after the release, and a grab started then
+            // follows a pointer with no button down until the next click.
+            // Not while fullscreen (it neither moves nor resizes).
             if (surfaceByToplevelId(conn, header.object_id)) |surface| {
-                if (!surface.fullscreen) {
-                    if (self.interactive_fn) |f| f(self.ctx, conn_id, surfaceIdOf(conn, surface), 0, 0);
-                }
-            }
-        } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and std.mem.eql(u8, msg.name, "resize")) {
-            // CSD border/corner drag; args = seat, serial, edges. Not while
-            // fullscreen (its size is the desktop's).
-            if (surfaceByToplevelId(conn, header.object_id)) |surface| {
-                if (!surface.fullscreen) {
-                    if (self.interactive_fn) |f| f(self.ctx, conn_id, surfaceIdOf(conn, surface), 1, args[2].uint);
-                }
+                const id = surfaceIdOf(conn, surface);
+                const is_move = msg.name[0] == 'm';
+                if (surface.fullscreen) {
+                    // its size and place are the desktop's
+                } else if (!inImplicitGrab(conn, args[1].uint, id)) {
+                    self.logf("c{d}: xdg_toplevel.{s} with serial {d} outside a held press — ignored", .{ conn_id, msg.name, args[1].uint });
+                } else if (self.interactive_fn) |f| f(self.ctx, conn_id, id, if (is_move) 0 else 1, if (is_move) 0 else args[2].uint);
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and
             (std.mem.eql(u8, msg.name, "set_maximized") or std.mem.eql(u8, msg.name, "unset_maximized")))
@@ -1261,6 +1447,7 @@ pub const Compositor = struct {
             if (surfaceByXdgId(conn, header.object_id)) |surface| {
                 surface.toplevel_id = args[0].new_id;
                 surface.role = .toplevel;
+                self.positions_dirty = true;
                 self.notifySurface(conn_id, surfaceIdOf(conn, surface), @intFromEnum(Role.toplevel));
             }
         } else if (std.mem.eql(u8, iface.name, "wl_subcompositor") and std.mem.eql(u8, msg.name, "get_subsurface")) {
@@ -1268,13 +1455,34 @@ pub const Compositor = struct {
                 surface.role = .subsurface;
                 surface.sub_obj_id = args[0].new_id;
                 surface.parent_id = args[2].object;
+                // on top of its siblings and parent, in the current stack
+                // and the pending one alike
+                var top: i64 = 0;
+                var top_pending: i64 = 0;
+                var it = conn.surfaces.iterator();
+                while (it.next()) |kv| {
+                    const sib = kv.value_ptr;
+                    if (kv.key_ptr.* == args[1].object or sib.role != .subsurface or sib.parent_id != surface.parent_id) continue;
+                    top = @max(top, sib.z);
+                    top_pending = @max(top_pending, sib.z_pending);
+                }
+                surface.z = top + 1;
+                surface.z_pending = top_pending + 1;
+                self.restacked(conn);
                 self.notifySurface(conn_id, args[1].object, @intFromEnum(Role.subsurface));
             }
         } else if (std.mem.eql(u8, iface.name, "wl_subsurface") and std.mem.eql(u8, msg.name, "set_position")) {
             if (surfaceBySubObjId(conn, header.object_id)) |surface| {
+                // applied at once, not at the parent's commit (plan.md
+                // "Current limits")
                 surface.x = args[0].int;
                 surface.y = args[1].int;
+                self.positions_dirty = true;
             }
+        } else if (std.mem.eql(u8, iface.name, "wl_subsurface") and
+            (std.mem.eql(u8, msg.name, "place_above") or std.mem.eql(u8, msg.name, "place_below")))
+        {
+            self.placeSubsurface(conn_id, conn, header.object_id, args[0].object, std.mem.eql(u8, msg.name, "place_above"));
         } else if (std.mem.eql(u8, iface.name, "xdg_wm_base") and std.mem.eql(u8, msg.name, "create_positioner")) {
             try conn.positioners.put(self.gpa, args[0].new_id, .{});
         } else if (std.mem.eql(u8, iface.name, "xdg_positioner")) {
@@ -1302,6 +1510,7 @@ pub const Compositor = struct {
             if (surfaceByXdgId(conn, header.object_id)) |surface| {
                 surface.role = .popup;
                 surface.popup_id = args[0].new_id;
+                self.positions_dirty = true;
                 self.notifySurface(conn_id, surfaceIdOf(conn, surface), @intFromEnum(Role.popup));
                 if (args[1].object != 0) { // parent xdg_surface is nullable
                     if (surfaceByXdgId(conn, args[1].object)) |parent| {
@@ -1342,21 +1551,22 @@ pub const Compositor = struct {
             }
         } else if (std.mem.eql(u8, iface.name, "wl_data_source")) {
             if (std.mem.eql(u8, msg.name, "offer")) {
-                if (conn.source_mimes.getPtr(header.object_id)) |list| {
-                    const mime = try self.gpa.dupe(u8, args[0].string orelse "");
-                    try list.append(self.gpa, mime);
-                }
+                if (conn.source_mimes.getPtr(header.object_id)) |list| try self.addSourceMime(conn_id, list, args[0].string);
             } else if (std.mem.eql(u8, msg.name, "set_actions")) {
                 try conn.source_actions.put(self.gpa, header.object_id, args[0].uint);
             }
         } else if (std.mem.eql(u8, iface.name, "wl_data_device")) {
             if (std.mem.eql(u8, msg.name, "set_selection")) {
-                // serial unchecked (POC); args[0] is the source, 0 = clear
-                self.setSelection(conn_id, args[0].object);
+                // args: source (nullable: 0 = clear), serial
+                if (self.maySetSelection(conn_id, conn, args[1].uint)) {
+                    self.setSelection(conn_id, args[0].object);
+                } else self.logf("c{d}: set_selection without keyboard focus (serial {d}) — ignored", .{ conn_id, args[1].uint });
             } else if (std.mem.eql(u8, msg.name, "start_drag")) {
                 // args: source (nullable), origin, icon (nullable), serial —
-                // serial unchecked (POC, like set_selection/move/resize)
-                self.startDrag(conn_id, conn, args[0].object, args[1].object, args[2].object);
+                // a press of this client's, still held (like move/resize)
+                if (pressHeld(conn, args[3].uint)) {
+                    self.startDrag(conn_id, conn, args[0].object, args[1].object, args[2].object);
+                } else self.logf("c{d}: start_drag with serial {d} outside a held press — ignored", .{ conn_id, args[3].uint });
             }
         } else if (std.mem.eql(u8, iface.name, "wl_data_offer")) {
             // requests on drag offers (selection offers only ever get
@@ -1379,16 +1589,15 @@ pub const Compositor = struct {
         } else if (std.mem.eql(u8, iface.name, "zwp_primary_selection_source_v1")) {
             // only `offer` (no set_actions — primary selection has no dnd)
             if (std.mem.eql(u8, msg.name, "offer")) {
-                if (conn.primary_source_mimes.getPtr(header.object_id)) |list| {
-                    const mime = try self.gpa.dupe(u8, args[0].string orelse "");
-                    try list.append(self.gpa, mime);
-                }
+                if (conn.primary_source_mimes.getPtr(header.object_id)) |list| try self.addSourceMime(conn_id, list, args[0].string);
             }
         } else if (std.mem.eql(u8, iface.name, "zwp_primary_selection_device_v1")) {
             if (std.mem.eql(u8, msg.name, "set_selection")) {
-                // args: source (nullable), serial — serial unchecked (POC,
-                // exactly like wl_data_device.set_selection above)
-                self.setPrimarySelection(conn_id, args[0].object);
+                // args: source (nullable), serial — gated exactly like
+                // wl_data_device.set_selection above
+                if (self.maySetSelection(conn_id, conn, args[1].uint)) {
+                    self.setPrimarySelection(conn_id, args[0].object);
+                } else self.logf("c{d}: primary set_selection without keyboard focus (serial {d}) — ignored", .{ conn_id, args[1].uint });
             }
         }
         // zwp_primary_selection_offer_v1 requests never reach here: `receive`
@@ -1520,9 +1729,17 @@ pub const Compositor = struct {
                 self.configureIfNeeded(conn_id, conn, header.object_id);
                 if (conn.surfaces.getPtr(header.object_id)) |surface| {
                     if (surface.geom_pending) |geom| {
+                        // popups are placed from it (surfaceAbs)
+                        if (!surface.geom_set or !std.mem.eql(i32, &surface.geom, &geom)) self.positions_dirty = true;
                         surface.geom = geom;
                         surface.geom_set = true;
                         surface.geom_pending = null;
+                    }
+                    // its subsurfaces' z-order (place_above / place_below)
+                    if (surface.stack_pending) {
+                        surface.stack_pending = false;
+                        latchStack(conn, header.object_id);
+                        self.restacked(conn);
                     }
                     if (surface.input_pending_set) {
                         surface.input_pending_set = false;
@@ -1592,6 +1809,7 @@ pub const Compositor = struct {
         if (msg.destructor) {
             if (std.mem.eql(u8, iface.name, "wl_surface")) {
                 _ = conn.surfaces.remove(header.object_id);
+                self.restacked(conn); // it, or its children, may have been placed
                 // its subsurfaces are unmapped with it, their role objects
                 // inert (the id may name another surface right after)
                 var child_it = conn.surfaces.iterator();
@@ -1664,6 +1882,7 @@ pub const Compositor = struct {
                     const match = (surface.role == .popup and surface.popup_id == header.object_id) or
                         (surface.role == .toplevel and surface.toplevel_id == header.object_id);
                     if (match) {
+                        self.positions_dirty = true;
                         surface.role = .none;
                         surface.popup_id = 0;
                         surface.toplevel_id = 0;
@@ -1690,6 +1909,7 @@ pub const Compositor = struct {
                 while (it.next()) |kv| {
                     const surface = kv.value_ptr;
                     if (surface.role != .subsurface or surface.sub_obj_id != header.object_id) continue;
+                    self.restacked(conn); // its siblings' ranks close up
                     surface.role = .none;
                     surface.sub_obj_id = 0;
                     surface.parent_id = 0;
@@ -1702,7 +1922,9 @@ pub const Compositor = struct {
                 while (it.next()) |surface| {
                     if (surface.xdg_surface_id == header.object_id) {
                         surface.xdg_surface_id = 0;
-                        // window geometry is xdg_surface state
+                        // window geometry is xdg_surface state (popups
+                        // are placed from it)
+                        if (surface.geom_set) self.positions_dirty = true;
                         surface.geom_set = false;
                         surface.geom_pending = null;
                         break;
@@ -1719,6 +1941,7 @@ pub const Compositor = struct {
                     if (sel.conn == conn_id and sel.source == header.object_id) {
                         self.selection = null;
                         self.broadcastSelection();
+                        self.notifySelection();
                     }
                 }
                 if (self.drag) |*drag| {
@@ -1867,12 +2090,147 @@ pub const Compositor = struct {
         return null;
     }
 
+    /// wl_subsurface.place_above / place_below: the surface of role object
+    /// `sub_obj_id` goes just above / below `ref_id` — its parent or a
+    /// sibling, else bad_surface (itself included) — in the parent's
+    /// PENDING stack; the parent's next commit latches it (latchStack). Keys
+    /// on the side it lands shift by one to make room, so the parent stays 0.
+    fn placeSubsurface(self: *Compositor, conn_id: u32, conn: *Conn, sub_obj_id: u32, ref_id: u32, above: bool) void {
+        var self_id: u32 = 0;
+        var it = conn.surfaces.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.role == .subsurface and kv.value_ptr.sub_obj_id == sub_obj_id) self_id = kv.key_ptr.*;
+        }
+        if (self_id == 0) return; // inert: its parent went (the surface is unmapped)
+        const parent_id = conn.surfaces.get(self_id).?.parent_id;
+        // the reference's key: the parent is 0
+        const k: i64 = blk: {
+            if (ref_id == parent_id) break :blk 0;
+            if (ref_id != self_id) {
+                if (conn.surfaces.get(ref_id)) |sib| {
+                    if (sib.role == .subsurface and sib.parent_id == parent_id) break :blk sib.z_pending;
+                }
+            }
+            return self.sendError(conn_id, sub_obj_id, subsurface_err_bad_surface, "wl_surface is not a sibling or the parent");
+        };
+        // where it goes (`at`), and which siblings move a step away from
+        // the parent to make room: above k ≥ 0 → k+1, the ones above k up;
+        // above k < 0 → k, k and the ones below it down; below mirrors it
+        const at: i64, const lo: i64, const hi: i64, const step: i64 = if (above)
+            (if (k >= 0) .{ k + 1, k + 1, std.math.maxInt(i64), 1 } else .{ k, std.math.minInt(i64), k, -1 })
+        else
+            (if (k <= 0) .{ k - 1, std.math.minInt(i64), k - 1, -1 } else .{ k, k, std.math.maxInt(i64), 1 });
+        it = conn.surfaces.iterator();
+        while (it.next()) |kv| {
+            const sib = kv.value_ptr;
+            if (kv.key_ptr.* == self_id or sib.role != .subsurface or sib.parent_id != parent_id) continue;
+            if (sib.z_pending >= lo and sib.z_pending <= hi) sib.z_pending += step;
+        }
+        conn.surfaces.getPtr(self_id).?.z_pending = at;
+        if (conn.surfaces.getPtr(parent_id)) |parent| parent.stack_pending = true;
+    }
+
+    /// The parent's commit: its subsurfaces' pending z-order becomes theirs.
+    fn latchStack(conn: *Conn, parent_id: u32) void {
+        var it = conn.surfaces.valueIterator();
+        while (it.next()) |sib| {
+            if (sib.role == .subsurface and sib.parent_id == parent_id) sib.z = sib.z_pending;
+        }
+    }
+
     fn surfaceIdOf(conn: *Conn, target: *Surface) u32 {
         var it = conn.surfaces.iterator();
         while (it.next()) |kv| {
             if (kv.value_ptr == target) return kv.key_ptr.*;
         }
         return 0;
+    }
+
+    /// The surface `surface_id` hangs from: a subsurface's parent, a popup's
+    /// parent xdg surface; 0 for anything else, or not known.
+    pub fn surfaceParent(self: *Compositor, conn_id: u32, surface_id: u32) u32 {
+        const conn = self.conns.get(conn_id) orelse return 0;
+        const surface = conn.surfaces.get(surface_id) orelse return 0;
+        return surface.parent_id;
+    }
+
+    /// A subsurface's place in its parent's current stack (wl_subsurface
+    /// z-order) as a rank: 1, 2, … above the parent counting up from it,
+    /// −1, −2, … below it counting down; 0 for anything not a subsurface.
+    /// Dense, so it changes only when the order does. Cached per surface
+    /// (`z_rank`), recomputed for the whole conn after a restack — the
+    /// embedder reads every placed surface's after each change.
+    pub fn surfaceZ(self: *Compositor, conn_id: u32, surface_id: u32) i32 {
+        const conn = self.conns.get(conn_id) orelse return 0;
+        const surface = conn.surfaces.getPtr(surface_id) orelse return 0;
+        if (surface.role != .subsurface or surface.parent_id == 0) return 0;
+        if (conn.ranks_dirty) self.rerank(conn) catch return scanZ(conn, surface_id, surface.*);
+        return surface.z_rank;
+    }
+
+    /// surfaceZ the slow way, one sibling scan (rerank out of memory).
+    fn scanZ(conn: *Conn, surface_id: u32, surface: Surface) i32 {
+        // siblings between it and the parent (keys are distinct; the id
+        // breaks a tie all the same)
+        var n: i32 = 1;
+        var it = conn.surfaces.iterator();
+        while (it.next()) |kv| {
+            const sib = kv.value_ptr;
+            const id = kv.key_ptr.*;
+            if (id == surface_id or sib.role != .subsurface or sib.parent_id != surface.parent_id) continue;
+            const nearer = if (surface.z > 0)
+                sib.z > 0 and (sib.z < surface.z or (sib.z == surface.z and id < surface_id))
+            else
+                sib.z < 0 and (sib.z > surface.z or (sib.z == surface.z and id > surface_id));
+            if (nearer) n += 1;
+        }
+        return if (surface.z > 0) n else -n;
+    }
+
+    /// A subsurface's stack, parent or role changed (or one came or went):
+    /// the conn's cached ranks are stale, and placed surfaces may have moved.
+    fn restacked(self: *Compositor, conn: *Conn) void {
+        conn.ranks_dirty = true;
+        self.positions_dirty = true;
+    }
+
+    /// Every subsurface's `z_rank` from the current keys, in one sort: per
+    /// parent, the ones above it counting up from it, the ones below it
+    /// counting down (scanZ's order, ties by id the same way).
+    fn rerank(self: *Compositor, conn: *Conn) !void {
+        const Entry = struct { parent: u32, z: i64, id: u32, s: *Surface };
+        var list: std.ArrayList(Entry) = .empty;
+        defer list.deinit(self.gpa);
+        var it = conn.surfaces.iterator();
+        while (it.next()) |kv| {
+            const s = kv.value_ptr;
+            if (s.role != .subsurface or s.parent_id == 0) continue;
+            try list.append(self.gpa, .{ .parent = s.parent_id, .z = s.z, .id = kv.key_ptr.*, .s = s });
+        }
+        std.mem.sort(Entry, list.items, {}, struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                if (a.parent != b.parent) return a.parent < b.parent;
+                const a_up = a.z > 0;
+                if (a_up != (b.z > 0)) return !a_up; // the ones below first
+                // nearest the parent first
+                if (a_up) return a.z < b.z or (a.z == b.z and a.id < b.id);
+                return a.z > b.z or (a.z == b.z and a.id > b.id);
+            }
+        }.lessThan);
+        var n: i32 = 0;
+        for (list.items, 0..) |e, i| {
+            const up = e.z > 0;
+            if (i == 0 or e.parent != list.items[i - 1].parent or up != (list.items[i - 1].z > 0)) n = 0;
+            n += 1;
+            e.s.z_rank = if (up) n else -n;
+        }
+        conn.ranks_dirty = false;
+    }
+
+    /// Whether positions_dirty was raised since the last call; clears it.
+    pub fn takePositionsDirty(self: *Compositor) bool {
+        defer self.positions_dirty = false;
+        return self.positions_dirty;
     }
 
     /// Walk parents to the root (toplevel) surface id.
@@ -1888,7 +2246,12 @@ pub const Compositor = struct {
         return id;
     }
 
-    /// Offset of a surface relative to its root toplevel (sums the parent chain).
+    /// Offset of a surface's origin from its root toplevel's origin (sums
+    /// the parent chain), logical px. A popup's x/y is its configured
+    /// position, which xdg-shell counts from the parent's window geometry
+    /// to the popup's own: its origin is that plus the parent's geometry
+    /// offset minus its own (`popupGeomOffset`) — GTK3/4 CSD windows and
+    /// menus both hang shadows outside their geometry.
     pub fn surfaceAbs(self: *Compositor, conn_id: u32, surface_id: u32) struct { x: i32, y: i32 } {
         const conn = self.conns.get(conn_id) orelse return .{ .x = 0, .y = 0 };
         var x: i32 = 0;
@@ -1897,12 +2260,30 @@ pub const Compositor = struct {
         var depth: u8 = 0;
         while (depth < 8) : (depth += 1) {
             const surface = conn.surfaces.get(id) orelse break;
-            x += surface.x;
-            y += surface.y;
+            // every term is a client's i32 (positions, window geometry):
+            // saturate, never overflow
+            x +|= surface.x;
+            y +|= surface.y;
             if (surface.parent_id == 0) break;
+            if (surface.role == .popup) {
+                const own = popupGeomOffset(surface);
+                const parent = if (conn.surfaces.get(surface.parent_id)) |p| popupGeomOffset(p) else [2]i32{ 0, 0 };
+                x +|= parent[0] -| own[0];
+                y +|= parent[1] -| own[1];
+            }
             id = surface.parent_id;
         }
         return .{ .x = x, .y = y };
+    }
+
+    /// Where an xdg surface's window geometry starts, for popup placement:
+    /// what set_window_geometry named, else the surface origin. The default
+    /// geometry (the bounds with subsurfaces, `windowGeometry`) is left out
+    /// on purpose: xwayland-satellite sets none, hangs its titlebar above
+    /// the surface as a subsurface and places menus from the X window's
+    /// origin, i.e. the surface's (plan.md, the satellite entry).
+    fn popupGeomOffset(surface: Surface) [2]i32 {
+        return if (surface.geom_set) .{ surface.geom[0], surface.geom[1] } else .{ 0, 0 };
     }
 
     const state_maximized: u32 = 1;
@@ -2163,8 +2544,10 @@ pub const Compositor = struct {
             surface.log_w = view.w;
             surface.log_h = view.h;
         } else {
-            surface.log_w = @divTrunc(@as(i32, @intCast(buf_w)), surface.buffer_scale);
-            surface.log_h = @divTrunc(@as(i32, @intCast(buf_h)), surface.buffer_scale);
+            // the embedder's u32 (a buffer's size, a client's claim at heart)
+            const max: u32 = std.math.maxInt(i32);
+            surface.log_w = @divTrunc(@as(i32, @intCast(@min(buf_w, max))), surface.buffer_scale);
+            surface.log_h = @divTrunc(@as(i32, @intCast(@min(buf_h, max))), surface.buffer_scale);
         }
     }
 
@@ -2210,27 +2593,30 @@ pub const Compositor = struct {
         var x1: i32 = surface.log_w;
         var y1: i32 = surface.log_h;
         var any = surface.log_w > 0 and surface.log_h > 0;
+        const base = self.surfaceAbs(conn_id, surface_id); // non-zero for a popup
         var it = conn.surfaces.iterator();
         while (it.next()) |kv| {
             const sub = kv.value_ptr;
             if (sub.role != .subsurface or sub.log_w <= 0 or sub.log_h <= 0) continue;
             if (subsurfaceRoot(conn, kv.key_ptr.*) != surface_id) continue;
-            const at = self.surfaceAbs(conn_id, kv.key_ptr.*); // sums the chain up to the root
+            const abs = self.surfaceAbs(conn_id, kv.key_ptr.*); // sums the chain up to the root
+            // client positions and geometry: saturate (as surfaceAbs does)
+            const at = .{ .x = abs.x -| base.x, .y = abs.y -| base.y };
             if (!any) {
                 x0 = at.x;
                 y0 = at.y;
-                x1 = at.x + sub.log_w;
-                y1 = at.y + sub.log_h;
+                x1 = at.x +| sub.log_w;
+                y1 = at.y +| sub.log_h;
                 any = true;
                 continue;
             }
             x0 = @min(x0, at.x);
             y0 = @min(y0, at.y);
-            x1 = @max(x1, at.x + sub.log_w);
-            y1 = @max(y1, at.y + sub.log_h);
+            x1 = @max(x1, at.x +| sub.log_w);
+            y1 = @max(y1, at.y +| sub.log_h);
         }
         if (!any) return .{};
-        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        return .{ .x = x0, .y = y0, .w = x1 -| x0, .h = y1 -| y0 };
     }
 
     /// xdg_popup.reposition (v3): recompute the popup's placement from a new
@@ -2244,6 +2630,7 @@ pub const Compositor = struct {
         surface.y = placed.y;
         surface.popup_w = pos.w;
         surface.popup_h = pos.h;
+        self.positions_dirty = true;
         self.sendEvent(conn_id, popup_id, "xdg_popup", "repositioned", &.{.{ .uint = token }});
         self.sendEvent(conn_id, popup_id, "xdg_popup", "configure", &.{
             .{ .int = surface.x },       .{ .int = surface.y },
@@ -2411,14 +2798,24 @@ pub const Compositor = struct {
             self.sendEvent(conn_id, id, "wl_shm", "format", &.{.{ .uint = shm_format_xrgb8888 }});
         } else if (std.mem.eql(u8, interface, "zwp_linux_dmabuf_v1")) {
             // v4+: formats come with the feedback. v3: one modifier event per
-            // table entry. v1/v2 get nothing: their `format` event promises
-            // implicit modifiers, which no relay backend can read.
-            if (version == 3) {
-                if (self.dmabuf) |d| for (0..d.count()) |i| {
+            // table entry. v1/v2: a `format` event promises the implicit
+            // modifier (DRM_FORMAT_MOD_INVALID), so one per format the table
+            // offers with it (virtgpu's; readback's LINEAR-only table: none).
+            if (self.dmabuf) |d| {
+                if (version == 3) for (0..d.count()) |i| {
                     const e = d.entry(i);
                     self.sendEvent(conn_id, id, "zwp_linux_dmabuf_v1", "modifier", &.{
                         .{ .uint = e.format }, .{ .uint = @truncate(e.modifier >> 32) }, .{ .uint = @truncate(e.modifier) },
                     });
+                };
+                if (version < 3) for (0..d.count()) |i| {
+                    const e = d.entry(i);
+                    if (e.modifier != dmabuf_mod_invalid) continue;
+                    const seen = for (0..i) |j| {
+                        const o = d.entry(j);
+                        if (o.format == e.format and o.modifier == dmabuf_mod_invalid) break true;
+                    } else false;
+                    if (!seen) self.sendEvent(conn_id, id, "zwp_linux_dmabuf_v1", "format", &.{.{ .uint = e.format }});
                 };
             }
         } else if (std.mem.eql(u8, interface, "wp_presentation")) {
@@ -2492,7 +2889,7 @@ pub const Compositor = struct {
     fn sendOutputMode(self: *Compositor, conn_id: u32, output_id: u32) void {
         self.sendEvent(conn_id, output_id, "wl_output", "mode", &.{
             .{ .uint = 0x1 | 0x2 }, // current | preferred
-            .{ .int = self.desk_w * self.output_scale }, .{ .int = self.desk_h * self.output_scale },
+            .{ .int = self.desk_w *| self.output_scale }, .{ .int = self.desk_h *| self.output_scale },
             .{ .int = 60000 },
         });
     }
@@ -2564,15 +2961,171 @@ pub const Compositor = struct {
     // clipboard (wl_data_device selection)
     // ------------------------------------------------------------------
 
+    /// A source's `offer(mime)` (wl_data_source, primary source): kept
+    /// unless over max_mime_len (it would be echoed in fixed-size events)
+    /// or the source already offers max_source_mimes. Ignored, like the
+    /// spec's other bad requests without an error code.
+    fn addSourceMime(self: *Compositor, conn_id: u32, list: *std.ArrayList([]u8), mime: ?[]const u8) !void {
+        const m = mime orelse "";
+        if (m.len > max_mime_len) return self.logf("c{d}: offer of a {d}-byte mime type ignored", .{ conn_id, m.len });
+        if (list.items.len >= max_source_mimes) return;
+        const copy = try self.gpa.dupe(u8, m);
+        list.append(self.gpa, copy) catch |err| {
+            self.gpa.free(copy);
+            return err;
+        };
+    }
+
     fn setSelection(self: *Compositor, conn_id: u32, source_id: u32) void {
         if (self.selection) |old| {
             // replaced (or cleared) → previous source is done; wl-copy exits on this
-            if (!(old.conn == conn_id and old.source == source_id)) {
+            if (old.conn == 0) {
+                self.dropOwnSelection(); // the embedder's: nobody to cancel
+            } else if (!(old.conn == conn_id and old.source == source_id)) {
                 self.sendEvent(old.conn, old.source, "wl_data_source", "cancelled", &.{});
             }
         }
         self.selection = if (source_id != 0) .{ .conn = conn_id, .source = source_id } else null;
         self.broadcastSelection();
+        // an explicit clear (set_selection(null)) names the client that
+        // cleared it, with no types: the embedder tells it apart from the
+        // owner going (conn 0, no types) — the page clipboard follows a clear
+        if (source_id == 0) {
+            if (self.selection_fn) |f| f(self.ctx, conn_id, &.{});
+        } else self.notifySelection();
+    }
+
+    /// Tell the embedder what the clipboard selection is now (selection_fn).
+    fn notifySelection(self: *Compositor) void {
+        const f = self.selection_fn orelse return;
+        const sel = self.selection orelse return f(self.ctx, 0, &.{});
+        if (sel.conn == 0) {
+            const own = &(self.own_selection orelse return f(self.ctx, 0, &.{}));
+            var mimes: std.ArrayList([]const u8) = .empty;
+            defer mimes.deinit(self.gpa);
+            for (own.entries.items) |e| mimes.append(self.gpa, e.mime) catch return;
+            return f(self.ctx, 0, mimes.items);
+        }
+        const src_conn = self.conns.get(sel.conn) orelse return f(self.ctx, sel.conn, &.{});
+        const list = src_conn.source_mimes.get(sel.source) orelse return f(self.ctx, sel.conn, &.{});
+        f(self.ctx, sel.conn, list.items);
+    }
+
+    fn dropOwnSelection(self: *Compositor) void {
+        const own = &(self.own_selection orelse return);
+        // the relay's copies of it go too (FDMSG own_pipe, generation 0)
+        if (own.sent != 0) {
+            if (self.fdmsg_fn) |f| {
+                var aux: [stream.OwnPipe.header_len]u8 = undefined;
+                (stream.OwnPipe{ .token = 0, .gen = 0, .blob = 0, .flags = 0, .bytes = &.{} }).writeHeader(&aux);
+                f(self.ctx, 0, @intFromEnum(stream.FdMsgKind.own_pipe), &.{}, &aux);
+            }
+        }
+        own.deinit(self.gpa);
+        self.own_selection = null;
+    }
+
+    /// The embedder's own clipboard selection (the page's clipboard, say):
+    /// it replaces whatever a client set (that source is cancelled) and is
+    /// offered, like any selection, only to the keyboard-focused client.
+    /// The core keeps the bytes and answers each `receive` (serveOwn: FDMSG
+    /// own_pipe, the relay writes them into the receiver's pipe and closes
+    /// it). Only on a link whose relay said it can (selection_bridge),
+    /// else error.Unsupported and nothing changes. `entries`:
+    /// repeated { u32 mime_len, mime, u32 data_len, data }, little-endian;
+    /// data_len 0xffffffff = the previous entry's data again (aliases such
+    /// as text/plain and UTF8_STRING share one copy). An empty `entries`
+    /// clears the selection if it is the embedder's own (never a client's).
+    /// Malformed input, an empty or NUL-holding mime, or more than
+    /// own_selection_max bytes in all leave the selection unchanged.
+    pub fn setOwnSelection(self: *Compositor, entries: []const u8) !void {
+        if (!self.selection_bridge) return error.Unsupported;
+        if (entries.len == 0) {
+            const sel = self.selection orelse return;
+            if (sel.conn != 0) return;
+            self.dropOwnSelection();
+            self.selection = null;
+            self.broadcastSelection();
+            self.notifySelection();
+            return;
+        }
+        var own: OwnSelection = .{};
+        errdefer own.deinit(self.gpa);
+        var total: usize = 0;
+        var rest = entries;
+        while (rest.len > 0) {
+            if (rest.len < 4) return error.BadSelection;
+            const mime_len = std.mem.readInt(u32, rest[0..4], .little);
+            if (mime_len == 0 or mime_len > max_mime_len or rest.len - 4 < @as(usize, mime_len) + 4) return error.BadSelection;
+            const mime = rest[4..][0..mime_len];
+            if (std.mem.indexOfScalar(u8, mime, 0) != null) return error.BadSelection;
+            rest = rest[4 + mime_len ..];
+            const data_len = std.mem.readInt(u32, rest[0..4], .little);
+            rest = rest[4..];
+            var blob: u32 = undefined;
+            if (data_len == 0xffffffff) {
+                if (own.blobs.items.len == 0) return error.BadSelection;
+                blob = @intCast(own.blobs.items.len - 1);
+            } else {
+                if (rest.len < data_len) return error.BadSelection;
+                total += data_len;
+                if (total > own_selection_max) return error.SelectionTooLarge;
+                // one payload a mime at most (OwnSelection.sent is a u32)
+                if (own.blobs.items.len == own_selection_max_mimes) return error.BadSelection;
+                const copy = try self.gpa.dupe(u8, rest[0..data_len]);
+                own.blobs.append(self.gpa, copy) catch |err| {
+                    self.gpa.free(copy);
+                    return err;
+                };
+                blob = @intCast(own.blobs.items.len - 1);
+                rest = rest[data_len..];
+            }
+            if (own.data(mime) != null) continue; // the first one of a mime wins
+            if (own.entries.items.len == own_selection_max_mimes) return error.BadSelection;
+            const m = try self.gpa.dupe(u8, mime);
+            own.entries.append(self.gpa, .{ .mime = m, .blob = blob }) catch |err| {
+                self.gpa.free(m);
+                return err;
+            };
+        }
+        if (self.selection) |old| {
+            if (old.conn != 0) self.sendEvent(old.conn, old.source, "wl_data_source", "cancelled", &.{});
+        }
+        self.dropOwnSelection();
+        self.own_selection = own;
+        self.own_gen +%= 1;
+        if (self.own_gen == 0) self.own_gen = 1;
+        self.selection = .{ .conn = 0, .source = self.own_gen };
+        self.broadcastSelection();
+        self.notifySelection();
+    }
+
+    /// Read the current clipboard selection as `mime` for the embedder:
+    /// the source client is sent `send(mime, fd)` in an FDMSG pipe_read
+    /// frame (aux = read_id ++ max_bytes) — the relay makes the pipe, reads
+    /// it (bounded by `max_bytes` and its own deadline) and answers with
+    /// pipe_read data for read_id. False (nothing sent): the relay can't
+    /// (no selection_bridge), no selection, the embedder's own (it has the
+    /// bytes), or `mime` not offered.
+    pub fn readSelection(self: *Compositor, mime: []const u8, read_id: u32, max_bytes: u32) bool {
+        if (!self.selection_bridge) return false;
+        const sel = self.selection orelse return false;
+        if (sel.conn == 0 or mime.len == 0 or mime.len > max_mime_len) return false;
+        const src_conn = self.conns.get(sel.conn) orelse return false;
+        const list = src_conn.source_mimes.get(sel.source) orelse return false;
+        const offered = for (list.items) |m| {
+            if (std.mem.eql(u8, m, mime)) break true;
+        } else false;
+        if (!offered) return false;
+        const fdmsg_fn = self.fdmsg_fn orelse return false;
+        const opcode = comptime protocol.find("wl_data_source").?.eventIndex("send").?;
+        var buf: [512]u8 = undefined;
+        const msg = wire.encode(&buf, sel.source, opcode, &.{ .{ .string = mime }, .fd }) catch return false;
+        var aux: [8]u8 = undefined;
+        std.mem.writeInt(u32, aux[0..4], read_id, .little);
+        std.mem.writeInt(u32, aux[4..8], max_bytes, .little);
+        fdmsg_fn(self.ctx, sel.conn, @intFromEnum(stream.FdMsgKind.pipe_read), msg, &aux);
+        return true;
     }
 
     /// Deliver the current selection to every conn that holds keyboard focus
@@ -2595,15 +3148,23 @@ pub const Compositor = struct {
             self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "selection", &.{.{ .object = 0 }});
             return;
         };
-        const src_conn = self.conns.get(sel.conn) orelse return;
-        const mimes = src_conn.source_mimes.get(sel.source) orelse return;
+        var own_mimes: [own_selection_max_mimes][]const u8 = undefined;
+        const mimes: []const []const u8 = if (sel.conn == 0) blk: {
+            const own = &(self.own_selection orelse return);
+            const n = @min(own.entries.items.len, own_mimes.len);
+            for (own.entries.items[0..n], 0..) |e, i| own_mimes[i] = e.mime;
+            break :blk own_mimes[0..n];
+        } else blk: {
+            const src_conn = self.conns.get(sel.conn) orelse return;
+            break :blk (src_conn.source_mimes.get(sel.source) orelse return).items;
+        };
 
         const offer_id = conn.next_server_id;
         conn.next_server_id += 1;
         conn.objects.put(self.gpa, offer_id, protocol.find("wl_data_offer").?, 3) catch return;
         conn.offers.put(self.gpa, offer_id, sel) catch return;
         self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "data_offer", &.{.{ .new_id = offer_id }});
-        for (mimes.items) |mime| {
+        for (mimes) |mime| {
             self.sendEvent(conn_id, offer_id, "wl_data_offer", "offer", &.{.{ .string = mime }});
         }
         self.sendEvent(conn_id, conn.data_device_id, "wl_data_device", "selection", &.{.{ .object = offer_id }});
@@ -2632,6 +3193,10 @@ pub const Compositor = struct {
         const args = wire.decodeArgs(bytes[wire.header_size..], &.{ .string, .fd }, &vals) catch
             return self.dropPipe(conn_id, token);
         const mime = args[0].string orelse return self.dropPipe(conn_id, token);
+        // no source offers a longer one (addSourceMime), and it would be
+        // echoed in the source's send event
+        if (mime.len > max_mime_len) return self.dropPipe(conn_id, token);
+        if (offer.conn == 0 and !is_primary) return self.serveOwn(conn_id, offer.source, mime, token);
         // an offer outlives its source (the receiver may hold it past a
         // selection change): a receive on it reads EOF, it is not routed to
         // whatever the source's id names by now
@@ -2642,10 +3207,36 @@ pub const Compositor = struct {
         else
             comptime protocol.find("wl_data_source").?.eventIndex("send").?;
         var buf: [512]u8 = undefined;
-        const msg = wire.encodeMessage(&buf, offer.source, opcode, &.{ .{ .string = mime }, .fd });
+        const msg = wire.encode(&buf, offer.source, opcode, &.{ .{ .string = mime }, .fd }) catch
+            return self.dropPipe(conn_id, token);
         var aux: [4]u8 = undefined;
         std.mem.writeInt(u32, &aux, token, .little);
         fdmsg_fn(self.ctx, offer.conn, 3, msg, &aux); // kind 3 = pipe
+    }
+
+    /// A receive on an offer of the embedder's own selection (generation
+    /// `gen`), answered with the token and no wire message: FDMSG own_pipe
+    /// naming the payload, its bytes along only the first time on this link
+    /// (the relay keeps them and writes them into the parked fd itself).
+    /// Own selections exist only on a selection_bridge link, so no other
+    /// relay is ever sent one. A stale offer (the own selection changed
+    /// since) or a mime it does not have reads EOF, as for a gone source.
+    fn serveOwn(self: *Compositor, conn_id: u32, gen: u32, mime: []const u8, token: u32) void {
+        const own = &(self.own_selection orelse return self.dropPipe(conn_id, token));
+        if (gen != self.own_gen) return self.dropPipe(conn_id, token);
+        const blob = own.blobOf(mime) orelse return self.dropPipe(conn_id, token);
+        const data = own.blobs.items[blob];
+        if (!self.selection_bridge) return self.dropPipe(conn_id, token);
+        const fdmsg_fn = self.fdmsg_fn orelse return;
+        const bit = @as(u32, 1) << @intCast(blob);
+        const first = own.sent & bit == 0;
+        const hlen = stream.OwnPipe.header_len;
+        const aux = self.gpa.alloc(u8, hlen + if (first) data.len else 0) catch return self.dropPipe(conn_id, token);
+        defer self.gpa.free(aux);
+        (stream.OwnPipe{ .token = token, .gen = gen, .blob = blob, .flags = if (first) stream.OwnPipe.has_bytes else 0, .bytes = &.{} }).writeHeader(aux[0..hlen]);
+        if (first) @memcpy(aux[hlen..], data);
+        fdmsg_fn(self.ctx, conn_id, @intFromEnum(stream.FdMsgKind.own_pipe), &.{}, aux);
+        own.sent |= bit;
     }
 
     /// A receive that has no source to go to: hand the token back with no
@@ -2896,9 +3487,12 @@ pub const Compositor = struct {
     fn dragAccept(self: *Compositor, conn_id: u32, offer_id: u32, mime: ?[]const u8) void {
         const drag = if (self.drag) |*d| d else return;
         if (conn_id != drag.focus_conn or offer_id != drag.focus_offer or drag.source_id == 0) return;
-        drag.accepted = mime != null;
+        // no source offers a mime over max_mime_len: such an accept names
+        // none of the offer's types — a revoke (and `target` echoes it)
+        const m: ?[]const u8 = if (mime) |s| (if (s.len > max_mime_len) null else s) else null;
+        drag.accepted = m != null;
         if (self.conns.get(drag.source_conn)) |_| {
-            self.sendEvent(drag.source_conn, drag.source_id, "wl_data_source", "target", &.{.{ .string = mime }});
+            self.sendEvent(drag.source_conn, drag.source_id, "wl_data_source", "target", &.{.{ .string = m }});
         }
     }
 
@@ -2955,8 +3549,10 @@ pub const Compositor = struct {
         // a minimized window is not on screen (an embedder lagging behind)
         if (underMinimized(conn, surface_id)) return;
         conn.pointer_focus = surface_id;
+        conn.buttons_held = 0; // a new surface: no press of this conn is held on it
         const serial = nextSerial(conn);
         conn.pointer_enter_serial = serial; // set_shape/set_cursor must echo this serial
+        noteInputSerial(conn, serial); // a hover alone doesn't make it the last input conn
         conn.cursor_surface = 0; // a new enter takes a fresh set_cursor
         self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "enter", &.{
             .{ .uint = serial }, .{ .object = surface_id },
@@ -2975,6 +3571,7 @@ pub const Compositor = struct {
         if (conn.pointer_id == 0 or conn.pointer_focus == 0) return;
         const focus = conn.pointer_focus;
         conn.pointer_focus = 0;
+        conn.buttons_held = 0; // the implicit grab is over (its release goes elsewhere)
         // its constraint ends first (unlocked/unconfined while the client
         // still sees its surface under the pointer), then the leave
         self.updateConstraints(conn_id, conn);
@@ -3042,11 +3639,65 @@ pub const Compositor = struct {
         if (self.drag != null) return;
         const conn = self.conns.get(conn_id) orelse return;
         if (conn.pointer_id == 0 or conn.pointer_focus == 0) return;
+        const serial = nextSerial(conn);
+        noteInputSerial(conn, serial);
+        self.last_input_conn = conn_id;
+        const bit = @as(u32, 1) << @as(u5, @truncate(button));
+        if (pressed) {
+            if (conn.buttons_held == 0) {
+                conn.grab_serial_first = serial;
+                conn.grab_surface = conn.pointer_focus;
+            }
+            conn.grab_serial_last = serial;
+            conn.buttons_held |= bit;
+        } else conn.buttons_held &= ~bit;
         self.sendEvent(conn_id, conn.pointer_id, "wl_pointer", "button", &.{
-            .{ .uint = nextSerial(conn) }, .{ .uint = time_ms },
-            .{ .uint = button },           .{ .uint = if (pressed) 1 else 0 },
+            .{ .uint = serial }, .{ .uint = time_ms },
+            .{ .uint = button }, .{ .uint = if (pressed) 1 else 0 },
         });
         self.pointerFrame(conn_id, conn);
+    }
+
+    /// Is `serial` that of a press in the implicit grab still going on, on
+    /// `toplevel_id`'s window (the toplevel or one of its subsurfaces: foot's
+    /// borders)? What xdg_toplevel.move/resize must name to be honoured
+    /// (xdg-shell: the compositor may ignore a request whose serial is no
+    /// longer valid). Released — or the pointer handed elsewhere — it is
+    /// over, whatever the serial.
+    fn inImplicitGrab(conn: *Conn, serial: u32, toplevel_id: u32) bool {
+        return pressHeld(conn, serial) and subsurfaceRoot(conn, conn.grab_surface) == toplevel_id;
+    }
+
+    /// Is `serial` that of a press of this conn's implicit grab, still
+    /// held? What wl_data_device.start_drag must name (GTK, Chromium: the
+    /// press that began the drag gesture).
+    fn pressHeld(conn: *Conn, serial: u32) bool {
+        if (conn.buttons_held == 0) return false;
+        return serial -% conn.grab_serial_first <= conn.grab_serial_last -% conn.grab_serial_first;
+    }
+
+    /// Keep `serial` among the conn's recent input serials (key, button,
+    /// keyboard or pointer enter) — see maySetSelection.
+    fn noteInputSerial(conn: *Conn, serial: u32) void {
+        conn.input_serials[conn.input_serial_next % conn.input_serials.len] = serial;
+        conn.input_serial_next +%= 1;
+    }
+
+    /// May this conn set (or clear) the clipboard or primary selection now?
+    /// Only while it holds keyboard focus (what wl-copy waits for: it maps
+    /// a 1×1 surface and sets the selection at its keyboard enter; GTK,
+    /// Qt and foot copy on a key or click of their own window), or — a slow
+    /// client whose request arrives after the focus moved — when `serial`
+    /// is one of its recent input serials and no other client has had a
+    /// key, a button or keyboard focus since. Otherwise a client in the
+    /// background could replace the selection at any moment (and the page
+    /// bridge would mirror it to the host clipboard). Refused requests are
+    /// ignored, as the protocol has it for invalid serials.
+    fn maySetSelection(self: *Compositor, conn_id: u32, conn: *Conn, serial: u32) bool {
+        if (conn.keyboard_focus != 0) return true;
+        if (self.last_input_conn != conn_id or serial == 0) return false;
+        for (conn.input_serials) |s| if (s == serial) return true;
+        return false;
     }
 
     /// A wheel event. `value_fixed` is the continuous scroll vector (surface
@@ -3513,8 +4164,11 @@ pub const Compositor = struct {
         conn.keyboard_focus = surface_id;
         if (before != 0) self.sendActivation(conn_id, conn, before);
         self.sendActivation(conn_id, conn, surface_id);
+        const serial = nextSerial(conn);
+        noteInputSerial(conn, serial);
+        self.last_input_conn = conn_id;
         self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "enter", &.{
-            .{ .uint = nextSerial(conn) }, .{ .object = surface_id }, .{ .array = &.{} },
+            .{ .uint = serial }, .{ .object = surface_id }, .{ .array = &.{} },
         });
         self.sendModifiers(conn_id, conn);
         // clipboard follows keyboard focus (wl_data_device.selection on enter)
@@ -3611,9 +4265,12 @@ pub const Compositor = struct {
     pub fn keyboardKey(self: *Compositor, conn_id: u32, time_ms: u32, evdev_key: u32, pressed: bool) void {
         const conn = self.conns.get(conn_id) orelse return;
         if (conn.keyboard_id == 0) return;
+        const serial = nextSerial(conn);
+        noteInputSerial(conn, serial);
+        self.last_input_conn = conn_id;
         self.sendEvent(conn_id, conn.keyboard_id, "wl_keyboard", "key", &.{
-            .{ .uint = nextSerial(conn) }, .{ .uint = time_ms },
-            .{ .uint = evdev_key },        .{ .uint = if (pressed) 1 else 0 },
+            .{ .uint = serial },    .{ .uint = time_ms },
+            .{ .uint = evdev_key }, .{ .uint = if (pressed) 1 else 0 },
         });
         // modifier bookkeeping
         const mod: u32 = switch (evdev_key) {
@@ -3628,11 +4285,32 @@ pub const Compositor = struct {
             const before = conn.mods_depressed;
             if (pressed) conn.mods_depressed |= mod else conn.mods_depressed &= ~mod;
             changed = conn.mods_depressed != before;
-        } else if (evdev_key == key_capslock and pressed) {
-            conn.mods_locked ^= mod_lock;
+        } else if ((evdev_key == key_capslock or evdev_key == key_numlock) and pressed) {
+            self.mods_locked ^= if (evdev_key == key_capslock) mod_lock else mod_num;
             changed = true;
         }
         if (changed) self.sendModifiers(conn_id, conn);
+    }
+
+    /// The browser's lock state (getModifierState): Caps Lock and NumLock
+    /// are set to it, and every client holding keyboard focus is told when
+    /// that changed something. Unchanged: nothing is sent.
+    pub fn keyboardLocks(self: *Compositor, caps_lock: bool, num_lock: bool) void {
+        const locked = (if (caps_lock) mod_lock else 0) | (if (num_lock) mod_num else 0);
+        if (locked == self.mods_locked) return;
+        self.mods_locked = locked;
+        var it = self.conns.iterator();
+        while (it.next()) |kv| {
+            const conn = kv.value_ptr.*;
+            if (conn.keyboard_id != 0 and conn.keyboard_focus != 0) self.sendModifiers(kv.key_ptr.*, conn);
+        }
+    }
+
+    /// The seat's lock state now — keyboardLocks' last word or the lock
+    /// keys' toggles since — for an embedder that carries it over to the
+    /// next link's compositor.
+    pub fn lockState(self: *const Compositor) struct { caps_lock: bool, num_lock: bool } {
+        return .{ .caps_lock = self.mods_locked & mod_lock != 0, .num_lock = self.mods_locked & mod_num != 0 };
     }
 
     fn sendModifiers(self: *Compositor, conn_id: u32, conn: *Conn) void {
@@ -3640,7 +4318,7 @@ pub const Compositor = struct {
             .{ .uint = nextSerial(conn) },
             .{ .uint = conn.mods_depressed },
             .{ .uint = 0 },
-            .{ .uint = conn.mods_locked },
+            .{ .uint = self.mods_locked },
             .{ .uint = 0 },
         });
     }
@@ -3662,7 +4340,12 @@ pub const Compositor = struct {
         const iface = comptime protocol.find(iface_name).?;
         const opcode = comptime iface.eventIndex(event_name).?;
         var buf: [1024]u8 = undefined;
-        const msg = wire.encodeMessage(&buf, object_id, opcode, args);
+        // client-sized strings are capped where they enter (max_mime_len,
+        // clampUtf8); this refusal is the backstop, never a write past buf
+        const msg = wire.encode(&buf, object_id, opcode, args) catch {
+            self.logf("c{d}: {s}.{s} over {d} B, not sent", .{ conn_id, iface_name, event_name, buf.len });
+            return;
+        };
         self.send_fn(self.ctx, conn_id, msg);
     }
 
@@ -3715,6 +4398,8 @@ const TestSink = struct {
     fdmsg_token: u32 = 0,
     fdmsg_bytes: [128]u8 = undefined,
     fdmsg_len: usize = 0,
+    // log lines
+    logs: u32 = 0,
     // surface_fn: last emission + call count
     surf_id: u32 = 0,
     surf_value: u32 = 0xfffffffe,
@@ -3763,6 +4448,29 @@ const TestSink = struct {
     // presented_fn: the last age + count (the event itself goes to `events`)
     presented_age: u32 = 0,
     presented_calls: u32 = 0,
+    // last fdmsg aux bytes (first 128) — pipe writes carry token ++ data
+    fdmsg_aux: [128]u8 = undefined,
+    fdmsg_calls: u32 = 0,
+    // selection_fn: last owner, its mimes joined with ',', + count
+    sel_conn: u32 = 0xffffffff,
+    sel_mimes: [128]u8 = undefined,
+    sel_mimes_len: usize = 0,
+    sel_calls: u32 = 0,
+
+    fn selection(ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        self.sel_conn = conn_id;
+        self.sel_calls += 1;
+        self.sel_mimes_len = 0;
+        for (mimes, 0..) |m, i| {
+            if (i > 0) {
+                self.sel_mimes[self.sel_mimes_len] = ',';
+                self.sel_mimes_len += 1;
+            }
+            @memcpy(self.sel_mimes[self.sel_mimes_len..][0..m.len], m);
+            self.sel_mimes_len += m.len;
+        }
+    }
 
     fn presented(ctx: ?*anyopaque, conn_id: u32, age_us: u32, msg: []const u8) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx.?));
@@ -3817,7 +4525,11 @@ const TestSink = struct {
         self.fdmsg_kind = kind;
         self.fdmsg_token = if (aux.len == 4) std.mem.readInt(u32, aux[0..4], .little) else 0;
         self.fdmsg_aux_len = aux.len;
-        @memcpy(self.fdmsg_bytes[0..wire_bytes.len], wire_bytes);
+        self.fdmsg_calls += 1;
+        const n = @min(aux.len, self.fdmsg_aux.len);
+        @memcpy(self.fdmsg_aux[0..n], aux[0..n]);
+        const wn = @min(wire_bytes.len, self.fdmsg_bytes.len); // len stays real
+        @memcpy(self.fdmsg_bytes[0..wn], wire_bytes[0..wn]);
         self.fdmsg_len = wire_bytes.len;
     }
 
@@ -3831,13 +4543,16 @@ const TestSink = struct {
             .bytes = undefined,
             .len = bytes.len,
         };
-        @memcpy(entry.bytes[0..bytes.len], bytes);
+        // the first 128 bytes (a long mime's offer is longer; len is real)
+        const n = @min(bytes.len, entry.bytes.len);
+        @memcpy(entry.bytes[0..n], bytes[0..n]);
         self.events.append(self.gpa, entry) catch unreachable;
     }
 
     fn log(ctx: ?*anyopaque, text: []const u8) void {
-        _ = ctx;
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
         _ = text;
+        self.logs += 1;
     }
 
     fn surfaceEvent(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, value: u32) void {
@@ -3890,6 +4605,16 @@ fn testSetup(sink: *TestSink) Compositor {
     var comp = Compositor.init(std.testing.allocator, sink, TestSink.send, TestSink.log);
     comp.srvobj_fn = TestSink.srvobj;
     return comp;
+}
+
+/// Tests: `conn_id` just had input of its own (a key press, say) — the
+/// serial a selection request of a client without keyboard focus names.
+fn testInputSerial(comp: *Compositor, conn_id: u32) u32 {
+    const conn = comp.conns.get(conn_id).?;
+    const serial = Compositor.nextSerial(conn);
+    Compositor.noteInputSerial(conn, serial);
+    comp.last_input_conn = conn_id;
+    return serial;
 }
 
 test "get_registry yields all globals, sync yields done+delete_id" {
@@ -4256,6 +4981,102 @@ test "subsurface position and root/abs tracking" {
     try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .new_id = 9 }, .{ .object = 7 }, .{ .object = 6 } }));
     try std.testing.expectEqual(Role.subsurface, comp.surfaceRole(1, 7));
     try std.testing.expectEqual(@as(u32, 6), comp.surfaceRoot(1, 7));
+}
+
+test "subsurface z-order: new ones on top; place_above / place_below latch at the parent's commit, below the parent too; a stranger is bad_surface" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+
+    const sub = comptime protocol.find("wl_subsurface").?;
+    const above_op = comptime sub.requestIndex("place_above").?;
+    const below_op = comptime sub.requestIndex("place_below").?;
+    const commit_op = comptime protocol.find("wl_surface").?.requestIndex("commit").?;
+    const T = WinTest;
+    try wmBaseToplevel(&comp, 1); // toplevel surface 6 (xdg_wm_base 4)
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 2 }, .{ .new_id_dynamic = .{ .interface = "wl_subcompositor", .version = 1, .id = 5 } } });
+    // subsurfaces a=10, b=12, c=14 of the toplevel (role objects id+1)
+    for ([_]u32{ 10, 12, 14 }) |s| {
+        try T.send(&comp, 3, 0, &.{.{ .new_id = s }});
+        try T.send(&comp, 5, 1, &.{ .{ .new_id = s + 1 }, .{ .object = s }, .{ .object = 6 } });
+    }
+    const Z = struct {
+        fn of(c: *Compositor, s: u32) i32 {
+            return c.surfaceZ(1, s);
+        }
+        fn expect(c: *Compositor, want: [3]i32) !void {
+            try std.testing.expectEqual(want, [3]i32{ of(c, 10), of(c, 12), of(c, 14) });
+        }
+    };
+    try Z.expect(&comp, .{ 1, 2, 3 }); // oldest at the bottom, all above the parent
+    try std.testing.expectEqual(@as(u32, 6), comp.surfaceParent(1, 10));
+    try std.testing.expectEqual(@as(i32, 0), Z.of(&comp, 6)); // not a subsurface
+    try std.testing.expectEqual(@as(u32, 0), comp.surfaceParent(1, 6));
+
+    // c just above the parent, a below it: pending until the parent commits
+    // (the children's own commits don't apply it)
+    try T.send(&comp, 15, above_op, &.{.{ .object = 6 }});
+    try T.send(&comp, 11, below_op, &.{.{ .object = 6 }});
+    try T.send(&comp, 14, commit_op, &.{});
+    try T.send(&comp, 10, commit_op, &.{});
+    try Z.expect(&comp, .{ 1, 2, 3 });
+    try T.send(&comp, 6, commit_op, &.{});
+    try Z.expect(&comp, .{ -1, 2, 1 }); // a | parent | c b
+
+    // b below a: the bottom of the stack; then c just below b: between them
+    try T.send(&comp, 13, below_op, &.{.{ .object = 10 }});
+    try T.send(&comp, 15, below_op, &.{.{ .object = 10 }});
+    try T.send(&comp, 6, commit_op, &.{});
+    try Z.expect(&comp, .{ -1, -3, -2 }); // b c a | parent
+
+    // a above b (below the parent, a step up from b): b a c | parent; then
+    // b above c (c is a sibling): a c b | parent
+    try T.send(&comp, 11, above_op, &.{.{ .object = 12 }});
+    try T.send(&comp, 6, commit_op, &.{});
+    try Z.expect(&comp, .{ -2, -3, -1 });
+    try T.send(&comp, 13, above_op, &.{.{ .object = 14 }});
+    try T.send(&comp, 6, commit_op, &.{});
+    try Z.expect(&comp, .{ -3, -1, -2 });
+
+    // a new subsurface goes on top, above the parent — pending moves
+    // included: the latched order is the last one asked for
+    try T.send(&comp, 11, above_op, &.{.{ .object = 12 }}); // c b a | parent (pending)
+    try T.send(&comp, 3, 0, &.{.{ .new_id = 16 }});
+    try T.send(&comp, 5, 1, &.{ .{ .new_id = 17 }, .{ .object = 16 }, .{ .object = 6 } });
+    try std.testing.expectEqual(@as(i32, 1), Z.of(&comp, 16));
+    try T.send(&comp, 11, above_op, &.{.{ .object = 16 }}); // c b | parent | d a
+    try T.send(&comp, 6, commit_op, &.{});
+    try Z.expect(&comp, .{ 2, -1, -2 });
+    try std.testing.expectEqual(@as(i32, 1), Z.of(&comp, 16));
+
+    // a nested subsurface's stack is its parent's own: e under b (12)
+    try T.send(&comp, 3, 0, &.{.{ .new_id = 18 }});
+    try T.send(&comp, 5, 1, &.{ .{ .new_id = 19 }, .{ .object = 18 }, .{ .object = 12 } });
+    try std.testing.expectEqual(@as(i32, 1), Z.of(&comp, 18));
+    try T.send(&comp, 19, below_op, &.{.{ .object = 12 }});
+    try T.send(&comp, 6, commit_op, &.{}); // not its parent: nothing
+    try std.testing.expectEqual(@as(i32, 1), Z.of(&comp, 18));
+    try T.send(&comp, 12, commit_op, &.{});
+    try std.testing.expectEqual(@as(i32, -1), Z.of(&comp, 18));
+    try Z.expect(&comp, .{ 2, -1, -2 });
+
+    // a sibling destroyed leaves the others' order (dense again)
+    try T.send(&comp, 17, 0, &.{}); // d's wl_subsurface.destroy
+    try Z.expect(&comp, .{ 1, -1, -2 });
+
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+    // the reference must be the parent or a sibling: a child of a sibling
+    // (e), itself, and a surface of no role are bad_surface
+    try T.send(&comp, 11, above_op, &.{.{ .object = 18 }});
+    try std.testing.expectEqual(@as(?u32, subsurface_err_bad_surface), lastErrorCode(&sink));
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 11, below_op, &.{.{ .object = 10 }});
+    try std.testing.expectEqual(@as(?u32, subsurface_err_bad_surface), lastErrorCode(&sink));
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 11, above_op, &.{.{ .object = 16 }});
+    try std.testing.expectEqual(@as(?u32, subsurface_err_bad_surface), lastErrorCode(&sink));
+    try Z.expect(&comp, .{ 1, -1, -2 });
 }
 
 test "popup gets configure from positioner on first commit" {
@@ -5179,6 +6000,17 @@ const WinTest = struct {
         var buf: [128]u8 = undefined;
         try comp.onWire(1, wire.encodeMessage(&buf, obj, op, args));
     }
+    /// A left-button press held on the toplevel (wl_seat 9, wl_pointer 10
+    /// bound on first use): its serial, what move/resize must name.
+    fn press(comp: *Compositor) !u32 {
+        if (comp.conns.get(1).?.pointer_id == 0) {
+            try send(comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
+            try send(comp, 9, 0, &.{.{ .new_id = 10 }}); // get_pointer
+        }
+        comp.pointerEnter(1, 6, 0, 0);
+        comp.pointerButton(1, 0, 0x110, true);
+        return comp.conns.get(1).?.serial;
+    }
     fn req(comp: *Compositor, comptime name: []const u8) !void {
         const op = comptime tl.requestIndex(name).?;
         if (comptime std.mem.eql(u8, name, "set_fullscreen")) return send(comp, 8, op, &.{.{ .object = 0 }});
@@ -5208,6 +6040,62 @@ const WinTest = struct {
         sink.events.clearRetainingCapacity();
     }
 };
+
+test "lock modifiers: NumLock (Mod2) starts locked; Caps Lock / NumLock keys toggle them; keyboardLocks sets both seat-wide, sent only on change" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
+    try T.send(&comp, 9, 1, &.{.{ .new_id = 11 }}); // get_keyboard
+    const mods_ev = comptime protocol.find("wl_keyboard").?.eventIndex("modifiers").?;
+    const S = struct {
+        // the `locked` arg of each wl_keyboard.modifiers since the last clear
+        fn locked(sink_: *TestSink, out: []u32) !usize {
+            var vals: [wire.max_args]wire.Value = undefined;
+            var n: usize = 0;
+            for (sink_.events.items) |ev| {
+                if (ev.object_id != 11 or ev.opcode != mods_ev) continue;
+                const a = try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .uint, .uint, .uint, .uint, .uint }, &vals);
+                out[n] = a[3].uint;
+                n += 1;
+            }
+            sink_.events.clearRetainingCapacity();
+            return n;
+        }
+    };
+    var got: [8]u32 = undefined;
+    const lock: u32 = 1 << 1;
+    const num: u32 = 1 << 4; // Mod2: us.xkb `modifier_map Mod2 { <NMLK> }`
+    sink.events.clearRetainingCapacity();
+    comp.keyboardEnter(1, 6);
+    try std.testing.expectEqualSlices(u32, &.{num}, got[0..try S.locked(&sink, &got)]);
+    comp.keyboardKey(1, 0, 58, true); // Caps Lock
+    comp.keyboardKey(1, 0, 58, false);
+    comp.keyboardKey(1, 0, 69, true); // NumLock
+    comp.keyboardKey(1, 0, 69, false);
+    comp.keyboardKey(1, 0, 71, true); // KP7: no modifier change
+    try std.testing.expectEqualSlices(u32, &.{ num | lock, lock }, got[0..try S.locked(&sink, &got)]);
+    // lockState follows the keys' toggles (what an embedder carries over a link reopen)
+    try std.testing.expectEqual(true, comp.lockState().caps_lock);
+    try std.testing.expectEqual(false, comp.lockState().num_lock);
+    // the browser's state: unchanged → nothing; changed → one modifiers event
+    comp.keyboardLocks(true, false);
+    try std.testing.expectEqual(@as(usize, 0), try S.locked(&sink, &got));
+    comp.keyboardLocks(false, true);
+    try std.testing.expectEqualSlices(u32, &.{num}, got[0..try S.locked(&sink, &got)]);
+    try std.testing.expectEqual(false, comp.lockState().caps_lock);
+    try std.testing.expectEqual(true, comp.lockState().num_lock);
+    // seat-wide: set while unfocused, a later enter carries it
+    comp.keyboardLeave(1);
+    sink.events.clearRetainingCapacity();
+    comp.keyboardLocks(true, true);
+    try std.testing.expectEqual(@as(usize, 0), try S.locked(&sink, &got));
+    comp.keyboardEnter(1, 6);
+    try std.testing.expectEqualSlices(u32, &.{ num | lock }, got[0..try S.locked(&sink, &got)]);
+}
 
 test "activated follows keyboard focus, in a configure that repeats the size; a size on its way is not read back" {
     const T = WinTest;
@@ -5306,9 +6194,11 @@ test "fullscreen: the configure carries the state and the desktop size; move/res
     try std.testing.expectEqual(Compositor.toplevel_fullscreen, comp.toplevelState(1, 6));
 
     // move/resize requests and grip resizes are ignored while fullscreen
+    const held = try T.press(&comp);
+    sink.events.clearRetainingCapacity();
     const calls = sink.inter_calls;
-    try T.send(&comp, 8, comptime T.tl.requestIndex("move").?, &.{ .{ .object = 0 }, .{ .uint = 1 } });
-    try T.send(&comp, 8, comptime T.tl.requestIndex("resize").?, &.{ .{ .object = 0 }, .{ .uint = 1 }, .{ .uint = 10 } });
+    try T.send(&comp, 8, comptime T.tl.requestIndex("move").?, &.{ .{ .object = 0 }, .{ .uint = held } });
+    try T.send(&comp, 8, comptime T.tl.requestIndex("resize").?, &.{ .{ .object = 0 }, .{ .uint = held }, .{ .uint = 10 } });
     comp.requestResize(1, 6, 500, 400);
     try std.testing.expectEqual(calls, sink.inter_calls);
     try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
@@ -5324,7 +6214,7 @@ test "fullscreen: the configure carries the state and the desktop size; move/res
     try T.expectConfigure(&sink, 1, 800, 600, &.{});
     try std.testing.expectEqual(@as(u32, 7), sink.inter_kind);
     try std.testing.expectEqual(@as(u32, 0), comp.toplevelState(1, 6));
-    try T.send(&comp, 8, comptime T.tl.requestIndex("move").?, &.{ .{ .object = 0 }, .{ .uint = 1 } });
+    try T.send(&comp, 8, comptime T.tl.requestIndex("move").?, &.{ .{ .object = 0 }, .{ .uint = held } });
     try std.testing.expectEqual(@as(u32, 0), sink.inter_kind); // moves again
 
     // the embedder's way in and out: the same configures
@@ -5602,6 +6492,249 @@ test "xdg_popup.reposition emits repositioned + configure sequence" {
     try std.testing.expectEqual(@as(u32, 11), sink.events.items[2].object_id); // xdg_surface.configure
     // and the popup surface now reports the new absolute position
     try std.testing.expectEqual(@as(i32, 206), comp.surfaceAbs(1, 10).x);
+}
+
+/// Popup tests on a WinTest toplevel: a positioner `id` with a 1×1 anchor
+/// rect at (x, y), anchor and gravity `ag`, size w×h; a popup (surface `s`,
+/// xdg_surface s+1, xdg_popup s+2) of xdg_surface `parent`, committed.
+const PopupTest = struct {
+    const pos = protocol.find("xdg_positioner").?;
+    const wm = protocol.find("xdg_wm_base").?;
+    const xs = protocol.find("xdg_surface").?;
+    const pp = protocol.find("xdg_popup").?;
+    const geom_op = xs.requestIndex("set_window_geometry").?;
+    fn positioner(comp: *Compositor, id: u32, x: i32, y: i32, ag: [2]u32, w: i32, h: i32) !void {
+        const T = WinTest;
+        try T.send(comp, 4, comptime wm.requestIndex("create_positioner").?, &.{.{ .new_id = id }});
+        try T.send(comp, id, comptime pos.requestIndex("set_size").?, &.{ .{ .int = w }, .{ .int = h } });
+        try T.send(comp, id, comptime pos.requestIndex("set_anchor_rect").?, &.{ .{ .int = x }, .{ .int = y }, .{ .int = 1 }, .{ .int = 1 } });
+        try T.send(comp, id, comptime pos.requestIndex("set_anchor").?, &.{.{ .uint = ag[0] }});
+        try T.send(comp, id, comptime pos.requestIndex("set_gravity").?, &.{.{ .uint = ag[1] }});
+    }
+    fn popup(comp: *Compositor, s: u32, parent: u32, positioner_id: u32) !void {
+        const T = WinTest;
+        try T.send(comp, 3, 0, &.{.{ .new_id = s }}); // create_surface
+        try T.send(comp, 4, comptime wm.requestIndex("get_xdg_surface").?, &.{ .{ .new_id = s + 1 }, .{ .object = s } });
+        try T.send(comp, s + 1, comptime xs.requestIndex("get_popup").?, &.{ .{ .new_id = s + 2 }, .{ .object = parent }, .{ .object = positioner_id } });
+        try T.send(comp, s, T.commit_op, &.{});
+    }
+    /// x, y of the last xdg_popup.configure to `popup_id`
+    fn configured(sink: *TestSink, popup_id: u32) ![2]i32 {
+        var vals: [wire.max_args]wire.Value = undefined;
+        var last: ?[2]i32 = null;
+        for (sink.events.items) |ev| {
+            if (ev.object_id != popup_id or ev.opcode != comptime pp.eventIndex("configure").?) continue;
+            const a = try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .int, .int, .int, .int }, &vals);
+            last = .{ a[0].int, a[1].int };
+        }
+        return last.?;
+    }
+    fn at(comp: *Compositor, surface: u32) [2]i32 {
+        const p = comp.surfaceAbs(1, surface);
+        return .{ p.x, p.y };
+    }
+};
+
+test "popups: placed from the parent's window geometry to their own (GTK CSD shadows) — nested and repositioned alike" {
+    const T = WinTest;
+    const P = PopupTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    const br = [2]u32{ 8, 8 }; // anchor bottom_right, gravity bottom_right
+
+    // no geometry set: the configure position counts from the surface origin
+    try P.positioner(&comp, 20, 100, 50, br, 200, 150);
+    try P.popup(&comp, 21, 7, 20);
+    try std.testing.expectEqual([2]i32{ 101, 51 }, try P.configured(&sink, 23));
+    try std.testing.expectEqual([2]i32{ 101, 51 }, P.at(&comp, 21));
+    try T.send(&comp, 23, 0, &.{}); // xdg_popup.destroy
+    try T.send(&comp, 22, 0, &.{}); // xdg_surface.destroy
+
+    // l3afpad: a GTK3 CSD window, its frame at (23,21) inside its shadow; a
+    // right-click at (400,400) of the surface = (377,379) of the geometry,
+    // which is what GTK's anchor rect says. The menu has a shadow of its
+    // own: its geometry at (3,3) of its surface.
+    try T.send(&comp, 7, P.geom_op, &.{ .{ .int = 23 }, .{ .int = 21 }, .{ .int = 754 }, .{ .int = 558 } });
+    try T.send(&comp, 6, T.commit_op, &.{});
+    sink.events.clearRetainingCapacity();
+    try P.positioner(&comp, 30, 377, 379, br, 200, 300);
+    try P.popup(&comp, 31, 7, 30);
+    try std.testing.expectEqual([2]i32{ 378, 380 }, try P.configured(&sink, 33)); // geometry-relative, as sent
+    try T.send(&comp, 32, P.geom_op, &.{ .{ .int = 3 }, .{ .int = 3 }, .{ .int = 200 }, .{ .int = 300 } });
+    try T.send(&comp, 31, T.commit_op, &.{});
+    // the menu's frame lands at the parent's (23+378, 21+380) = just past
+    // the click; its surface 3 px up-left of that (it used to be 20 px off)
+    try std.testing.expectEqual([2]i32{ 23 + 378 - 3, 21 + 380 - 3 }, P.at(&comp, 31));
+
+    // a submenu off its item: anchor right of (190,40) of the menu's
+    // geometry, its own frame at (3,3) too
+    try P.positioner(&comp, 40, 190, 40, .{ 4, 8 }, 150, 100);
+    try P.popup(&comp, 41, 32, 40);
+    try std.testing.expectEqual([2]i32{ 191, 40 }, try P.configured(&sink, 43));
+    try T.send(&comp, 42, P.geom_op, &.{ .{ .int = 3 }, .{ .int = 3 }, .{ .int = 150 }, .{ .int = 100 } });
+    try T.send(&comp, 41, T.commit_op, &.{});
+    try std.testing.expectEqual([2]i32{ 398 + 3 + 191 - 3, 398 + 3 + 40 - 3 }, P.at(&comp, 41));
+
+    // xdg_popup.reposition: the same placement; the submenu follows
+    try P.positioner(&comp, 50, 99, 99, br, 200, 300);
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 33, comptime P.pp.requestIndex("reposition").?, &.{ .{ .object = 50 }, .{ .uint = 1 } });
+    try std.testing.expectEqual([2]i32{ 100, 100 }, try P.configured(&sink, 33));
+    try std.testing.expectEqual([2]i32{ 23 + 100 - 3, 21 + 100 - 3 }, P.at(&comp, 31));
+    try std.testing.expectEqual([2]i32{ 120 + 3 + 191 - 3, 118 + 3 + 40 - 3 }, P.at(&comp, 41));
+}
+
+test "positions dirty: raised by what moves or restacks a subsurface or popup (set_position, the parent's stack latch, geometry, popup placement, roles, destroys), not by plain commits or damage; ranks cached and redone after a restack" {
+    const T = WinTest;
+    const P = PopupTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    const sub = comptime protocol.find("wl_subsurface").?;
+    const damage_op = comptime T.surf.requestIndex("damage").?;
+    const Dirty = struct {
+        fn expect(c: *Compositor, want: bool) !void {
+            try std.testing.expectEqual(want, c.takePositionsDirty());
+            try std.testing.expect(!c.takePositionsDirty()); // read clears it
+        }
+    };
+    _ = comp.takePositionsDirty(); // the toplevel's setup
+
+    // subsurfaces a=10, b=12 of the toplevel: each is made dirty, and its
+    // rank is right at once
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 2 }, .{ .new_id_dynamic = .{ .interface = "wl_subcompositor", .version = 1, .id = 5 } } });
+    try Dirty.expect(&comp, false); // a bind moves nothing
+    for ([_]u32{ 10, 12 }, 1..) |s, n| {
+        try T.send(&comp, 3, 0, &.{.{ .new_id = s }});
+        try Dirty.expect(&comp, false); // a surface with no role
+        try T.send(&comp, 5, 1, &.{ .{ .new_id = s + 1 }, .{ .object = s }, .{ .object = 6 } });
+        try Dirty.expect(&comp, true);
+        try std.testing.expectEqual(@as(i32, @intCast(n)), comp.surfaceZ(1, s));
+    }
+
+    // commits and damage with nothing pending: not dirty (the busy case)
+    try T.send(&comp, 10, T.commit_op, &.{});
+    try T.send(&comp, 6, damage_op, &.{ .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 } });
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try Dirty.expect(&comp, false);
+
+    // set_position applies at once: dirty without any commit
+    try T.send(&comp, 11, comptime sub.requestIndex("set_position").?, &.{ .{ .int = 5 }, .{ .int = 7 } });
+    try Dirty.expect(&comp, true);
+    try std.testing.expectEqual([2]i32{ 5, 7 }, P.at(&comp, 10));
+
+    // place_below is pending: dirty at the parent's commit, not before;
+    // the cached ranks follow
+    try T.send(&comp, 13, comptime sub.requestIndex("place_below").?, &.{.{ .object = 6 }});
+    try Dirty.expect(&comp, false);
+    try std.testing.expectEqual(@as(i32, 2), comp.surfaceZ(1, 12));
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try Dirty.expect(&comp, true);
+    try std.testing.expectEqual(@as(i32, -1), comp.surfaceZ(1, 12));
+    try std.testing.expectEqual(@as(i32, 1), comp.surfaceZ(1, 10));
+
+    // the toplevel's window geometry (popups are placed from it): dirty
+    // when the commit latches a new one, not when it latches the same
+    try T.send(&comp, 7, P.geom_op, &.{ .{ .int = 10 }, .{ .int = 10 }, .{ .int = 700 }, .{ .int = 500 } });
+    try Dirty.expect(&comp, false);
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try Dirty.expect(&comp, true);
+    try T.send(&comp, 7, P.geom_op, &.{ .{ .int = 10 }, .{ .int = 10 }, .{ .int = 700 }, .{ .int = 500 } });
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try Dirty.expect(&comp, false);
+
+    // a popup: get_popup, then its reposition
+    try P.positioner(&comp, 20, 100, 50, .{ 8, 8 }, 200, 150);
+    try Dirty.expect(&comp, false);
+    try P.popup(&comp, 21, 7, 20);
+    try Dirty.expect(&comp, true);
+    try P.positioner(&comp, 30, 40, 40, .{ 8, 8 }, 200, 150);
+    try T.send(&comp, 23, comptime P.pp.requestIndex("reposition").?, &.{ .{ .object = 30 }, .{ .uint = 1 } });
+    try Dirty.expect(&comp, true);
+    // the popup's role object, then its xdg_surface (geometry unset: not
+    // dirty again), then its wl_surface
+    try T.send(&comp, 23, 0, &.{}); // xdg_popup.destroy
+    try Dirty.expect(&comp, true);
+    try T.send(&comp, 22, 0, &.{}); // xdg_surface.destroy, no geometry
+    try Dirty.expect(&comp, false);
+    try T.send(&comp, 21, 0, &.{}); // wl_surface.destroy
+    try Dirty.expect(&comp, true);
+
+    // wl_subsurface.destroy: dirty, and the sibling's rank closes up
+    try T.send(&comp, 3, 0, &.{.{ .new_id = 14 }});
+    try T.send(&comp, 5, 1, &.{ .{ .new_id = 15 }, .{ .object = 14 }, .{ .object = 6 } });
+    try Dirty.expect(&comp, true);
+    try std.testing.expectEqual(@as(i32, 2), comp.surfaceZ(1, 14));
+    try T.send(&comp, 11, 0, &.{}); // a's wl_subsurface.destroy
+    try Dirty.expect(&comp, true);
+    try std.testing.expectEqual(@as(i32, 0), comp.surfaceZ(1, 10)); // no role now
+    try std.testing.expectEqual(@as(i32, 1), comp.surfaceZ(1, 14));
+    try std.testing.expectEqual(@as(i32, -1), comp.surfaceZ(1, 12));
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+}
+
+test "move/resize: honoured only with the serial of a press still held on the window — a request after the release (slow client) is ignored" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    const move_op = comptime T.tl.requestIndex("move").?;
+    const resize_op = comptime T.tl.requestIndex("resize").?;
+    var calls = sink.inter_calls;
+
+    // no press at all
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = 1 } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
+
+    // held: honoured
+    const s1 = try T.press(&comp);
+    try T.send(&comp, 8, resize_op, &.{ .{ .object = 0 }, .{ .uint = s1 }, .{ .uint = 4 } });
+    try std.testing.expectEqual(calls + 1, sink.inter_calls);
+    try std.testing.expectEqual(@as(u32, 1), sink.inter_kind);
+    try std.testing.expectEqual(@as(u32, 4), sink.inter_value);
+    calls = sink.inter_calls;
+
+    // foot's quick click on its left border: the request comes after the
+    // release — no grab (it used to follow the pointer until the next click)
+    comp.pointerButton(1, 0, 0x110, false);
+    try T.send(&comp, 8, resize_op, &.{ .{ .object = 0 }, .{ .uint = s1 }, .{ .uint = 4 } });
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s1 } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
+
+    // a new press: the old serial is stale, the new one good
+    const s2 = try T.press(&comp);
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s1 } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s2 } });
+    try std.testing.expectEqual(calls + 1, sink.inter_calls);
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_kind);
+    calls = sink.inter_calls;
+
+    // a second button joins the grab: both presses count until the last
+    // goes up
+    comp.pointerButton(1, 0, 0x111, true);
+    const s3 = comp.conns.get(1).?.serial;
+    comp.pointerButton(1, 0, 0x110, false);
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s2 } });
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s3 } });
+    try std.testing.expectEqual(calls + 2, sink.inter_calls);
+    calls = sink.inter_calls;
+    comp.pointerButton(1, 0, 0x111, false);
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s3 } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
+
+    // the pointer handed elsewhere (a leave) ends the grab, button or not
+    const s4 = try T.press(&comp);
+    comp.pointerLeave(1);
+    try T.send(&comp, 8, move_op, &.{ .{ .object = 0 }, .{ .uint = s4 } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
 }
 
 test "wl_output advertises output_scale, mode in hw px; set_buffer_scale tracked" {
@@ -6111,15 +7244,22 @@ test "xdg_toplevel move/resize/maximize: interactive callbacks + configures" {
     const max_op = comptime tl.requestIndex("set_maximized").?;
     const unmax_op = comptime tl.requestIndex("unset_maximized").?;
 
+    // a press held on the window: wl_seat 5, wl_pointer 12
+    try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 5 } } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 0, &.{.{ .new_id = 12 }})); // get_pointer
+    comp.pointerEnter(1, 9, 0, 0);
+    comp.pointerButton(1, 0, 0x110, true);
+    const held = comp.conns.get(1).?.serial;
+
     // move → embedder drag callback (kind 0), no protocol events
     sink.events.clearRetainingCapacity();
-    try comp.onWire(1, wire.encodeMessage(&buf, 11, move_op, &.{ .{ .object = 5 }, .{ .uint = 1 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, move_op, &.{ .{ .object = 5 }, .{ .uint = held } }));
     try std.testing.expectEqual(@as(u32, 0), sink.inter_kind);
     try std.testing.expectEqual(@as(u32, 9), sink.inter_surface);
     try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
 
     // resize → callback (kind 1) with the edges bitmask (bottom-right = 10)
-    try comp.onWire(1, wire.encodeMessage(&buf, 11, resize_op, &.{ .{ .object = 5 }, .{ .uint = 2 }, .{ .uint = 10 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, resize_op, &.{ .{ .object = 5 }, .{ .uint = held }, .{ .uint = 10 } }));
     try std.testing.expectEqual(@as(u32, 1), sink.inter_kind);
     try std.testing.expectEqual(@as(u32, 10), sink.inter_value);
 
@@ -6172,7 +7312,7 @@ test "clipboard: selection follows focus, receive routes to source, replace canc
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 4 }})); // create_data_source
     try comp.onWire(1, wire.encodeMessage(&buf, 4, 0, &.{.{ .string = "text/plain" }})); // offer
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 1, &.{ .{ .new_id = 5 }, .{ .object = 6 } })); // get_data_device (seat id fake)
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 4 }, .{ .uint = 0 } })); // set_selection
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 4 }, .{ .uint = testInputSerial(&comp, 1) } })); // set_selection
 
     // conn 2: the RECEIVER with a focused toplevel + keyboard + data device.
     try comp.connOpen(2);
@@ -6218,13 +7358,198 @@ test "clipboard: selection follows focus, receive routes to source, replace canc
     sink.events.clearRetainingCapacity();
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 12 }})); // second source
     try comp.onWire(1, wire.encodeMessage(&buf, 12, 0, &.{.{ .string = "text/plain" }}));
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 12 }, .{ .uint = 0 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 12 }, .{ .uint = testInputSerial(&comp, 1) } }));
     const cancelled_op = comptime protocol.find("wl_data_source").?.eventIndex("cancelled").?;
     var saw_cancelled = false;
     for (sink.events.items) |ev| {
         if (ev.conn_id == 1 and ev.object_id == 4 and ev.opcode == cancelled_op) saw_cancelled = true;
     }
     try std.testing.expect(saw_cancelled);
+}
+
+/// setOwnSelection's packed entries (test helper): data null = alias of the
+/// previous entry's data.
+fn packOwnSelection(out: []u8, entries: []const struct { []const u8, ?[]const u8 }) []u8 {
+    var n: usize = 0;
+    for (entries) |e| {
+        std.mem.writeInt(u32, out[n..][0..4], @intCast(e[0].len), .little);
+        @memcpy(out[n + 4 ..][0..e[0].len], e[0]);
+        n += 4 + e[0].len;
+        if (e[1]) |d| {
+            std.mem.writeInt(u32, out[n..][0..4], @intCast(d.len), .little);
+            @memcpy(out[n + 4 ..][0..d.len], d);
+            n += 4 + d.len;
+        } else {
+            std.mem.writeInt(u32, out[n..][0..4], 0xffffffff, .little);
+            n += 4;
+        }
+    }
+    return out[0..n];
+}
+
+test "clipboard: the embedder's own selection is offered to the focused client only, served from the core; reads of a client's go to its source" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.fdmsg_fn = TestSink.fdmsg;
+    comp.selection_fn = TestSink.selection;
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+
+    var buf: [256]u8 = undefined;
+    var vals: [wire.max_args]wire.Value = undefined;
+    const receive_op = comptime protocol.find("wl_data_offer").?.requestIndex("receive").?;
+    const cancelled_op = comptime protocol.find("wl_data_source").?.eventIndex("cancelled").?;
+    const send_op = comptime protocol.find("wl_data_source").?.eventIndex("send").?;
+    const offer_op = comptime protocol.find("wl_data_offer").?.eventIndex("offer").?;
+    const selection_op = comptime protocol.find("wl_data_device").?.eventIndex("selection").?;
+
+    // conn 1: a wl-copy shaped source. manager=3, source=4, device=5.
+    try comp.connOpen(1);
+    try comp.onWire(1, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 3 } } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 4 }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 4, 0, &.{.{ .string = "text/plain" }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 3, 1, &.{ .{ .new_id = 5 }, .{ .object = 6 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 4 }, .{ .uint = testInputSerial(&comp, 1) } }));
+    try std.testing.expectEqual(@as(u32, 1), sink.sel_calls);
+    try std.testing.expectEqual(@as(u32, 1), sink.sel_conn);
+    try std.testing.expectEqualStrings("text/plain", sink.sel_mimes[0..sink.sel_mimes_len]);
+
+    // the embedder reads it: send(mime, fd) to the source in a pipe_read
+    try std.testing.expect(comp.readSelection("text/plain", 7, 1000));
+    try std.testing.expectEqual(@as(u32, 1), sink.fdmsg_conn);
+    try std.testing.expectEqual(@intFromEnum(stream.FdMsgKind.pipe_read), sink.fdmsg_kind);
+    const send_hdr = try wire.Header.parse(sink.fdmsg_bytes[0..sink.fdmsg_len]);
+    try std.testing.expectEqual(@as(u32, 4), send_hdr.object_id);
+    try std.testing.expectEqual(send_op, send_hdr.opcode);
+    try std.testing.expectEqualStrings("text/plain", (try wire.decodeArgs(sink.fdmsg_bytes[wire.header_size..sink.fdmsg_len], &.{ .string, .fd }, &vals))[0].string.?);
+    try std.testing.expectEqual(@as(usize, 8), sink.fdmsg_aux_len);
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, sink.fdmsg_aux[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 1000), std.mem.readInt(u32, sink.fdmsg_aux[4..8], .little));
+    try std.testing.expect(!comp.readSelection("image/png", 8, 1000)); // not offered
+
+    // conn 2: focused receiver; conn 3: a data device, never focused
+    for ([_]u32{ 2, 3 }) |c| {
+        try comp.connOpen(c);
+        try comp.onWire(c, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 1 }, .{ .new_id_dynamic = .{ .interface = "wl_compositor", .version = 4, .id = 3 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 6 }, .{ .new_id_dynamic = .{ .interface = "xdg_wm_base", .version = 1, .id = 4 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 5, .id = 5 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 6 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 5, 1, &.{.{ .new_id = 7 }}));
+        try comp.onWire(c, wire.encodeMessage(&buf, 6, 1, &.{ .{ .new_id = 8 }, .{ .object = 5 } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 9 }}));
+        try comp.onWire(c, wire.encodeMessage(&buf, 4, 2, &.{ .{ .new_id = 10 }, .{ .object = 9 } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 10, 1, &.{.{ .new_id = 11 }}));
+    }
+    comp.keyboardEnter(2, 9);
+    sink.events.clearRetainingCapacity();
+
+    // bad entries change nothing: an alias with nothing before it, a NUL in a mime
+    var pack: [256]u8 = undefined;
+    try std.testing.expectError(error.BadSelection, comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text/plain", null }})));
+    try std.testing.expectError(error.BadSelection, comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text\x00plain", "x" }})));
+    try std.testing.expectError(error.BadSelection, comp.setOwnSelection("\x05\x00"));
+    // clearing when a client owns it: not ours to clear
+    try comp.setOwnSelection("");
+    try std.testing.expectEqual(@as(u32, 1), sink.sel_calls);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+
+    // the embedder's own: the source is cancelled, the focused conn alone is offered it
+    try comp.setOwnSelection(packOwnSelection(&pack, &.{ .{ "text/plain;charset=utf-8", "h\xc3\xa9llo" }, .{ "text/plain", null }, .{ "UTF8_STRING", null } }));
+    try std.testing.expectEqual(@as(u32, 2), sink.sel_calls);
+    try std.testing.expectEqual(@as(u32, 0), sink.sel_conn);
+    try std.testing.expectEqualStrings("text/plain;charset=utf-8,text/plain,UTF8_STRING", sink.sel_mimes[0..sink.sel_mimes_len]);
+    var own_offer: u32 = 0;
+    var offers: usize = 0;
+    var cancelled = false;
+    for (sink.events.items) |ev| {
+        try std.testing.expect(ev.conn_id != 3);
+        if (ev.conn_id == 1 and ev.object_id == 4 and ev.opcode == cancelled_op) cancelled = true;
+        if (ev.conn_id == 2 and ev.opcode == offer_op and ev.object_id >= objects.server_id_base) {
+            own_offer = ev.object_id;
+            offers += 1;
+        }
+    }
+    try std.testing.expect(cancelled);
+    try std.testing.expectEqual(@as(usize, 3), offers);
+    try std.testing.expect(!comp.readSelection("text/plain", 9, 1000)); // the embedder has the bytes
+
+    // a receive is answered from the core: no wire message, FDMSG own_pipe
+    // with the token and (the first time) the bytes
+    comp.onPipeReceive(2, wire.encodeMessage(&buf, own_offer, receive_op, &.{ .{ .string = "UTF8_STRING" }, .fd }), 42);
+    try std.testing.expectEqual(@as(u32, 2), sink.fdmsg_conn);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FdMsgKind.own_pipe)), sink.fdmsg_kind);
+    try std.testing.expectEqual(@as(usize, 0), sink.fdmsg_len);
+    const own_msg = try stream.OwnPipe.decode(sink.fdmsg_aux[0..sink.fdmsg_aux_len]);
+    try std.testing.expectEqual(@as(u32, 42), own_msg.token);
+    try std.testing.expectEqualStrings("h\xc3\xa9llo", own_msg.bytes);
+    // a mime it does not have: EOF (the token alone)
+    comp.onPipeReceive(2, wire.encodeMessage(&buf, own_offer, receive_op, &.{ .{ .string = "image/png" }, .fd }), 43);
+    try std.testing.expectEqual(@as(usize, 4), sink.fdmsg_aux_len);
+    try std.testing.expectEqual(@as(u32, 43), std.mem.readInt(u32, sink.fdmsg_aux[0..4], .little));
+
+    // a newer own selection: the old offer reads EOF
+    try comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text/plain", "second" }}));
+    comp.onPipeReceive(2, wire.encodeMessage(&buf, own_offer, receive_op, &.{ .{ .string = "text/plain" }, .fd }), 44);
+    try std.testing.expectEqual(@as(usize, 4), sink.fdmsg_aux_len);
+
+    // a client takes it back: the own selection is gone (its offers read EOF)
+    var own2: u32 = 0;
+    for (sink.events.items) |ev| {
+        if (ev.conn_id == 2 and ev.opcode == offer_op and ev.object_id >= objects.server_id_base) own2 = ev.object_id;
+    }
+    try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 12 }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 12, 0, &.{.{ .string = "text/plain" }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 12 }, .{ .uint = testInputSerial(&comp, 1) } }));
+    try std.testing.expectEqual(@as(u32, 1), sink.sel_conn);
+    try std.testing.expect(comp.own_selection == null);
+    comp.onPipeReceive(2, wire.encodeMessage(&buf, own2, receive_op, &.{ .{ .string = "text/plain" }, .fd }), 45);
+    try std.testing.expectEqual(@as(usize, 4), sink.fdmsg_aux_len);
+    try std.testing.expectEqual(@as(u32, 45), std.mem.readInt(u32, sink.fdmsg_aux[0..4], .little));
+
+    // own again, then cleared by the embedder: the focused client hears selection(null)
+    try comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text/plain", "third" }}));
+    sink.events.clearRetainingCapacity();
+    try comp.setOwnSelection("");
+    try std.testing.expectEqual(@as(u32, 0), sink.sel_conn);
+    try std.testing.expectEqual(@as(usize, 0), sink.sel_mimes_len);
+    try std.testing.expect(comp.selection == null);
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try std.testing.expectEqual(selection_op, sink.events.items[0].opcode);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, sink.events.items[0].bytes[8..12], .little));
+}
+
+test "clipboard: a relay without FEATURE selection_cache (wlandr 0.1.0) is never sent pipe_read or own-selection frames, and no client is offered an embedder selection it could not paste" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.fdmsg_fn = TestSink.fdmsg;
+    comp.selection_fn = TestSink.selection;
+    // other features don't turn it on
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.dmabuf_kind), &[_]u8{ 1, 0, 0, 0 });
+    try selConn(&comp, 1);
+    comp.keyboardEnter(1, 11);
+    const T = SelTest;
+    // conn 1 copies: clients' selections work as ever
+    try T.sources(&comp);
+    try T.setSel(&comp, 1, 20, testInputSerial(&comp, 1));
+    try std.testing.expectEqual(@as(u32, 1), sink.sel_conn);
+    const calls = sink.fdmsg_calls;
+    // the embedder can't read it: nothing sent (no FDMSG pipe_read)
+    try std.testing.expect(!comp.readSelection("text/plain", 1, 1000));
+    try std.testing.expectEqual(calls, sink.fdmsg_calls);
+    // nor set its own: refused, nothing offered, the client's source stays
+    sink.events.clearRetainingCapacity();
+    var pack: [64]u8 = undefined;
+    try std.testing.expectError(error.Unsupported, comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text/plain", "page" }})));
+    try std.testing.expectError(error.Unsupported, comp.setOwnSelection(""));
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    try std.testing.expect(comp.own_selection == null);
+    try std.testing.expectEqual([2]u32{ 1, 20 }, T.owner(comp.selection).?);
+    try std.testing.expectEqual(calls, sink.fdmsg_calls);
 }
 
 test "primary selection: offer on keyboard enter, receive routes to source, replace cancels" {
@@ -6244,7 +7569,7 @@ test "primary selection: offer on keyboard enter, receive routes to source, repl
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 4 }})); // create_source
     try comp.onWire(1, wire.encodeMessage(&buf, 4, 0, &.{.{ .string = "text/plain" }})); // source.offer
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 1, &.{ .{ .new_id = 5 }, .{ .object = 6 } })); // get_device (seat id fake)
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 0, &.{ .{ .object = 4 }, .{ .uint = 0 } })); // device.set_selection
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 0, &.{ .{ .object = 4 }, .{ .uint = testInputSerial(&comp, 1) } })); // device.set_selection
 
     // conn 2: the RECEIVER with a focused toplevel + keyboard + primary device.
     try comp.connOpen(2);
@@ -6300,7 +7625,7 @@ test "primary selection: offer on keyboard enter, receive routes to source, repl
     sink.events.clearRetainingCapacity();
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 12 }})); // second source
     try comp.onWire(1, wire.encodeMessage(&buf, 12, 0, &.{.{ .string = "text/plain" }}));
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 0, &.{ .{ .object = 12 }, .{ .uint = 0 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 0, &.{ .{ .object = 12 }, .{ .uint = testInputSerial(&comp, 1) } }));
     const cancelled_op = comptime protocol.find("zwp_primary_selection_source_v1").?.eventIndex("cancelled").?;
     var saw_cancelled = false;
     for (sink.events.items) |ev| {
@@ -6346,12 +7671,12 @@ test "server-id typing: data + primary offers share the contiguous id space; onl
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 4 }})); // clip create_data_source
     try comp.onWire(1, wire.encodeMessage(&buf, 4, 0, &.{.{ .string = "text/plain" }}));
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 1, &.{ .{ .new_id = 5 }, .{ .object = 99 } })); // clip get_data_device
-    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 4 }, .{ .uint = 0 } })); // clip set_selection
+    try comp.onWire(1, wire.encodeMessage(&buf, 5, 1, &.{ .{ .object = 4 }, .{ .uint = testInputSerial(&comp, 1) } })); // clip set_selection
     try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 13 }, .{ .new_id_dynamic = .{ .interface = "zwp_primary_selection_device_manager_v1", .version = 1, .id = 6 } } }));
     try comp.onWire(1, wire.encodeMessage(&buf, 6, 0, &.{.{ .new_id = 7 }})); // primary create_source
     try comp.onWire(1, wire.encodeMessage(&buf, 7, 0, &.{.{ .string = "text/plain" }}));
     try comp.onWire(1, wire.encodeMessage(&buf, 6, 1, &.{ .{ .new_id = 8 }, .{ .object = 99 } })); // primary get_device
-    try comp.onWire(1, wire.encodeMessage(&buf, 8, 0, &.{ .{ .object = 7 }, .{ .uint = 0 } })); // primary set_selection
+    try comp.onWire(1, wire.encodeMessage(&buf, 8, 0, &.{ .{ .object = 7 }, .{ .uint = testInputSerial(&comp, 1) } })); // primary set_selection
 
     // conn 2 receives both selections: bind clip manager(6) + primary manager(9),
     // a keyboard, both devices, and a mapped toplevel.
@@ -6450,7 +7775,7 @@ test "dnd: full drag conn1→conn2 — offer, actions, drop, transfer, finish" {
     // press on the origin, then start_drag(source 12, origin 7, no icon)
     comp.pointerEnter(1, 7, 0, 0);
     comp.pointerButton(1, 0, 0x110, true);
-    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = 99 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = comp.conns.get(1).?.serial } })); // the press
     try std.testing.expectEqual(@as(u32, 4), sink.inter_kind); // dnd session started
     try std.testing.expectEqual(@as(u32, 7), sink.inter_surface);
 
@@ -6543,7 +7868,8 @@ test "dnd: leave on retarget, unaccepted drop cancels, icon role lifecycle" {
     try comp.onWire(1, wire.encodeMessage(&buf, 12, 0, &.{.{ .string = "text/plain" }}));
     try comp.onWire(1, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 13 }})); // icon surface
     comp.pointerEnter(1, 7, 0, 0);
-    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 13 }, .{ .uint = 1 } }));
+    comp.pointerButton(1, 0, 0x110, true);
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 13 }, .{ .uint = comp.conns.get(1).?.serial } }));
     try std.testing.expectEqual(Role.dnd_icon, comp.surfaceRole(1, 13));
     try std.testing.expectEqual(@as(u32, 13), sink.inter_value); // icon id rides kind 4
 
@@ -6594,7 +7920,8 @@ test "dnd: source destroy mid-drag cancels silently; conn close cancels" {
     try comp.onWire(1, wire.encodeMessage(&buf, 6, 0, &.{.{ .new_id = 12 }}));
     try comp.onWire(1, wire.encodeMessage(&buf, 12, 0, &.{.{ .string = "text/plain" }}));
     comp.pointerEnter(1, 7, 0, 0);
-    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = 1 } }));
+    comp.pointerButton(1, 0, 0x110, true);
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = comp.conns.get(1).?.serial } }));
     comp.dragMotion(2, 7, 100, 256, 256);
 
     const dd = comptime protocol.find("wl_data_device").?;
@@ -6614,7 +7941,8 @@ test "dnd: source destroy mid-drag cancels silently; conn close cancels" {
     try comp.onWire(1, wire.encodeMessage(&buf, 6, 0, &.{.{ .new_id = 14 }}));
     try comp.onWire(1, wire.encodeMessage(&buf, 14, 0, &.{.{ .string = "text/plain" }}));
     comp.pointerEnter(1, 7, 0, 0);
-    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 14 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = 1 } }));
+    comp.pointerButton(1, 0, 0x110, true);
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 14 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = comp.conns.get(1).?.serial } }));
     comp.dragMotion(2, 7, 100, 256, 256);
     sink.events.clearRetainingCapacity();
     comp.connClose(1);
@@ -6697,6 +8025,49 @@ test "linux-dmabuf: advertised only after setDmabuf; binding it unadvertised is 
     try std.testing.expectEqual(@as(u32, 4), args[2].uint);
 }
 
+test "linux-dmabuf from FEATURE frames: dmabuf_kind virtgpu without a GPU source keeps it off (either order, one log line); with one, shm, or no dmabuf_kind (readback) it is offered" {
+    const table = dmabufTable();
+    var feat: [8 + table.len]u8 = undefined;
+    (stream.DmabufFeature{ .main_device = 0xe280, .table = &table }).encode(&feat);
+    var vg: [4]u8 = undefined;
+    (stream.DmabufKindFeature{ .buffer_kind = @intFromEnum(stream.BufferKind.virtgpu) }).encode(&vg);
+    var shm_kind: [4]u8 = undefined;
+    (stream.DmabufKindFeature{ .buffer_kind = @intFromEnum(stream.BufferKind.shm) }).encode(&shm_kind);
+    const unknown_kind = [_]u8{ 9, 0, 0, 0 };
+    const Case = struct { gpu: bool, kind: ?[]const u8, kind_first: bool = true, offered: bool };
+    const cases = [_]Case{
+        .{ .gpu = true, .kind = &vg, .offered = true },
+        .{ .gpu = false, .kind = &vg, .offered = false },
+        .{ .gpu = false, .kind = &vg, .kind_first = false, .offered = false }, // out of order: still off
+        .{ .gpu = false, .kind = null, .offered = true }, // readback: pixels in the stream
+        .{ .gpu = false, .kind = &shm_kind, .offered = true },
+        .{ .gpu = true, .kind = &unknown_kind, .offered = false }, // a kind it can't show
+        .{ .gpu = true, .kind = vg[0..3], .offered = false }, // bad bytes: unknown kind
+    };
+    for (cases) |c| {
+        var sink: TestSink = undefined;
+        var comp = testSetup(&sink);
+        defer comp.deinit();
+        defer sink.events.deinit(sink.gpa);
+        comp.gpu_source = c.gpu;
+        if (!c.kind_first) comp.applyFeature(@intFromEnum(stream.FeatureKind.linux_dmabuf), &feat);
+        if (c.kind) |k| comp.applyFeature(@intFromEnum(stream.FeatureKind.dmabuf_kind), k);
+        if (c.kind_first) comp.applyFeature(@intFromEnum(stream.FeatureKind.linux_dmabuf), &feat);
+        comp.applyFeature(77, "skipped"); // unknown feature: logged, nothing else
+        try std.testing.expectEqual(c.offered, comp.dmabuf != null);
+        // offered: setDmabuf's line; refused: exactly one about why (plus the unknown feature's)
+        try std.testing.expectEqual(@as(u32, 2), sink.logs - @as(u32, if (c.kind_first or c.offered) 0 else 1));
+        try comp.connOpen(1);
+        var buf: [128]u8 = undefined;
+        try comp.onWire(1, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
+        try std.testing.expectEqual(globals.len + @intFromBool(c.offered), sink.events.items.len);
+        if (!c.offered) { // binding it anyway: a protocol error, as for any unadvertised global
+            try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = dmabuf_global.name }, .{ .new_id_dynamic = .{ .interface = dmabuf_global.interface, .version = 4, .id = 3 } } }));
+            try std.testing.expectEqual(@as(?u32, display_err_invalid_object), lastErrorCode(&sink));
+        }
+    }
+}
+
 test "linux-dmabuf: feedback is the format table (memfd FDMSG), main device, one tranche of every entry, done; v3 gets modifier events" {
     var sink: TestSink = undefined;
     var comp = testSetup(&sink);
@@ -6743,6 +8114,41 @@ test "linux-dmabuf: feedback is the format table (memfd FDMSG), main device, one
     sink.events.clearRetainingCapacity();
     try comp.onWire(2, wire.encodeMessage(&bbuf, 2, 0, &.{ .{ .uint = dmabuf_global.name }, .{ .new_id_dynamic = .{ .interface = dmabuf_global.interface, .version = 2, .id = 4 } } }));
     try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+}
+
+test "linux-dmabuf: a table with implicit-modifier entries (virtgpu's) gives v1/v2 binders one format event per such format; create with MOD_INVALID passes" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    comp.fdmsg_fn = TestSink.fdmsg;
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    // XR24/INVALID, AR24/INVALID, XR24/LINEAR, AR24/INVALID again (a dup)
+    var table: [64]u8 = undefined;
+    for ([_]struct { u32, u64 }{ .{ fourcc_xrgb8888, dmabuf_mod_invalid }, .{ fourcc_argb8888, dmabuf_mod_invalid }, .{ fourcc_xrgb8888, 0 }, .{ fourcc_argb8888, dmabuf_mod_invalid } }, 0..) |e, i| {
+        std.mem.writeInt(u32, table[i * 16 ..][0..4], e[0], .little);
+        std.mem.writeInt(u32, table[i * 16 + 4 ..][0..4], 0, .little);
+        std.mem.writeInt(u64, table[i * 16 + 8 ..][0..8], e[1], .little);
+    }
+    try comp.setDmabuf(0xe280, &table);
+    try comp.connOpen(1);
+    try dmabufBind(&comp, 2);
+    var vals: [wire.max_args]wire.Value = undefined;
+    var got: [4]u32 = undefined;
+    var n: usize = 0;
+    const format_op = comptime protocol.find("zwp_linux_dmabuf_v1").?.eventIndex("format").?;
+    for (sink.events.items) |ev| {
+        if (ev.object_id != 3 or ev.opcode != format_op) continue;
+        got[n] = (try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{.uint}, &vals))[0].uint;
+        n += 1;
+    }
+    try std.testing.expectEqualSlices(u32, &.{ fourcc_xrgb8888, fourcc_argb8888 }, got[0..n]);
+
+    // params with the implicit modifier: accepted (no error)
+    var buf: [64]u8 = undefined;
+    try comp.onWire(1, wire.encodeMessage(&buf, 3, comptime protocol.find("zwp_linux_dmabuf_v1").?.requestIndex("create_params").?, &.{.{ .new_id = 4 }}));
+    try dmabufAdd(&comp, 4, 0, dmabuf_mod_invalid);
+    try comp.onWire(1, wire.encodeMessage(&buf, 4, comptime protocol.find("zwp_linux_buffer_params_v1").?.requestIndex("create_immed").?, &.{ .{ .new_id = 5 }, .{ .int = 8 }, .{ .int = 8 }, .{ .uint = fourcc_xrgb8888 }, .{ .uint = 0 } }));
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
 }
 
 test "linux-dmabuf params: create_immed makes the client's wl_buffer; create a dense server id, DMABUF_CREATED before created" {
@@ -7193,4 +8599,355 @@ test "confine: confined inside its area, motion clamped (relative unclipped), un
     comp.pointerEnter(1, T.SURF, T.px(20), T.px(20));
     try T.expect(&sink, &.{ .{ 21, T.unconfined_ev }, .{ T.PTR, T.leave_ev }, .{ T.PTR, T.frame_ev }, .{ T.PTR, T.enter_ev }, .{ T.PTR, T.frame_ev } });
     try std.testing.expectEqual(.defunct, T.state(&comp, 21));
+}
+
+/// Tests (selection gating, long mime types): conn `c` with a toplevel
+/// (surface 11), a keyboard (7), a pointer (14), a data device (8) and a
+/// primary device (10); data manager 6, primary manager 9. Unfocused.
+fn selConn(comp: *Compositor, c: u32) !void {
+    var buf: [256]u8 = undefined;
+    try comp.connOpen(c);
+    try comp.onWire(c, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
+    try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 1 }, .{ .new_id_dynamic = .{ .interface = "wl_compositor", .version = 4, .id = 3 } } }));
+    try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 6 }, .{ .new_id_dynamic = .{ .interface = "xdg_wm_base", .version = 1, .id = 4 } } }));
+    try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 5, .id = 5 } } }));
+    try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 6 } } }));
+    try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 13 }, .{ .new_id_dynamic = .{ .interface = "zwp_primary_selection_device_manager_v1", .version = 1, .id = 9 } } }));
+    try comp.onWire(c, wire.encodeMessage(&buf, 5, 1, &.{.{ .new_id = 7 }})); // get_keyboard
+    try comp.onWire(c, wire.encodeMessage(&buf, 5, 0, &.{.{ .new_id = 14 }})); // get_pointer
+    try comp.onWire(c, wire.encodeMessage(&buf, 6, 1, &.{ .{ .new_id = 8 }, .{ .object = 5 } })); // get_data_device
+    try comp.onWire(c, wire.encodeMessage(&buf, 9, 1, &.{ .{ .new_id = 10 }, .{ .object = 5 } })); // primary get_device
+    try comp.onWire(c, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 11 }})); // create_surface
+    try comp.onWire(c, wire.encodeMessage(&buf, 4, 2, &.{ .{ .new_id = 12 }, .{ .object = 11 } })); // get_xdg_surface
+    try comp.onWire(c, wire.encodeMessage(&buf, 12, 1, &.{.{ .new_id = 13 }})); // get_toplevel
+    try comp.onWire(c, wire.encodeMessage(&buf, 11, 6, &.{})); // initial commit
+}
+
+const SelTest = struct {
+    const ddev = protocol.find("wl_data_device").?;
+    const pdev = protocol.find("zwp_primary_selection_device_v1").?;
+    const doffer = protocol.find("wl_data_offer").?;
+    const poffer = protocol.find("zwp_primary_selection_offer_v1").?;
+    const set_sel_op = ddev.requestIndex("set_selection").?;
+    const start_drag_op = ddev.requestIndex("start_drag").?;
+    const pset_sel_op = pdev.requestIndex("set_selection").?;
+    fn send(comp: *Compositor, c: u32, obj: u32, op: u16, args: []const wire.Value) !void {
+        var buf: [2048]u8 = undefined;
+        try comp.onWire(c, wire.encodeMessage(&buf, obj, op, args));
+    }
+    /// conn 1's clipboard source 20 and primary source 21, each offering text/plain
+    fn sources(comp: *Compositor) !void {
+        try send(comp, 1, 6, 0, &.{.{ .new_id = 20 }}); // create_data_source
+        try send(comp, 1, 20, 0, &.{.{ .string = "text/plain" }});
+        try send(comp, 1, 9, 0, &.{.{ .new_id = 21 }}); // primary create_source
+        try send(comp, 1, 21, 0, &.{.{ .string = "text/plain" }});
+    }
+    fn setSel(comp: *Compositor, c: u32, source: u32, serial: u32) !void {
+        try send(comp, c, 8, set_sel_op, &.{ .{ .object = source }, .{ .uint = serial } });
+    }
+    fn setPrimary(comp: *Compositor, c: u32, source: u32, serial: u32) !void {
+        try send(comp, c, 10, pset_sel_op, &.{ .{ .object = source }, .{ .uint = serial } });
+    }
+    fn owner(sel: ?Selection) ?[2]u32 {
+        const s = sel orelse return null;
+        return .{ s.conn, s.source };
+    }
+    /// the newest offer id introduced to `c` on `device` (data_offer event)
+    fn lastOffer(sink: *TestSink, c: u32, device: u32, op: u16) u32 {
+        var id: u32 = 0;
+        for (sink.events.items) |ev| {
+            if (ev.conn_id == c and ev.object_id == device and ev.opcode == op) id = std.mem.readInt(u32, ev.bytes[8..12], .little);
+        }
+        return id;
+    }
+    fn count(sink: *TestSink, c: u32, obj: u32, op: u16) usize {
+        var n: usize = 0;
+        for (sink.events.items) |ev| {
+            if (ev.conn_id == c and ev.object_id == obj and ev.opcode == op) n += 1;
+        }
+        return n;
+    }
+};
+
+test "selection requests: honoured from the keyboard-focused client, or with a recent input serial while no other client had input since; start_drag needs a held press" {
+    const T = SelTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.interactive_fn = TestSink.interactive;
+    try selConn(&comp, 1);
+    try selConn(&comp, 2);
+    try T.sources(&comp);
+
+    // a background client with no input of its own: ignored, any serial
+    try T.setSel(&comp, 1, 20, 0);
+    try T.setSel(&comp, 1, 20, 5);
+    try T.setPrimary(&comp, 1, 21, 0);
+    try std.testing.expectEqual(@as(?[2]u32, null), T.owner(comp.selection));
+    try std.testing.expectEqual(@as(?[2]u32, null), T.owner(comp.primary_selection));
+
+    // wl-copy's way: the selection set while it holds keyboard focus
+    comp.keyboardEnter(1, 11);
+    const enter1 = comp.conns.get(1).?.serial;
+    try T.setSel(&comp, 1, 20, enter1);
+    try T.setPrimary(&comp, 1, 21, enter1);
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 20 }), T.owner(comp.selection));
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 21 }), T.owner(comp.primary_selection));
+
+    // focus moved on: its old serial no longer counts (conn 2 had focus since)
+    comp.keyboardLeave(1);
+    comp.keyboardEnter(2, 11);
+    try T.send(&comp, 1, 6, 0, &.{.{ .new_id = 22 }});
+    try T.send(&comp, 1, 22, 0, &.{.{ .string = "text/plain" }});
+    try T.setSel(&comp, 1, 22, enter1);
+    try T.setSel(&comp, 1, 0, enter1); // nor may it clear
+    try T.setPrimary(&comp, 1, 0, enter1);
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 20 }), T.owner(comp.selection));
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 21 }), T.owner(comp.primary_selection));
+
+    // a slow client: Ctrl+C in conn 1, the embedder moves focus away before
+    // the request arrives — honoured with that key's serial, nothing else
+    comp.keyboardLeave(2);
+    comp.keyboardEnter(1, 11);
+    comp.keyboardKey(1, 0, 46, true);
+    const key = comp.conns.get(1).?.serial;
+    comp.keyboardLeave(1);
+    try T.setSel(&comp, 1, 22, key +% 100); // never sent to it
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 20 }), T.owner(comp.selection));
+    try T.setSel(&comp, 1, 22, key);
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 22 }), T.owner(comp.selection));
+    // ...until another client has input: a click in conn 2
+    comp.pointerEnter(2, 11, 0, 0);
+    comp.pointerButton(2, 0, 0x110, true);
+    comp.pointerButton(2, 0, 0x110, false);
+    try T.setSel(&comp, 1, 20, key);
+    try T.setPrimary(&comp, 1, 0, key);
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 22 }), T.owner(comp.selection));
+    try std.testing.expectEqual(@as(?[2]u32, .{ 1, 21 }), T.owner(comp.primary_selection));
+
+    // start_drag: a press of conn 1's still held, nothing else
+    const drag_args = struct {
+        fn of(serial: u32) [4]wire.Value {
+            return .{ .{ .object = 20 }, .{ .object = 11 }, .{ .object = 0 }, .{ .uint = serial } };
+        }
+    };
+    sink.inter_kind = 0xffffffff;
+    try T.send(&comp, 1, 8, T.start_drag_op, &drag_args.of(key)); // a key, no press
+    try std.testing.expectEqual(@as(u32, 0xffffffff), sink.inter_kind);
+    comp.pointerLeave(2);
+    comp.pointerEnter(1, 11, 0, 0);
+    comp.pointerButton(1, 0, 0x110, true);
+    const press = comp.conns.get(1).?.serial;
+    comp.pointerButton(1, 0, 0x110, false);
+    try T.send(&comp, 1, 8, T.start_drag_op, &drag_args.of(press)); // released: too late
+    try std.testing.expectEqual(@as(u32, 0xffffffff), sink.inter_kind);
+    comp.pointerButton(1, 0, 0x110, true);
+    const held = comp.conns.get(1).?.serial;
+    try T.send(&comp, 1, 8, T.start_drag_op, &drag_args.of(press)); // an earlier press
+    try std.testing.expectEqual(@as(u32, 0xffffffff), sink.inter_kind);
+    try T.send(&comp, 1, 8, T.start_drag_op, &drag_args.of(held));
+    try std.testing.expectEqual(@as(u32, 4), sink.inter_kind); // the dnd session started
+    try std.testing.expect(comp.drag != null);
+
+    // the target accepting with a mime no source can offer: a revoke
+    comp.dragMotion(2, 11, 0, 256, 256);
+    const offer = comp.drag.?.focus_offer;
+    try std.testing.expect(offer != 0);
+    const over = [_]u8{'x'} ** (max_mime_len + 1);
+    try T.send(&comp, 2, offer, comptime T.doffer.requestIndex("accept").?, &.{ .{ .uint = 0 }, .{ .string = "text/plain" } });
+    try std.testing.expect(comp.drag.?.accepted);
+    sink.events.clearRetainingCapacity();
+    try T.send(&comp, 2, offer, comptime T.doffer.requestIndex("accept").?, &.{ .{ .uint = 0 }, .{ .string = &over } });
+    try std.testing.expect(!comp.drag.?.accepted);
+    const target_op = comptime protocol.find("wl_data_source").?.eventIndex("target").?;
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try std.testing.expectEqual(target_op, sink.events.items[0].opcode);
+    try std.testing.expectEqual(@as(usize, 12), sink.events.items[0].len); // target(null)
+    comp.dragCancel();
+}
+
+test "clipboard: a client's over-long mime types are ignored at offer (both sources) and read EOF at receive; sendEvent refuses an event over its buffer" {
+    const T = SelTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.fdmsg_fn = TestSink.fdmsg;
+    try selConn(&comp, 1);
+    try T.sources(&comp);
+    const long = [_]u8{'a'} ** 1500; // the reviewers' repro: 1512 B into a 1024 B buffer
+    const over = [_]u8{'b'} ** (max_mime_len + 1);
+    const edge = [_]u8{'c'} ** max_mime_len;
+    try T.send(&comp, 1, 20, 0, &.{.{ .string = &long }});
+    try T.send(&comp, 1, 20, 0, &.{.{ .string = &over }});
+    try T.send(&comp, 1, 20, 0, &.{.{ .string = &edge }});
+    try T.send(&comp, 1, 21, 0, &.{.{ .string = &long }});
+    try std.testing.expectEqual(@as(usize, 2), comp.conns.get(1).?.source_mimes.get(20).?.items.len);
+    try std.testing.expectEqual(@as(usize, 1), comp.conns.get(1).?.primary_source_mimes.get(21).?.items.len);
+
+    // set while focused: its own device is offered the selection (no
+    // panic, no write past the event buffer)
+    comp.keyboardEnter(1, 11);
+    sink.events.clearRetainingCapacity();
+    try T.setSel(&comp, 1, 20, comp.conns.get(1).?.serial);
+    try T.setPrimary(&comp, 1, 21, comp.conns.get(1).?.serial);
+    const offer = T.lastOffer(&sink, 1, 8, comptime T.ddev.eventIndex("data_offer").?);
+    const poffer = T.lastOffer(&sink, 1, 10, comptime T.pdev.eventIndex("data_offer").?);
+    try std.testing.expectEqual(@as(usize, 2), T.count(&sink, 1, offer, comptime T.doffer.eventIndex("offer").?));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 1, poffer, comptime T.poffer.eventIndex("offer").?));
+    var edge_ev: usize = 0;
+    for (sink.events.items) |ev| if (ev.object_id == offer and ev.len == 8 + 4 + 260) {
+        edge_ev += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), edge_ev); // the 256 B one went out whole
+
+    // a receive naming a mime over the cap reads EOF (no send to the source)
+    var buf: [1024]u8 = undefined;
+    const receive_op = comptime T.doffer.requestIndex("receive").?;
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = &over }, .fd }), 61);
+    try std.testing.expectEqual(@as(u32, 3), sink.fdmsg_kind);
+    try std.testing.expectEqual(@as(u32, 61), sink.fdmsg_token);
+    try std.testing.expectEqual(@as(usize, 0), sink.fdmsg_len);
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, poffer, comptime T.poffer.requestIndex("receive").?, &.{ .{ .string = &over }, .fd }), 62);
+    try std.testing.expectEqual(@as(u32, 62), sink.fdmsg_token);
+    try std.testing.expectEqual(@as(usize, 0), sink.fdmsg_len);
+    // the 256 B one is routed to the source
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = &edge }, .fd }), 63);
+    try std.testing.expectEqual(@as(u32, 63), sink.fdmsg_token);
+    try std.testing.expectEqual(@as(usize, 8 + 4 + 260), sink.fdmsg_len);
+
+    // the backstop: an event that does not fit is not sent (and logged)
+    sink.events.clearRetainingCapacity();
+    const logs = sink.logs;
+    const huge = [_]u8{'e'} ** 2000;
+    comp.sendEvent(1, 1, "wl_display", "error", &.{ .{ .object = 1 }, .{ .uint = 0 }, .{ .string = &huge } });
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    try std.testing.expectEqual(logs + 1, sink.logs);
+}
+
+test "conn 0 is reserved: connOpen refuses it, and a conn already open" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try std.testing.expectError(error.ReservedConnId, comp.connOpen(0));
+    try std.testing.expectEqual(@as(usize, 0), comp.conns.count());
+    try comp.connOpen(1);
+    try std.testing.expectError(error.ConnAlreadyOpen, comp.connOpen(1));
+    try std.testing.expectEqual(@as(usize, 1), comp.conns.count());
+}
+
+test "placement saturates at the i32 limits: client geometry, positions and positioners" {
+    const T = WinTest;
+    const P = PopupTest;
+    const max = std.math.maxInt(i32);
+    const min = std.math.minInt(i32);
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    // the reviewers' repro: parent geometry x = INT32_MAX, popup geometry x = −10
+    try T.send(&comp, 7, P.geom_op, &.{ .{ .int = max }, .{ .int = 0 }, .{ .int = 10 }, .{ .int = 10 } });
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try P.positioner(&comp, 20, 0, 0, .{ 8, 8 }, 20, 20);
+    try P.popup(&comp, 21, 7, 20);
+    try T.send(&comp, 22, P.geom_op, &.{ .{ .int = -10 }, .{ .int = 0 }, .{ .int = 10 }, .{ .int = 10 } });
+    try T.send(&comp, 21, T.commit_op, &.{});
+    try std.testing.expectEqual(max, P.at(&comp, 21)[0]);
+    // the other way round, and the positioner's own sums
+    try T.send(&comp, 7, P.geom_op, &.{ .{ .int = min }, .{ .int = min }, .{ .int = 10 }, .{ .int = 10 } });
+    try T.send(&comp, 22, P.geom_op, &.{ .{ .int = max }, .{ .int = max }, .{ .int = 10 }, .{ .int = 10 } });
+    try T.send(&comp, 6, T.commit_op, &.{});
+    try T.send(&comp, 21, T.commit_op, &.{});
+    try std.testing.expectEqual([2]i32{ min + 1, min + 1 }, P.at(&comp, 21)); // its configure x/y is 1, 1
+    const pos = comptime protocol.find("xdg_positioner").?;
+    try T.send(&comp, 4, comptime protocol.find("xdg_wm_base").?.requestIndex("create_positioner").?, &.{.{ .new_id = 30 }});
+    try T.send(&comp, 30, comptime pos.requestIndex("set_size").?, &.{ .{ .int = max }, .{ .int = max } });
+    try T.send(&comp, 30, comptime pos.requestIndex("set_anchor_rect").?, &.{ .{ .int = max }, .{ .int = min }, .{ .int = max }, .{ .int = max } });
+    try T.send(&comp, 30, comptime pos.requestIndex("set_anchor").?, &.{.{ .uint = 8 }});
+    try T.send(&comp, 30, comptime pos.requestIndex("set_gravity").?, &.{.{ .uint = 5 }}); // top_left: − size
+    try T.send(&comp, 30, comptime pos.requestIndex("set_offset").?, &.{ .{ .int = max }, .{ .int = min } });
+    try T.send(&comp, 23, comptime protocol.find("xdg_popup").?.requestIndex("reposition").?, &.{ .{ .object = 30 }, .{ .uint = 1 } });
+    try std.testing.expectEqual([2]i32{ 0, min }, try P.configured(&sink, 23)); // (max + max + max) − max, (min + max + min) − max
+
+    // windowGeometry over subsurfaces at the extremes (no geometry set)
+    try T.send(&comp, 7, P.geom_op, &.{ .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 } });
+    comp.conns.get(1).?.surfaces.getPtr(6).?.geom_set = false;
+    try T.send(&comp, 3, 0, &.{.{ .new_id = 40 }});
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 2 }, .{ .new_id_dynamic = .{ .interface = "wl_subcompositor", .version = 1, .id = 41 } } });
+    try T.send(&comp, 41, 1, &.{ .{ .new_id = 42 }, .{ .object = 40 }, .{ .object = 6 } }); // get_subsurface
+    try T.send(&comp, 42, comptime protocol.find("wl_subsurface").?.requestIndex("set_position").?, &.{ .{ .int = min }, .{ .int = max } });
+    comp.noteBufferSize(1, 40, 0xffff_ffff, 0xffff_ffff);
+    const g = comp.windowGeometry(1, 6);
+    try std.testing.expectEqual(min, g.x);
+    try std.testing.expectEqual(@as(i32, 0), g.y);
+    try std.testing.expectEqual(max, g.w);
+    try std.testing.expectEqual(max, g.h);
+}
+
+test "own selection to a relay with FEATURE selection_cache: each payload's bytes go once (FDMSG own_pipe), later receives name it; a new selection drops the relay's copy first" {
+    const T = SelTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.fdmsg_fn = TestSink.fdmsg;
+    try selConn(&comp, 1);
+    comp.keyboardEnter(1, 11);
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+    var pack: [256]u8 = undefined;
+    try comp.setOwnSelection(packOwnSelection(&pack, &.{ .{ "text/plain", "shared" }, .{ "UTF8_STRING", null }, .{ "text/html", "<b>x</b>" } }));
+    const offer = T.lastOffer(&sink, 1, 8, comptime T.ddev.eventIndex("data_offer").?);
+    const gen = comp.own_gen;
+    var buf: [256]u8 = undefined;
+    const receive_op = comptime T.doffer.requestIndex("receive").?;
+    const Expect = struct {
+        fn ownPipe(s: *TestSink, conn: u32, token: u32, g: u32, blob: u32, bytes: ?[]const u8) !void {
+            try std.testing.expectEqual(@as(u32, @intFromEnum(stream.FdMsgKind.own_pipe)), s.fdmsg_kind);
+            try std.testing.expectEqual(conn, s.fdmsg_conn);
+            try std.testing.expectEqual(@as(usize, 0), s.fdmsg_len); // no wire message
+            const m = try stream.OwnPipe.decode(s.fdmsg_aux[0..s.fdmsg_aux_len]);
+            try std.testing.expectEqual(token, m.token);
+            try std.testing.expectEqual(g, m.gen);
+            try std.testing.expectEqual(blob, m.blob);
+            try std.testing.expectEqual(@as(u32, if (bytes != null) stream.OwnPipe.has_bytes else 0), m.flags);
+            try std.testing.expectEqualStrings(bytes orelse "", m.bytes);
+        }
+    };
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = "UTF8_STRING" }, .fd }), 71);
+    try Expect.ownPipe(&sink, 1, 71, gen, 0, "shared");
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = "text/plain" }, .fd }), 72);
+    try Expect.ownPipe(&sink, 1, 72, gen, 0, null); // the alias: same payload, already there
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = "text/html" }, .fd }), 73);
+    try Expect.ownPipe(&sink, 1, 73, gen, 1, "<b>x</b>");
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = "text/html" }, .fd }), 74);
+    try Expect.ownPipe(&sink, 1, 74, gen, 1, null);
+    // a mime it doesn't have: EOF as ever (pipe, token alone)
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer, receive_op, &.{ .{ .string = "image/png" }, .fd }), 75);
+    try std.testing.expectEqual(@as(u32, 3), sink.fdmsg_kind);
+    try std.testing.expectEqual(@as(usize, 4), sink.fdmsg_aux_len);
+
+    // replaced: gen 0 first (the relay drops its copy), then fresh bytes
+    const calls = sink.fdmsg_calls;
+    try comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text/plain", "next" }}));
+    try std.testing.expectEqual(calls + 1, sink.fdmsg_calls);
+    try Expect.ownPipe(&sink, 0, 0, 0, 0, null);
+    const offer2 = T.lastOffer(&sink, 1, 8, comptime T.ddev.eventIndex("data_offer").?);
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer2, receive_op, &.{ .{ .string = "text/plain" }, .fd }), 76);
+    try Expect.ownPipe(&sink, 1, 76, comp.own_gen, 0, "next");
+    // a new link's relay holds nothing: the bytes go again
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+    comp.onPipeReceive(1, wire.encodeMessage(&buf, offer2, receive_op, &.{ .{ .string = "text/plain" }, .fd }), 77);
+    try Expect.ownPipe(&sink, 1, 77, comp.own_gen, 0, "next");
+    // cleared: the copy goes; nothing was sent of an unread selection
+    const calls2 = sink.fdmsg_calls;
+    try comp.setOwnSelection(&.{});
+    try std.testing.expectEqual(calls2 + 1, sink.fdmsg_calls);
+    try Expect.ownPipe(&sink, 0, 0, 0, 0, null);
+    try comp.setOwnSelection(packOwnSelection(&pack, &.{.{ "text/plain", "unread" }}));
+    const calls3 = sink.fdmsg_calls;
+    try comp.setOwnSelection(&.{});
+    try std.testing.expectEqual(calls3, sink.fdmsg_calls);
 }

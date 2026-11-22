@@ -49,21 +49,29 @@ fixed when the relay starts (one per relay run):
 
 linux-dmabuf buffers (`zwp_linux_buffer_params_v1`, only when the relay was
 started with a dmabuf backend, see FEATURE) go through the relay's **dmabuf
-backend**, also fixed at startup. The one there is, `readback` (needs the
-`copy` buffer mode), maps a LINEAR dmabuf and ships it exactly like a wl_shm
-buffer — BUFFER/BUFFER_LZ, released at commit time — so the engine cannot
-tell the two apart.
+backend**, also fixed at startup:
 
-A GPU buffer can instead be named, not shipped: a COMMIT of buffer kind 2
-names a resource the embedder's renderer holds, released when the engine
-ACKs it (see COMMIT). The engine side exists; no relay in this repo emits
-it yet (only the JS test relay does). COMMITs of both kinds may share one
-conn; they share its serial space and its ACKs.
+| Backend | A dmabuf commit travels as | `wl_buffer.release` |
+| --- | --- | --- |
+| `readback` (needs the `copy` buffer mode) | a LINEAR dmabuf mapped and shipped exactly like a wl_shm buffer — BUFFER/BUFFER_LZ; the engine cannot tell the two apart | at commit time, by the relay |
+| `virtgpu` (any buffer mode; unkernel: with `kwshm`) | nothing: a COMMIT of buffer kind 2 names the virtio-gpu resource behind the dmabuf, which the embedder's renderer holds | when the engine ACKs the COMMIT |
+
+Only an engine that can draw those resources offers linux-dmabuf in front
+of a `virtgpu` relay: the relay says how its dmabuf commits travel (FEATURE
+`dmabuf_kind`), and an engine with no GPU source leaves the global off, so
+GPU clients render in software over wl_shm instead of into buffers nothing
+would show.
+
+COMMITs of both kinds may share one conn (a client with wl_shm and dmabuf
+buffers, on any buffer mode — with `copy` the conn's shm commits are
+BUFFER frames and its dmabuf ones COMMITs); they share its serial space
+and its ACKs.
 
 There is **no negotiation and no version frame**: relay and engine ship
 together, and the engine learns the mode from the frames that arrive. (A
-FEATURE frame announces something the relay can do — today linux-dmabuf —
-but nothing answers it: it is one-way, like the buffer mode.) An
+FEATURE frame announces something the relay can do — today linux-dmabuf,
+and how its dmabuf commits travel — but nothing answers it: it is one-way,
+like the buffer mode; what the engine does with it is its own business.) An
 engine MUST accept every relay→engine frame type on any link and present
 whichever pixel frames arrive (a relay MAY even mix them on one link). An
 engine that has no buffer source (the embedder supplied none) and receives a
@@ -170,7 +178,9 @@ buffer (M7.1+: accumulated `wl_surface.damage`/`damage_buffer` rects, clamped
 to buffer bounds — `wl_surface.damage` is scaled by the buffer scale, and
 counts as the whole buffer on a surface with a viewport or a buffer
 transform; rects past the server's cap merge into bounding boxes;
-first ship or dim change degrade to one full-buffer rect).
+first ship, a dim change, or the first pixels after the surface showed a
+GPU resource (COMMIT kind virtgpu) degrade to one full-buffer rect — see
+COMMIT's "Damage").
 Pixels are **canvas-ready RGBA**: the server swizzles wl_shm xrgb8888/argb8888
 (little-endian BGRX/BGRA bytes) at ship time, forcing alpha 0xff for xrgb and
 passing argb's (premultiplied) alpha through unchanged —
@@ -196,6 +206,12 @@ u8  type = 0x03
 u32 conn_id
 ```
 
+conn_id is never 0: 0 names no app — it is the browser's own clipboard
+selection wherever a conn is reported (the reference compositor's
+selection owner, the engine's 'selection' event) — and the reference
+compositor refuses a CONN_OPEN of 0 (logged, no conn), as it does one for a
+conn that is already open. wlandr numbers conns from 1.
+
 ### 0x04 CONN_CLOSE — app disconnected (either direction)
 
 ```
@@ -218,11 +234,20 @@ u32 fd_kind           ← 1 = shm_pool (the server took the pool fd)
                                      wl_keyboard.keymap, dmabuf feedback format_table)
                         3 = pipe    (clipboard receive/send; aux = u32 fd token)
                         4 = dmabuf  (the server took a zwp_linux_buffer_params_v1.add plane fd)
+                        5 = pipe_read (the browser reads the clipboard selection; the
+                                       server makes the pipe and reads it. Browser→
+                                       server only to a server that sent FEATURE
+                                       selection_cache)
+                        6 = own_pipe (browser→server, only to a server that sent
+                                      FEATURE selection_cache: a receive of the
+                                      browser's own selection, from the server's copy)
 u32 byte_len
 u8  wire_bytes[byte_len]  ← the original wire message, fd arg carries no bytes
 u32 aux_len
 u8  aux[aux_len]      ← kind-specific: shm_pool, dmabuf: none (every mode);
-                        memfd: the file's bytes; pipe: 4-byte LE fd token
+                        memfd: the file's bytes; pipe: 4-byte LE fd token (browser→
+                        server with no wire message: + the bytes to write);
+                        pipe_read, own_pipe: see below
 ```
 
 server→browser (fd_kind=shm_pool): `wl_shm.create_pool` arrived; the server
@@ -249,7 +274,12 @@ fd_kind=pipe travels BOTH directions (M7.2 clipboard). The pipe write-end fd
 only ever exists server-side; the token names it across the hop:
 - server→browser: a `receive(mime, fd)` request arrived from the receiving app
   on a server-allocated offer. The server stashes the fd in a token-keyed table
-  and forwards the wire message plus token. **Object-typing rule:** the browser
+  and forwards the wire message plus token. **The fd must be a pipe** (an
+  anonymous pipe or a FIFO — what wl-paste, GTK, Qt, foot and the rest
+  pass): wlandr closes any other fd at once and sends nothing, so that
+  receiver reads EOF. The server writes and closes these fds on threads
+  every app shares, and only a pipe's write and close never wait — a FUSE
+  or hung-NFS file's, a tty's block whatever O_NONBLOCK says. **Object-typing rule:** the browser
   compositor allocates server-side ids (≥ 0xff000000) for two interfaces —
   `wl_data_offer` (clipboard + dnd) and `zwp_primary_selection_offer_v1`
   (primary selection) — from ONE contiguous counter. The ids cannot be
@@ -272,6 +302,74 @@ only ever exists server-side; the token names it across the hop:
   server closes the fd parked under the token and sends nothing: the receiver
   reads EOF. Every token the server hands out is answered one way or the
   other.
+- browser→server, `byte_len` = 0 and aux longer than the token: the offer is
+  the browser's own selection (the embedder's, e.g. the page clipboard: the
+  compositor holds the bytes), from a browser that does not use own_pipe.
+  aux = token ++ the bytes, on every receive; the server writes them into
+  the fd parked under the token, then closes it, exactly like an
+  own_pipe's (below: one writer, capped, 5 s). The server never parses the
+  bytes. wlandr accepts it; the reference browser never sends it (it uses
+  own_pipe, and offers apps a selection of its own only on a link whose
+  server sent FEATURE selection_cache — a server without it, wlandr 0.1.0,
+  rejects this form, "pipe fdmsg with bad aux len", and keeps the fd
+  parked: the receiving app would block in `read`).
+
+fd_kind=pipe_read (5) lets the browser read the clipboard selection itself
+(the page clipboard bridge), both directions, never a wire message the app
+sent. The browser sends it only to a server that sent FEATURE
+selection_cache (wlandr 0.1.0 predates it: "unsupported fdmsg kind 5", no
+answer ever comes):
+- browser→server: wire_bytes = a `wl_data_source.send(mime, fd)` event for
+  conn_id (the source app), aux = u32 read_id ++ u32 max_bytes. The server
+  makes a pipe, sends the event with the write end attached (closing its
+  copy), and reads the read end until EOF, more than max_bytes (it caps
+  that at 64 MiB), 5 s, or the link detaching.
+- server→browser: the answer, exactly one per read while the link stays
+  attached: conn_id = the source app, byte_len = 0, aux = u32 read_id ++
+  u32 status ++ the bytes. status 0 = all of it (the pipe reached EOF:
+  every holder of the write end closed it), 1 = over max_bytes (no bytes),
+  2 = timed out (no bytes), 3 = failed: the send could not be delivered
+  (the source's conn was gone) or the pipe failed (no bytes).
+  EOF is 0 whether or not the source is still connected by then: it is
+  the only completion signal any Wayland receiver gets, and sources hang
+  up before it in normal use (`wl-copy --paste-once` hands the write to a
+  child and exits). A source killed mid-write reads as 0 with what it
+  wrote — the same truncation every other receiver of it would see.
+  read_id is the browser's; the server only echoes it.
+
+fd_kind=own_pipe (6), browser→server only, and only to a server that sent
+FEATURE selection_cache: a `receive` on an offer of the browser's own
+selection, answered from the server's copy of the payload, so each payload
+crosses the link once per link rather than once per receive. conn_id = the
+receiving app, byte_len = 0, aux:
+
+```
+u32 token        ← the parked receive (0: none)
+u32 gen          ← the own selection's generation (0: it is gone — drop the copy)
+u32 blob         ← which of its payloads, < 32 (mime types may share one)
+u32 flags        ← bit 0: the payload's bytes follow
+u8  bytes[]      ← (flags bit 0) the payload
+```
+
+With bytes, the server keeps them as (gen, blob), first dropping whatever
+it kept of another generation; the reference browser sends them with the
+first receive of each payload on a link. Then the receive under `token` is
+served from the kept (gen, blob): the server writes it into the parked fd
+and closes it; with none kept (never sent, another generation, dropped) it
+just closes it (the receiver reads EOF). gen = 0 (token 0, conn_id 0, no
+bytes): the browser's own selection was replaced or cleared — the server
+frees its copy (transfers already going finish from the bytes they began
+with). The copy also goes when the link detaches.
+
+wlandr writes every own-selection receive (own_pipe or pipe with bytes) on
+one writer thread: non-blocking writes between polls (RWF_NOWAIT per
+write, so a receiver clearing O_NONBLOCK on its shared end changes
+nothing), none under a lock the link or app threads take, at most 4
+transfers in flight per receiving conn and 32 in all — past a cap the fd is
+closed at once (EOF), as it is for a conn that closed meanwhile, even one
+closing as the frame is handled — each given 5 s, ended at EPIPE, when its
+conn closes, or when the link detaches. A receiver that never reads costs
+a slot for 5 s, never a thread or a copy.
 
 ### 0x06 SRVOBJ — server-object type registration, browser→server only (M13)
 
@@ -461,11 +559,32 @@ release is decided as for any commit (below).
 
 **Damage.** Accumulated `wl_surface.damage` (scaled by the buffer scale) and
 `damage_buffer` since the previous commit, clamped to the buffer, empties
-dropped; at least one rect. The first COMMIT for a surface, or one whose buffer
-dims differ from the previous COMMIT's, carries exactly one full-buffer rect
-(the engine's copy of the surface is gone). The relay caps rects (64 today,
-merging past the cap) but receivers accept any count. No shadow trimming: the
-relay never reads the pixels.
+dropped; at least one rect. The first COMMIT for a surface, one whose buffer
+dims differ from the previous pixel frame's, and one whose buffer **kind**
+differs from the previous pixel frame's (pixels — BUFFER, BUFFER_LZ or
+COMMIT kind shm — versus COMMIT kind virtgpu) carries exactly one full-buffer
+rect: the engine's copy of the surface is gone (resized, or made by another
+path: the reference GL presenter starts a blank texture when shm pixels
+follow a GPU image). So does the first one after a commit that showed
+nothing (the engine missed changes). Otherwise damage is relative to the
+previous commit's content, whichever buffer held it — the next of a
+swapchain's resources included: each buffer holds the whole surface
+(`wl_surface.attach`), so an engine may copy just the damaged rects onto
+what it shows, or the whole image. The relay caps rects (64 today, merging
+past the cap) but receivers accept any count. No shadow trimming: the relay
+never reads the pixels. (In copy mode the relay's shadow of what the engine
+shows is dropped when a GPU image replaces it, so the full rect after it
+ships whole, untrimmed.)
+
+The relay counts every COMMIT it sent as shown; it can't see one the
+engine ACKed without showing anything new — kind virtgpu with no image
+resolved (no resolver, null, a throw or a rejection), a failed read or a
+broken handle for kind shm, an invalid notice. The engine makes up for it:
+the surface's next COMMIT is presented whole, its damage replaced by one
+full-buffer rect (the reference engine does so before asking the buffer
+source or the resolver, so both see the full rect too, as does the commit
+event), else a presenter copying only the damaged rects would paint them
+over stale content.
 
 **Ordering.** Same rule as BUFFER: after the WIRE frame carrying its
 `wl_surface.commit`, in the same message; its HANDLE_OPEN anywhere earlier on
@@ -480,7 +599,8 @@ these, or of an unknown kind, is ACKed without presenting (and logged).
 
 **Engine side (reference engine, `lib/engine.ts`).** The engine reads the
 damaged bytes through its buffer source while processing the COMMIT (one read
-per damage span, merged when close; an asynchronous source holds up later
+per damage span, merged when close, or all spans in one batched read, or the
+source's memory viewed in place; an asynchronous source holds up later
 frames, in order, until the read settles), hands the presenter a commit event
 (`format` `'bgra'` for ARGB8888, `'bgrx'` for XRGB8888, plus `stride` — or,
 for a view that presents with 2D only, packed `'rgba'` converted by the core's
@@ -491,9 +611,9 @@ JS swizzle for 2D surfaces beside GL ones; the GL presenter swaps channels and
 forces alpha in its shader).
 
 Buffer kind **2 = virtgpu**: a GPU resource the embedder's renderer holds,
-named instead of shipped. No relay in this repo emits it yet (the JS test
-relay, `test/support/relay.js` with `gpu: true`, does, for the engine's
-tests). Ref (≥ 36 bytes):
+named instead of shipped. wlandr emits it with `--dmabuf virtgpu` (below,
+"wlandr's emitter"); the JS test relay, `test/support/relay.js` with
+`gpu: true`, does too, for the engine's tests. Ref (≥ 36 bytes):
 
 ```
 u32 resource          ← resource id (≥ 1): whatever the embedder's renderer and its guest side agree on (e.g. a virgl resource id)
@@ -510,8 +630,8 @@ pixels; the rest lets the embedder check what it resolves (and present
 y_invert right).
 
 When it is sent: as for kind shm (a current buffer, non-empty effective
-damage; damage and the full-buffer first/resized rule likewise). There is
-no fence in STREAM.
+damage; damage and the full-buffer rule — first, resized, kind changed —
+likewise). There is no fence in STREAM.
 
 **The contract with the embedder** (the reference engine's side of it is
 `lib/engine.ts` `GpuSource`; none of it has run against a real renderer):
@@ -546,26 +666,109 @@ content, dispatches the commit event (format `'gpu'`, `gpu` = the ref,
 `image` = what the resolver returned), lets the resolver release the image,
 and ACKs. An engine without a resolver reports an error once, still
 dispatches each commit with no image (the surface is laid out and keeps its
-last content) and ACKs it.
+last content) and ACKs it — though in front of wlandr such an engine
+offers no linux-dmabuf in the first place (FEATURE dmabuf_kind), so only a
+relay that names wl_shm buffers as resources (the JS test relay) gets
+there. A commit with no image makes the surface's next one whole (Damage,
+above).
+
+**wlandr's emitter (`--dmabuf virtgpu[:NODE]`, `server/src/virtgpu.zig`).**
+The resource is the virtio-gpu one behind the client's dmabuf. At
+`create`/`create_immed` the relay imports plane 0's fd on the render node
+(`DRM_IOCTL_PRIME_FD_TO_HANDLE` → a GEM handle,
+`DRM_IOCTL_VIRTGPU_RESOURCE_INFO` → `res_handle`, the ref's `resource`); the
+other ref fields are the client's (size, fourcc, flags, plane 0's offset,
+stride and modifier). It offers ARGB8888, XRGB8888, ABGR8888 and XBGR8888,
+each with `DRM_FORMAT_MOD_INVALID` (first: virgl allocates with the
+implicit layout) and LINEAR, one plane. A buffer it cannot name — more
+planes, interlaced flags, a failed import (a dmabuf of another device, a
+resource id of 0), or a claimed layout the resource cannot hold — is
+accepted but never shown (no COMMIT; released per commit like an unfit
+wl_shm buffer). The layout check: stride ≥ width·4, neither side over 16384
+px (a GL texture's usual limit), and `offset + stride·(height−1) + width·4 ≤
+RESOURCE_INFO.size` — the GEM object's size: the guest backing Mesa asked
+for, page-rounded by the kernel; so a one-page resource can't make the page
+size a canvas from a 16384×16384 claim. That backing is the layout's total
+size (256-aligned, so at least `stride·height`) only for resources created
+`PIPE_BIND_SHARED` — which GBM and EGL-Wayland buffers always are, so a GPU
+client's buffers pass. Mesa's `virgl_resource_create_front` asks for 1 byte
+for a texture that can use staging transfers and 0 (one page) for MSAA: such
+a non-shared texture exported as a dmabuf is refused here though it is valid
+on the host (the relay cannot learn the host's size; refusing is the safe
+side), logged as having no guest backing of the claimed size. The first refusal of
+each kind is logged with its reason, as is the first buffer of each
+(format, modifier, flags) it does name; refusals have their own bounded
+table, so no client can use up the accepted-buffer lines, and the
+fence-timeout warning below is per conn.
+Lifetime: the GEM handle keeps the resource alive; the relay counts its
+holders — each wl_buffer made from it plus each un-ACKed COMMIT naming it
+(one handle per object per DRM file: two wl_buffers over one dmabuf share
+it) — and closes it (`DRM_IOCTL_GEM_CLOSE`) when the last goes, so a
+COMMIT's resource outlives `wl_buffer.destroy` until its ACK; a conn or
+link ending drops its holds at once. Release: the shared ledger (Buffer
+release), so after the ACK. Nothing here has run on a real virtio-gpu node.
+
+*The relay's own renderer context.* On a device without
+`VIRTIO_GPU_F_CONTEXT_INIT` (unkernel's offers only VIRGL) the guest kernel
+creates a host virgl context for a DRM file at its first PRIME import
+(`virtio_gpu_gem_object_open` → CTX_CREATE, then CTX_ATTACH_RESOURCE per
+import, CTX_DETACH_RESOURCE at GEM_CLOSE) and destroys it only when the
+file closes. So the relay's imports cost the page one more renderer
+context, and the relay keeps the node open only while it holds a handle:
+opened at the first import, closed when the last handle goes, opened again
+(a new context) at the next. With no GPU buffer alive the page hosts no
+context of the relay's (unkernel refuses snapshots while any exists).
+At startup the node is opened once to check it — DRM_IOCTL_VERSION must
+name `virtio_gpu`, since DRM dispatches driver ioctls by number and
+RESOURCE_INFO on another driver's node would run that driver's ioctl — and
+closed again; every later open checks the same.
+
+*Ordering, as wlandr provides it.* The relay forwards a client's requests in
+the order it reads them and adds no reordering: a COMMIT is built while the
+relay handles that client's `wl_surface.commit` — right after appending that
+request's WIRE, in the same link message, before any later request of the
+client — and nothing is queued or deferred. A GPU client submits its
+rendering (Mesa: execbuffer, at `eglSwapBuffers`) before it sends the commit
+request, so the submission precedes the COMMIT on its way to the host.
+On top of that the relay waits, before building the COMMIT, for the
+dmabuf's implicit write fences: `poll(POLLIN)` on plane 0's fd returns once
+the fences the kernel attached to the buffer (virtio-gpu attaches its
+execbuffer fence to every buffer the batch names) have signalled. A
+signalled fence means the device answered the fenced SUBMIT_3D — nothing
+more: in unkernel that is right after its renderer ran the commands in its
+WebGL context (not GPU completion), which is exactly what a resolver
+reading the texture in that same context needs; QEMU in strict mode
+answers at host GPU completion. The wait is bounded (100 ms): past it the
+COMMIT goes out anyway and the first such timeout of each conn is logged;
+it holds up only that client's thread (other clients and the link go
+on). Explicit sync
+(`linux-drm-syncobj-v1`) is not advertised (FD RULE), so no client attaches
+a sync file and the ref carries no fence.
 
 ### 0x0c FEATURE — a relay capability, server→browser only
 
 ```
 u8  type = 0x0c
-u32 feature           ← 1 = linux_dmabuf (0 is never valid)
+u32 feature           ← 1 = linux_dmabuf, 2 = dmabuf_kind, 3 = selection_cache
+                        (0 is never valid)
 u32 len
 u8  bytes[len]        ← feature-specific
 ```
 
 Sent first on a link, before any CONN_OPEN, one per feature the relay has
-(none: no frame). It tells the compositor what it may offer apps; the
-browser applies it before it processes the next frame. A browser that does
-not know a feature skips the frame (it is self-delimiting).
+(none: no frame); wlandr sends them all in the link's first message. It
+tells the compositor what it may offer apps; the browser applies it before
+it processes the next frame. A browser that does not know a feature skips
+the frame (it is self-delimiting), and a feature's bytes are its own: one
+whose length is implied by `len` (linux_dmabuf's table) can't grow, so new
+facts are new feature kinds.
 
 **1 = linux_dmabuf**: the relay takes dmabufs (`--dmabuf`), so the compositor
 advertises `zwp_linux_dmabuf_v1` (version 4; without this frame it is never
 advertised and a bind of it is a protocol error). The table is the
-backend's (readback: ARGB8888 and XRGB8888, LINEAR). Bytes:
+backend's (readback: ARGB8888 and XRGB8888, LINEAR; virtgpu: ARGB8888,
+XRGB8888, ABGR8888, XBGR8888 with `DRM_FORMAT_MOD_INVALID`, then the same
+with LINEAR). Bytes:
 
 ```
 u64 main_device       ← dev_t clients allocate on (glibc makedev encoding)
@@ -577,7 +780,49 @@ The entries are exactly the format table the compositor ships to clients
 feedback is one tranche on `main_device` holding every entry, flags 0, and
 `create`/`create_immed` with a (format, modifier) pair outside it is
 `invalid_format`. v3 binders get one `modifier` event per entry, v1/v2
-binders no formats (their `format` event would promise implicit modifiers).
+binders one `format` event per format the table offers with
+`DRM_FORMAT_MOD_INVALID` (their `format` promises the implicit modifier;
+readback's LINEAR-only table gives them none).
+
+**2 = dmabuf_kind**: how the relay's dmabuf commits reach the engine — as
+COMMITs of one buffer kind. Sent just before linux_dmabuf (same message)
+by a relay whose dmabuf backend sends COMMITs (wlandr: `virtgpu`, kind 2);
+absent (readback), dmabuf commits travel as pixels — BUFFER/BUFFER_LZ, which
+every engine shows. Bytes (≥ 4; fields are only ever appended, a receiver
+reads the first 4 and ignores the rest):
+
+```
+u32 buffer_kind       ← the COMMIT buffer kind every dmabuf commit carries (2 = virtgpu)
+```
+
+An engine that cannot show that kind does not advertise
+`zwp_linux_dmabuf_v1`, whatever linux_dmabuf says — so a GPU client finds
+no dmabuf path and renders in software over wl_shm (Mesa's EGL falls back
+to swrast; a dmabuf-only client like weston-simple-dmabuf-egl exits)
+instead of rendering into buffers that would show blank. The reference
+compositor (`Compositor.applyFeature`): kind shm is showable, kind virtgpu
+only when the embedder has a GPU source (`wland_set_gpu_source`; the
+reference engine sets it from `EngineOptions.gpu` at every link open; 1 when
+never set), anything else (unknown, or bytes under 4) not; a refusal is
+logged once per link and also holds if linux_dmabuf came first. The JS test
+relay with `gpu: true` sends it too (kind virtgpu, no linux_dmabuf after
+it: its "GPU" buffers are wl_shm ones).
+
+**3 = selection_cache**: the server bridges the clipboard for the browser:
+it reads selections for it (FDMSG pipe_read) and keeps a copy of each
+payload of the browser's own clipboard selection it is sent, serving
+receives from it (FDMSG own_pipe, above), so each payload's bytes cross
+once per link. Bytes: none (any are ignored). wlandr sends it on every
+link, after the dmabuf frames. Without it (a server that predates it:
+wlandr 0.1.0) the browser sends neither pipe_read nor own_pipe nor a pipe
+with bytes, and offers apps no selection of its own — an app could not
+paste it (the server would park its pipe and never write it). The
+reference browser: `Engine.selectionBridged()` false, `readSelection`
+rejects at once, `setSelection` sets nothing, the page bridge is inert on
+that link (one log line; copy/paste chords are plain keys). Apps' own
+selections travel between apps as ever (FDMSG pipe with a wire message).
+Which it is is known at the link's first frame that is not a FEATURE
+(every app starts with CONN_OPEN), and decided again on every link.
 
 ### 0x0d DMABUF_CREATED — a server-made dmabuf wl_buffer, browser→server only
 
@@ -595,7 +840,11 @@ needs that id to tie the params' plane fds to the buffer, so the browser sends
 this frame just before (same burst) the WIRE frame holding `created`. The
 server records it before writing `created` to the app, so the buffer is
 tracked by the time the app can name it. `create_immed` needs nothing: the
-client names the id.
+client names the id. A `create` the compositor refuses gets no frame: the
+refusals are protocol errors (fatal to the client; the reference compositor
+never sends `failed`), and the server drops what it took from the params
+with the conn. (wlandr's virtgpu import refuses each of those buffers on
+its own checks before naming it, so no GEM handle waits for that.)
 
 ### 0x0e PRESENTED — a presentation timestamp to stamp, browser→server only
 
@@ -717,8 +966,8 @@ linux-dmabuf buffers. The relay keeps, per wl_buffer:
 | `wl_surface.destroy` | nothing (buffers are independent of surfaces) |
 | conn closes / link drops | everything dropped, no releases |
 
-In copy mode `busy` is always 0, so this is v1's behaviour: release right
-after the commit-time copy. The invariant is **one release per busy period,
+For a buffer shipped as pixels (copy mode, readback) `busy` is always 0, so
+this is v1's behaviour: release right after the commit-time copy. The invariant is **one release per busy period,
 never a release without an attach**: GTK commits WITHOUT attach for empty
 frames, and a duplicate release makes GDK destroy the cairo surface it is
 painting into (nautilus SIGSEGV). A client that waits for the release before
@@ -790,8 +1039,13 @@ a variable one).
 - App connections made while no engine is attached wait (kernel-buffered)
   until one attaches; the server then sends CONN_OPEN and starts relaying.
 - conn_ids and handle_ids are never reused within a server run.
-- FEATURE frames come first on a link; the rest of a link never changes
-  what the relay can do.
+- FEATURE frames come first on a link (dmabuf_kind before linux_dmabuf);
+  the rest of a link never changes what the relay can do.
+- Version skew: a browser meets a server that lacks a FEATURE as one that
+  can't do that thing (above: linux_dmabuf, selection_cache) and never
+  sends it the frames that need it, so a newer page in front of wlandr
+  0.1.0 works with the page clipboard bridge off. An older browser skips
+  the FEATURE kinds it doesn't know.
 - No heartbeats. ACK (for COMMIT) is the only acknowledgement. Copy-mode pixel
   payloads above a size threshold are LZ4-compressed (BUFFER_LZ, 0x07);
   everything else ships uncompressed.
