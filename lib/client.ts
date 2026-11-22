@@ -84,9 +84,9 @@ export interface WlandOptions {
    *  throws (this one included) is reported asynchronously and does not keep
    *  the others from the event. */
   onEvent?(event: Event): void;
-  /** The window list (windows()) changed: windows, titles, roles, window
-   *  states (maximized, fullscreen, minimized) — and keyboard focus, unless
-   *  `onFocusChange` is given. */
+  /** The window list (windows()) changed: windows, titles, app ids, size
+   *  hints, roles, window states (maximized, fullscreen, minimized) — and
+   *  keyboard focus, unless `onFocusChange` is given. */
   onWindowsChange?(): void;
   /** Keyboard focus moved to another window, or to none (InputOptions.
    *  onFocusChange). Default: onWindowsChange. */
@@ -110,6 +110,8 @@ export interface WlandOptions {
 export interface WindowEntry {
   key: string;
   title: string;
+  /** xdg_toplevel.set_app_id ('' until the app sets one). */
+  appId: string;
   focused: boolean;
   maximized: boolean;
   fullscreen: boolean;
@@ -121,6 +123,9 @@ export interface WindowEntry {
   restore(): void;
   setMaximized(maximized: boolean): void;
   setFullscreen(fullscreen: boolean): void;
+  /** Ask the app to close the window (Engine.close: xdg_toplevel.close).
+   *  The app decides; the list changes when the window goes. */
+  close(): void;
 }
 
 export interface Wland {
@@ -267,6 +272,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
     windows: () => view.windows().map((w) => ({
       key: w.key,
       title: w.title,
+      appId: w.appId,
       focused: inp.focused(w.conn, w.surface),
       maximized: w.maximized,
       fullscreen: w.fullscreen,
@@ -280,6 +286,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       restore: () => mgr.restore(w.conn, w.surface),
       setMaximized: (on: boolean) => mgr.setMaximized(w.conn, w.surface, on),
       setFullscreen: (on: boolean) => mgr.setFullscreen(w.conn, w.surface, on),
+      close: () => eng.close(w.conn, w.surface),
     })),
   };
 }

@@ -215,6 +215,45 @@ const px = (img: { width: number; data: Uint8Array }, x: number, y: number) =>
   [...img.data.subarray((y * img.width + x) * 4, (y * img.width + x) * 4 + 4)];
 const without = (calls: Call[], ...names: string[]) => calls.filter((c) => !names.includes(c[0]));
 
+test('scene: a window carries its app id and size hints (applied at the commit, resize() clamped to them); close() asks the app', async () => {
+  let changes = 0;
+  const ctx = await setup({ onWindowsChange: () => { changes++; } });
+  const { hl, link, calls } = ctx;
+  const a = client(ctx, 1);
+  const t = a.toplevel('meta');
+  a.send(msg(t.toplevel, 3, 'org.example.Meta'), msg(t.toplevel, 8, 30, 20), msg(t.toplevel, 7, 60, 0));
+  a.paint(t.surface, 40, 30, [255, 0, 0, 255]);
+  const key = `c1s${t.surface}`;
+  let w = hl.window(key)!;
+  assert.deepEqual([w.appId, w.minW, w.minH, w.maxW, w.maxH], ['org.example.Meta', 0, 0, 0, 0], 'the hints wait for a commit');
+  const before = changes;
+  a.send(msg(t.surface, 6));
+  w = hl.window(key)!;
+  assert.deepEqual([w.minW, w.minH, w.maxW, w.maxH], [30, 20, 60, 0]);
+  assert.ok(changes > before, 'onWindowsChange');
+  link.sent.length = 0;
+  hl.resize(key, 100, 10);
+  assert.deepEqual(calls.at(-1), ['requestResize', 1, t.surface, 100, 10]);
+  // the core clamps the configure: xdg_toplevel.configure(60, 20, states)
+  const sent = cat(...link.sent);
+  const dv = new DataView(sent.buffer);
+  assert.equal(sent[0], 0x01);
+  assert.deepEqual([dv.getUint32(9, true), dv.getUint32(13, true) & 0xffff, dv.getInt32(17, true), dv.getInt32(21, true)], [t.toplevel, 0, 60, 20]);
+
+  // close: xdg_toplevel.close (event 1) on the toplevel, and nothing else happens
+  link.sent.length = 0;
+  hl.close(key);
+  assert.deepEqual(link.sent.map((b) => [...b]), [[...wire(1, u32s(t.toplevel, (8 << 16) | 1))]]);
+  assert.ok(hl.window(key), 'the app decides');
+  // the app does close it: its xdg_toplevel goes, and the hints with it
+  ctx.events.length = 0;
+  a.send(msg(t.toplevel, 0));
+  assert.deepEqual(ctx.events.find((e) => e.type === 'size-limits'),
+    { type: 'size-limits', conn: 1, surface: t.surface, minW: 0, minH: 0, maxW: 0, maxH: 0 });
+  assert.equal(hl.window(key), undefined);
+  hl.dispose();
+});
+
 test('scene: windows cascade, take focus on map, and go away with their surface or conn (no leave; focus passes on)', async () => {
   let changes = 0;
   const ctx = await setup({ onWindowsChange: () => { changes++; } });
@@ -225,7 +264,7 @@ test('scene: windows cascade, take focus on map, and go away with their surface 
   a.paint(ta.surface, 40, 30, [255, 0, 0, 255]);
   const [w1] = hl.windows();
   assert.deepEqual({ ...w1 }, {
-    key: `c1s${ta.surface}`, conn: 1, surface: ta.surface, title: 'first',
+    key: `c1s${ta.surface}`, conn: 1, surface: ta.surface, title: 'first', appId: '', minW: 0, minH: 0, maxW: 0, maxH: 0,
     x: 24, y: 48, width: 40, height: 30, originX: 24, originY: 48, z: w1.z, maximized: false, fullscreen: false, minimized: false, focused: true,
   });
   assert.deepEqual(calls, [['keyboardEnter', 1, ta.surface]]);

@@ -89,7 +89,8 @@ export interface HeadlessOptions {
    *  policy calls back into the engine: a commit's `pixels` is still
    *  readable here. A throwing consumer is reported asynchronously. */
   onEvent?(event: Event): void;
-  /** The window list changed: windows, titles, roles, focus, stacking. */
+  /** The window list changed: windows, titles, app ids, size hints,
+   *  roles, focus, stacking. */
   onWindowsChange?(): void;
 }
 
@@ -130,7 +131,16 @@ export interface HeadlessWindow {
   conn: number;
   /** The toplevel surface. */
   surface: number;
+  /** xdg_toplevel.set_title; the key until the app sets one. */
   title: string;
+  /** xdg_toplevel.set_app_id ('' until the app sets one). */
+  appId: string;
+  /** The app's size hints (SizeLimitsEvent), window geometry px; 0 = no
+   *  limit in that dimension. resize() is clamped to them. */
+  minW: number;
+  minH: number;
+  maxW: number;
+  maxH: number;
   /** The box's top-left in the output, logical px. What the app draws
    *  outside its geometry (shadows) extends beyond the box. A fullscreen
    *  window's box is the whole output (black where the app's geometry
@@ -251,6 +261,10 @@ export interface Headless {
   minimize(ref: WindowRef): void;
   /** Bring a minimized window back where it was, raised and focused. */
   restore(ref: WindowRef): void;
+  /** Ask the app to close the window (engine.close: xdg_toplevel.close);
+   *  the app decides, and its answer (the window going, a dialog) is seen
+   *  as usual. */
+  close(ref: WindowRef): void;
   /** Place the window's box at (x, y), output logical px. */
   move(ref: WindowRef, x: number, y: number): void;
   /** Ask the app for a new size (xdg_toplevel.configure, clamped to its
@@ -438,6 +452,8 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   const surfaces = new Map<string, Surf>();
   const wins = new Map<string, Win>();   // root key → placement (titles can precede it)
   const titles = new Map<string, string>();
+  const appIds = new Map<string, string>();
+  const limits = new Map<string, { minW: number; minH: number; maxW: number; maxH: number }>(); // toplevel key → size hints
   const popups = new Map<string, { conn: number; surface: number }>(); // mapped popups (wm.ts)
   const textInput = new Set<number>(); // conns with text-input enabled
   const regions = new Map<string, Int32Array>(); // surface key → input region (absent: the whole surface)
@@ -612,7 +628,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   function dropConn(conn: number) {
     for (const [key, s] of surfaces) if (s.conn === conn) surfaces.delete(key);
     for (const key of wins.keys()) if (wins.get(key)!.conn === conn) wins.delete(key);
-    for (const key of titles.keys()) if (key.startsWith(`c${conn}s`)) titles.delete(key);
+    for (const map of [titles, appIds, limits]) for (const key of map.keys()) if (key.startsWith(`c${conn}s`)) map.delete(key);
     for (const [key, p] of popups) if (p.conn === conn) popups.delete(key);
     for (const key of regions.keys()) if (key.startsWith(`c${conn}s`)) regions.delete(key);
     textInput.delete(conn);
@@ -659,6 +675,8 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         surfaces.delete(key);
         wins.delete(key);
         titles.delete(key);
+        appIds.delete(key);
+        limits.delete(key);
         popups.delete(key);
         regions.delete(key);
         forget((c, s) => c === ev.conn && s === ev.surface);
@@ -692,6 +710,17 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         titles.set(keyOf(ev.conn, ev.surface), ev.title);
         changed();
         break;
+      case 'app-id':
+        appIds.set(keyOf(ev.conn, ev.surface), ev.appId);
+        changed();
+        break;
+      case 'size-limits': {
+        const key = keyOf(ev.conn, ev.surface);
+        if (ev.minW || ev.minH || ev.maxW || ev.maxH) limits.set(key, { minW: ev.minW, minH: ev.minH, maxW: ev.maxW, maxH: ev.maxH });
+        else limits.delete(key);
+        changed();
+        break;
+      }
       case 'text-input':
         if (ev.active) textInput.add(ev.conn); else textInput.delete(ev.conn);
         break;
@@ -1131,6 +1160,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     const o = originOfWin(win);
     return {
       key: win.key, conn: win.conn, surface: win.surface, title: titles.get(win.key) ?? win.key,
+      appId: appIds.get(win.key) ?? '', minW: 0, minH: 0, maxW: 0, maxH: 0, ...limits.get(win.key),
       x: win.x, y: win.y,
       width: win.fullscreen ? output.width : win.gw || root.logicalWidth,
       height: win.fullscreen ? output.height : win.gh || root.logicalHeight,
@@ -1202,6 +1232,10 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     restore(ref) {
       const win = toplevel(ref);
       if (win) engine.setMinimized(win.conn, win.surface, false);
+    },
+    close(ref) {
+      const win = toplevel(ref);
+      if (win) engine.close(win.conn, win.surface);
     },
     move(ref, x, y) {
       const win = wins.get(refKey(ref));
@@ -1286,6 +1320,8 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       surfaces.clear();
       wins.clear();
       titles.clear();
+      appIds.clear();
+      limits.clear();
       popups.clear();
       regions.clear();
       active = hover = pressed = grab = dnd = lock = null;

@@ -66,7 +66,17 @@ export interface ViewWindow {
    *  the press); its canvases and hit elements set `auto` explicitly, so
    *  anything an embedder adds inside it takes no pointer unless it does. */
   element: HTMLElement;
+  /** xdg_toplevel.set_title; the key until the app sets one. */
   title: string;
+  /** xdg_toplevel.set_app_id ('' until the app sets one). */
+  appId: string;
+  /** The app's size hints (SizeLimitsEvent: xdg_toplevel.set_min_size /
+   *  set_max_size as of its last commit), window geometry px; 0 = no limit
+   *  in that dimension. */
+  minW: number;
+  minH: number;
+  maxW: number;
+  maxH: number;
   /** Window states as of the last event or commit (CommitEvent.maximized,
    *  .fullscreen, .minimized). A minimized window is hidden but still
    *  listed (a taskbar restores it). */
@@ -84,7 +94,8 @@ export interface ViewOptions {
   mount?(win: ViewWindow): void;
   /** Take a window's element out of the page. Default: element.remove(). */
   unmount?(win: ViewWindow): void;
-  /** Window list changed: a window came or went, a title or role changed. */
+  /** Window list changed: a window came or went, its title, app id, size
+   *  hints, role or states changed. */
   onWindowsChange?(): void;
   /** WebGL present for toplevels: 'auto' (only on hardware-accelerated
    *  WebGL), 'always', or 'never'. Default 'auto'. */
@@ -137,7 +148,8 @@ export interface View {
 
 const keyOf = (conn: number, surface: number) => `c${conn}s${surface}`;
 
-/** A window element per toplevel (title lives in `titles`). `origin` is the
+/** A window element per toplevel (title, app id and size hints live in
+ *  `titles`, `appIds`, `limits`: they can precede it). `origin` is the
  *  toplevel surface's origin inside it: the canvases' parent, offset by the
  *  window geometry's position. `g` is the last box laid out (the geometry,
  *  or the toplevel's size while none is known; w 0 = nothing yet). */
@@ -201,6 +213,8 @@ export function createView(options: ViewOptions): View {
   const byCanvas = new WeakMap<object, Surface>(); // canvas or hit element → record
   const windows = new Map<string, Win>(); // root key → window
   const titles = new Map<string, string>(); // toplevel key → title (titles can precede the window)
+  const appIds = new Map<string, string>(); // toplevel key → app id (likewise)
+  const limits = new Map<string, { minW: number; minH: number; maxW: number; maxH: number }>(); // toplevel key → size hints
   const cursors = new Map<number, Cursor>(); // conn → its pointer image
   const imageSet = imageSetFn();
   let overlay: { s: Surface; hx: number; hy: number } | null = null; // the cursor canvas following the pointer
@@ -320,7 +334,13 @@ export function createView(options: ViewOptions): View {
     if (s.hit) s.hit.remove();
     surfaces.delete(s.key);
     dropWindow(s.key);
-    titles.delete(s.key);
+    forgetToplevel(s.key);
+  }
+
+  function forgetToplevel(key: string) {
+    titles.delete(key);
+    appIds.delete(key);
+    limits.delete(key);
   }
 
   // dnd icons live in the container itself (no window), fixed, input-inert;
@@ -674,7 +694,7 @@ export function createView(options: ViewOptions): View {
         const key = keyOf(ev.conn, ev.surface);
         const s = surfaces.get(key);
         if (s) { dropSurface(s); restack(s.conn, s.root); }
-        else { dropWindow(key); titles.delete(key); }
+        else { dropWindow(key); forgetToplevel(key); }
         onWindowsChange();
         break;
       }
@@ -697,6 +717,7 @@ export function createView(options: ViewOptions): View {
         cursors.delete(ev.conn);
         for (const s of surfaces.values()) if (s.conn === ev.conn) dropSurface(s);
         for (const win of windows.values()) if (win.conn === ev.conn) dropWindow(win.key);
+        for (const map of [titles, appIds, limits]) for (const key of map.keys()) if (key.startsWith(`c${ev.conn}s`)) map.delete(key);
         onWindowsChange();
         break;
       }
@@ -704,6 +725,17 @@ export function createView(options: ViewOptions): View {
         titles.set(keyOf(ev.conn, ev.surface), ev.title);
         onWindowsChange();
         break;
+      case 'app-id':
+        appIds.set(keyOf(ev.conn, ev.surface), ev.appId);
+        onWindowsChange();
+        break;
+      case 'size-limits': {
+        const key = keyOf(ev.conn, ev.surface);
+        if (ev.minW || ev.minH || ev.maxW || ev.maxH) limits.set(key, { minW: ev.minW, minH: ev.minH, maxW: ev.maxW, maxH: ev.maxH });
+        else limits.delete(key);
+        onWindowsChange();
+        break;
+      }
       case 'maximize':
       case 'fullscreen':
       case 'minimize': {
@@ -737,6 +769,8 @@ export function createView(options: ViewOptions): View {
   const publicWindow = (win: Win): ViewWindow => ({
     key: win.key, conn: win.conn, surface: win.surface, element: win.element,
     title: titles.get(win.key) || win.key,
+    appId: appIds.get(win.key) ?? '',
+    minW: 0, minH: 0, maxW: 0, maxH: 0, ...limits.get(win.key),
     maximized: win.maximized, fullscreen: win.fullscreen, minimized: win.minimized,
   });
 
@@ -794,6 +828,8 @@ export function createView(options: ViewOptions): View {
       for (const s of [...surfaces.values()]) dropSurface(s);
       for (const key of [...windows.keys()]) dropWindow(key);
       titles.clear();
+      appIds.clear();
+      limits.clear();
       for (const [k, v] of Object.entries(savedStyle)) cstyle[k] = v;
       onWindowsChange();
     },

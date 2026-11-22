@@ -8,7 +8,7 @@ import { installFakeDom } from './fake-dom.ts';
 import { createView, watchOutput } from '../lib/view.ts';
 import { createInput } from '../lib/input.ts';
 import { createWindowManager } from '../lib/wm.ts';
-import { createWland, type Wland } from '../lib/client.ts';
+import { createWland, type ViewWindow, type Wland } from '../lib/client.ts';
 import type { Engine, Link, LinkCallbacks, Role } from '../lib/engine.ts';
 
 const wasm = await readFile(new URL('../lib/wland.wasm', import.meta.url));
@@ -1138,6 +1138,70 @@ test('createWland windows(): the states per entry; raise() on a minimized window
     w.raise();
     assert.deepEqual(asked, [[1, 5, false]]);
     wl.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('createWland: mount / unmount and onFocusChange are passed on; app id and size hints on the window; close() asks the engine', async () => {
+  const dom = installFakeDom();
+  try {
+    const link = scriptedLink();
+    const frame = dom.container(); // the embedder's own window frame
+    const mounted: ViewWindow[] = [], unmounted: string[] = [];
+    let windowsChanges = 0, focusChanges = 0;
+    const wl: Wland = await createWland({
+      container: dom.container(), wasm, link, webgl: 'never', scale: 1,
+      mount: (win) => { mounted.push(win); frame.appendChild(win.element); },
+      unmount: (win) => { unmounted.push(win.key); win.element.remove(); },
+      onWindowsChange: () => { windowsChanges++; },
+      onFocusChange: () => { focusChanges++; },
+    });
+    link.cb!.onOpen();
+    const feed = (ev: Ev) => { wl.view.handle(ev); wl.input.handle(ev); wl.wm.handle(ev); };
+    // the app id and hints may come before the window exists
+    feed({ type: 'app-id', conn: 1, surface: 5, appId: 'org.example.App' });
+    feed({ type: 'size-limits', conn: 1, surface: 5, minW: 100, minH: 50, maxW: 0, maxH: 400 });
+    feed({
+      type: 'commit', conn: 1, surface: 5, role: 1, root: 5, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 1, height: 1 },
+      width: 1, height: 1, logicalWidth: 1, logicalHeight: 1, format: 'rgba', stride: 0,
+      damage: new Int32Array([0, 0, 1, 1]), pixels: new Uint8Array(4),
+    });
+    assert.equal(mounted.length, 1);
+    assert.equal(mounted[0].element.parentElement, frame, 'the embedder\'s mount put it there');
+    assert.deepEqual([mounted[0].appId, mounted[0].minW, mounted[0].minH, mounted[0].maxW, mounted[0].maxH], ['org.example.App', 100, 50, 0, 400]);
+    const [w] = wl.windows();
+    assert.equal(w.appId, 'org.example.App');
+    // hints that change are announced; all zero is none again
+    const before = windowsChanges;
+    feed({ type: 'size-limits', conn: 1, surface: 5, minW: 0, minH: 0, maxW: 0, maxH: 0 });
+    assert.ok(windowsChanges > before);
+    assert.deepEqual([wl.view.window(1, 5)!.minW, wl.view.window(1, 5)!.maxH], [0, 0]);
+    // focus has its own callback: a second window took it at its map, the
+    // first one raised takes it back
+    assert.equal(focusChanges, 1, 'the first window took focus at its map');
+    feed({
+      type: 'commit', conn: 1, surface: 6, role: 1, root: 6, x: 0, y: 0, maximized: false, fullscreen: false, minimized: false,
+      geometry: { x: 0, y: 0, width: 1, height: 1 },
+      width: 1, height: 1, logicalWidth: 1, logicalHeight: 1, format: 'rgba', stride: 0,
+      damage: new Int32Array([0, 0, 1, 1]), pixels: new Uint8Array(4),
+    });
+    assert.equal(focusChanges, 2);
+    const focusBefore = focusChanges, windowsBefore = windowsChanges;
+    w.raise();
+    assert.equal(focusChanges, focusBefore + 1);
+    assert.equal(windowsChanges, windowsBefore, 'not onWindowsChange when onFocusChange is given');
+    // close() is engine.close, nothing else
+    const asked: unknown[][] = [];
+    wl.engine.close = (...a) => { asked.push(a); };
+    w.close();
+    assert.deepEqual(asked, [[1, 5]]);
+    assert.equal(wl.windows().length, 2, 'the app decides');
+    feed({ type: 'destroy', conn: 1, surface: 5 });
+    assert.deepEqual(unmounted, ['c1s5']);
+    wl.dispose();
+    await new Promise((r) => setTimeout(r, 0)); // the IME sink's blur check (a microtask) runs on the fake DOM
   } finally {
     dom.uninstall();
   }

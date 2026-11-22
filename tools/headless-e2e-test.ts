@@ -348,6 +348,8 @@ async function foot() {
   const app = runApp(spec);
   const win = await oneWindow(spec.name);
   check(win.focused, `mapped with keyboard focus (${win.width}x${win.height} at ${win.x},${win.y})`);
+  const appId = realApps ? 'foot' : 'wland-fixture.term';
+  check(win.appId === appId, `the window carries its app id ("${win.appId}")`);
   const shot0 = hl.screenshot();
   check(colours(shot0) >= 3, `screenshot non-blank (${colours(shot0)} colours sampled)`);
 
@@ -438,7 +440,10 @@ async function foot() {
   await settle();
   const big = hl.windows()[0]!;
   check(colours(hl.screenshot({ window: big })) >= 3, `resized to ${big.width}x${big.height}, content rendered`);
-  await stop(app);
+  // close: xdg_toplevel.close, and foot exits by itself
+  hl.close(big);
+  await until(() => !alive(app), 5000, 'foot to exit when asked to close');
+  check(true, 'close(): foot exited by itself');
   await noWindows();
 }
 
