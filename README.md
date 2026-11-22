@@ -2,7 +2,7 @@
 
 **Wayland apps, composited in the browser.**
 
-![How wland works: unmodified Wayland apps talk to the wlandr relay over a unix socket on a Linux host, VM guest or container; the relay keeps the file descriptors and streams the rest over a WebSocket, vsock or any byte stream to a compositor running as wasm in a browser tab](.github/how-it-works.svg)
+![How wland works: unmodified Wayland apps talk to the wlandr relay over a unix socket on a Linux host, VM guest or container; the relay keeps the file descriptors and streams the rest over a WebSocket, vsock or any byte stream to a compositor running as wasm in a browser tab; with --profile session the compositor runs in the relay instead and the tab is a viewer, so apps outlive a reload](.github/how-it-works.svg)
 
 wland is a Wayland compositor compiled to WebAssembly, ~65 kB gzipped in
 total. Real apps like `foot` and `nautilus` speak the real wire protocol,

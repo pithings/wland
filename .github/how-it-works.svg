@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 30 960 294" width="960" height="294" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 30 960 452" width="960" height="452" role="img" aria-labelledby="t d">
   <title id="t">How wland works</title>
-  <desc id="d">Unmodified Wayland apps talk to the wlandr relay over a unix socket on a Linux host, VM guest or container. The relay keeps file descriptors and forwards everything else over a WebSocket, vsock or any byte stream (STREAM) to the compositor, which runs as WebAssembly in a browser tab and draws each window.</desc>
+  <desc id="d">Unmodified Wayland apps talk to the wlandr relay over a unix socket on a Linux host, VM guest or container. The relay keeps file descriptors and forwards everything else over a WebSocket, vsock or any byte stream (STREAM) to the compositor, which runs as WebAssembly in a browser tab and draws each window. That is the default passthrough profile, where a page reload restarts the apps. In the session profile (wlandr --profile session) the compositor runs inside the relay and the browser tab is a viewer that is sent the scene and sends input, so apps keep running across reloads.</desc>
   <style>
     svg {
       --bg: #fafafa; --card: #ffffff; --sub: #f4f4f5; --fg: #171717; --muted: #737373;
@@ -43,6 +43,8 @@
     .focus { fill: none; stroke: var(--fg); opacity: 0; }
     .chip { fill: var(--sub); stroke: var(--border); }
     .chip-hl { fill: none; stroke: var(--blue); opacity: 0; }
+    .node { fill: var(--sub); stroke: var(--border); }
+    .node-hl { fill: var(--sub); stroke: var(--blue); }
 
     /* packets */
     .r { animation: right 2.4s linear infinite; }
@@ -115,13 +117,13 @@
       <stop offset="0" stop-color="#fff"/>
       <stop offset="1" stop-color="#fff" stop-opacity="0"/>
     </radialGradient>
-    <mask id="gridmask"><rect width="960" height="324" fill="url(#fade)"/></mask>
-    <clipPath id="canvasclip"><rect x="0.5" y="30.5" width="959" height="293" rx="16"/></clipPath>
+    <mask id="gridmask"><rect width="960" height="482" fill="url(#fade)"/></mask>
+    <clipPath id="canvasclip"><rect x="0.5" y="30.5" width="959" height="451" rx="16"/></clipPath>
   </defs>
 
   <!-- canvas -->
-  <rect class="canvas" x="0.5" y="30.5" width="959" height="293" rx="16"/>
-  <rect width="960" height="324" fill="url(#grid)" mask="url(#gridmask)" clip-path="url(#canvasclip)"/>
+  <rect class="canvas" x="0.5" y="30.5" width="959" height="451" rx="16"/>
+  <rect width="960" height="482" fill="url(#grid)" mask="url(#gridmask)" clip-path="url(#canvasclip)"/>
 
   <!-- linux host boundary -->
   <rect class="bound" x="24.5" y="60.5" width="571" height="208" rx="14"/>
@@ -253,4 +255,45 @@
   <circle class="violet" cx="384" cy="297.5" r="3.5"/>
   <text class="s muted" x="394" y="301">input, clipboard, resize</text>
   <text class="xs mono muted" x="920" y="301" text-anchor="end">idle desktop = 0 bytes</text>
+
+  <!-- profiles: where the compositor runs -->
+  <text class="eyebrow" x="44" y="336">PROFILES<tspan opacity="0.6"> · WHERE THE COMPOSITOR RUNS</tspan></text>
+  <rect class="card" x="40.5" y="348.5" width="431" height="108" rx="10"/>
+  <text class="mono" x="58" y="374" font-size="14" font-weight="600">passthrough<tspan class="s muted" font-weight="400" dx="8">default</tspan></text>
+  <text class="s muted" x="454" y="374" text-anchor="end">a reload restarts the apps</text>
+  <line class="rule" x1="41" y1="388.5" x2="471" y2="388.5"/>
+  <g class="mono" text-anchor="middle">
+    <rect class="node" x="58.5" y="404.5" width="72" height="36" rx="6"/>
+    <text x="94.5" y="419" font-size="11">apps</text>
+    <text class="muted" x="94.5" y="432" font-size="10">Wayland</text>
+    <rect class="node" x="178.5" y="404.5" width="120" height="36" rx="6"/>
+    <text x="238.5" y="419" font-size="11">wlandr</text>
+    <text class="muted" x="238.5" y="432" font-size="10">relay</text>
+    <rect class="node-hl" x="346.5" y="404.5" width="108" height="36" rx="6"/>
+    <text x="400.5" y="419" font-size="11">browser tab</text>
+    <text class="blue" x="400.5" y="432" font-size="10">compositor</text>
+    <text class="muted" x="154.5" y="417" font-size="10">wire</text>
+    <path class="line" d="M135.5 426 H173.5 M169.5 422.5 L173.5 426 L169.5 429.5 M139.5 422.5 L135.5 426 L139.5 429.5"/>
+    <text class="muted" x="322.5" y="417" font-size="10">wire</text>
+    <path class="line" d="M303.5 426 H341.5 M337.5 422.5 L341.5 426 L337.5 429.5 M307.5 422.5 L303.5 426 L307.5 429.5"/>
+  </g>
+  <rect class="card" x="488.5" y="348.5" width="431" height="108" rx="10"/>
+  <text class="mono" x="506" y="374" font-size="14" font-weight="600">session<tspan class="s muted" font-weight="400" dx="8">--profile session</tspan></text>
+  <text class="s muted" x="902" y="374" text-anchor="end">apps outlive the tab</text>
+  <line class="rule" x1="489" y1="388.5" x2="919" y2="388.5"/>
+  <g class="mono" text-anchor="middle">
+    <rect class="node" x="506.5" y="404.5" width="72" height="36" rx="6"/>
+    <text x="542.5" y="419" font-size="11">apps</text>
+    <text class="muted" x="542.5" y="432" font-size="10">Wayland</text>
+    <rect class="node-hl" x="626.5" y="404.5" width="120" height="36" rx="6"/>
+    <text x="686.5" y="419" font-size="11">wlandr</text>
+    <text class="blue" x="686.5" y="432" font-size="10">compositor</text>
+    <rect class="node" x="794.5" y="404.5" width="108" height="36" rx="6"/>
+    <text x="848.5" y="419" font-size="11">browser tab</text>
+    <text class="muted" x="848.5" y="432" font-size="10">viewer</text>
+    <text class="muted" x="602.5" y="417" font-size="10">wire</text>
+    <path class="line" d="M583.5 426 H621.5 M617.5 422.5 L621.5 426 L617.5 429.5 M587.5 422.5 L583.5 426 L587.5 429.5"/>
+    <text class="muted" x="770.5" y="417" font-size="10">scene</text>
+    <path class="line" d="M751.5 426 H789.5 M785.5 422.5 L789.5 426 L785.5 429.5 M755.5 422.5 L751.5 426 L755.5 429.5"/>
+  </g>
 </svg>
