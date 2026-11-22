@@ -433,6 +433,17 @@ const wl = await createWland({ container, mount, unmount, manageDisplay: false }
 wl.engine.setVisible(conn, surface, false);   // or entry.setVisible(false) on wl.windows()
 ```
 
+Menus near the edge: apps place popups relative to their window, and only
+the compositor can keep them on screen (flip a menu to the other side of
+its button, slide it back, shrink it), which needs to know where the window
+is. The default window manager tells it; with your own frames, tell it
+where each window's box (`ViewWindow.element`, the window geometry) sits
+in the container whenever you place or move it:
+
+```js
+wl.engine.setWindowPosition(conn, surface, x, y);   // the box's top-left, container px
+```
+
 Snapping windows to halves and quarters: `setTiled` tells the app which
 edges it is tiled against (it drops its shadows and rounded corners
 there, as when maximized), and can ask for the tile's size in the same
@@ -739,7 +750,8 @@ authentication.
 - **Apps** — foot, weston-terminal, nautilus (menus, popups, file drag and
   drop), and X11 apps like xterm through xwayland-satellite.
 - **Windows** — move, resize, maximize, minimize and fullscreen. Popups close
-  on an outside click. Clicks on transparent parts fall through.
+  on an outside click and stay on screen near its edges (flipped, slid or
+  shrunk as the app allows). Clicks on transparent parts fall through.
 - **Input** — keyboard, pointer, wheel, cursor shapes and app-drawn cursors.
 - **Pointer lock** — for games and 3D apps.
 - **Text input** — dead keys, CJK and the emoji picker.

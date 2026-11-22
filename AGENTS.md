@@ -73,6 +73,11 @@ any of them (update this list when it does).
   that window (core `inImplicitGrab`; wm.ts re-checks the DOM's buttons and
   ends a grab whose button is up). A popup's x/y counts from the parent's
   set window geometry to its own (`surfaceAbs`), not from surface origins.
+  Popups are constrained to the output (xdg_positioner flip/slide/resize)
+  only once the embedder told the core where the window's geometry is
+  (`setWindowPosition`: wm.ts and headless do it themselves; an embedder
+  with its own `mount` must) — unknown, they are placed as the positioner
+  says; reactive ones are re-placed when the window moves.
 - The engine re-reads subsurface/popup positions and ranks ('position'
   events) only after a link message that left the core's `positions_dirty`
   set (`wland_take_positions_dirty`): core code that moves, restacks,

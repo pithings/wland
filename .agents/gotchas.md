@@ -595,8 +595,27 @@ with it. New findings go in the matching section.
   shadows outside their geometry: placing from surface origins put
   l3afpad's menus ~20 px up-left. Only a SET geometry counts there: a
   default one (bounds with subsurfaces) is the surface origin, for
-  xwayland-satellite (plan.md, the satellite entry). No constraint
-  adjustment (flip/slide/resize): window positions are the embedder's.
+  xwayland-satellite (plan.md, the satellite entry).
+- **Constraint adjustment needs the window's position** (`win_pos`, from
+  `setWindowPosition`: the embedder owns positions, the core is only
+  told). `placePopup` constrains against the OUTPUT (desk_w×desk_h, not
+  setBounds' work area) translated into the parent's geometry space;
+  `popupParentAt` sums the toplevel's position and each popup's x/y down
+  the chain (a popup's x/y IS geometry-to-geometry, so no surface offsets
+  enter). Unknown position (never told, the xdg_toplevel went, a session
+  viewer's init) = exactly the unadjusted placement — the e2e checks that
+  relied on it still hold. Per axis, only if that axis is out: flip
+  (offset mirrored too, as mutter; kept only if the flipped box fits),
+  slide (gravity's direction first, then back, never pushing the other
+  edge out: a popup larger than the output stays put on that axis), resize
+  (cut to the output; the configure carries the cut size). Non-reactive
+  open popups never move when the window does (they ride along); reactive
+  ones are re-placed at setWindowPosition / setDesktopSize, parents
+  first, with a plain xdg_popup.configure + xdg_surface.configure (no
+  `repositioned`: that answers a reposition request) and positions_dirty.
+  The wm tells positions from element.style.left/top (deduped per window,
+  forgotten at 'open', 'close', 'synced', an unmap), so it is off with an
+  embedder's `mount` (createWland passes `positions: !mount`).
 - **Interactive move/resize needs a press still held on the window**
   (`inImplicitGrab`): its serial must be one of the current implicit
   grab's presses (first…latest, buttons tracked per conn in

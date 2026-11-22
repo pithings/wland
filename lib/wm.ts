@@ -5,10 +5,10 @@
 // dnd session (wl_data_device.start_drag). Window positions are DOM state;
 // the core is only told them (Engine.setWindowPosition, `positions`: it
 // constrains popups to the output with them). It moves the view's window
-// elements, so it assumes the
-// view's default mount (windows absolutely positioned in one container); an
-// embedder hosting windows in its own frames brings its own window manager,
-// or keeps this one for the rest and takes interactive move/resize
+// elements, so it assumes the view's default mount (windows absolutely
+// positioned in one container); an embedder hosting windows in its own
+// frames brings its own window manager, or keeps this one for the rest
+// and takes interactive move/resize
 // (`interactive`: the app's requests and Alt+drag, with the press they came
 // from) and focus (input's `autoFocus: false`: this module then focuses
 // nothing either — not a window it restores or makes fullscreen, nor the
@@ -231,6 +231,8 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') window.addEventListener('blur', onBlur);
 
   // --- window positions for the core (popup constraints; `positions`) -----
+  // the element's left/top (a fullscreen window's 0,0: its geometry centred
+  // in the container when smaller is not accounted for)
   function tellPosition(conn: number, surface: number) {
     if (!positionsOn) return;
     const win = view.window(conn, surface);

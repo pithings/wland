@@ -113,9 +113,40 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   mode (like zwp_linux_dmabuf_v1, conditional) would fix SDL under the
   default; on a session link a mode switch would then need wl_registry
   global / global_remove to existing registries (registries are not
-  tracked today). Open, in WINDOW.md's order: visibility owned by the
-  embedder, window positions for popup constraints, tiled states and
-  acked-configure serials.
+  tracked today).
+  Milestone 4, done (2026-11-22), the last of WINDOW.md §2: visibility —
+  `Engine.setVisible(conn, surface, visible)` (CALL 31; WindowEntry
+  .setVisible, headless setVisible/`hidden`): a hidden window is rendered
+  for like a minimized one (callbacks held, feedback discarded, v6
+  `suspended`, popups and subsurfaces alike) without being minimized or
+  losing focus or popups; `ViewOptions.manageDisplay` / createWland's
+  (default true; false: the view never writes a window element's display).
+  Tiled — `Engine.setTiled(conn, surface, edges, w?, h?)` (CALL 32, EDGE_*
+  bits): tiled_* states (v2+) in every configure, independent of
+  maximized/fullscreen, an optional size in the same configure. Answers —
+  'configure' events (EVENT 17: serial, size, states, `cause`) for every
+  toplevel configure, `cause` being the token requestResize / setMaximized
+  / setFullscreen / setTiled now return (their CALLs' last word); 'acked'
+  events (EVENT 18, replayed) at the commit applying an ack, with the
+  serial and size it asked (`acked` on ViewWindow / HeadlessWindow): the
+  rule is acked serial ≥ the token's configure serial. Positions —
+  `Engine.setWindowPosition(conn, surface, x, y)` (CALL 33): xdg_positioner
+  constraint adjustment (flip/slide/resize per axis, nested popups,
+  reposition, reactive re-placement on moves and output changes) against
+  the output; unknown position = unadjusted as before; wm.ts (`positions`,
+  off with an embedder's `mount`) and headless tell it themselves. A
+  session viewer's init drops the last viewer's hidden/tiled/positions.
+  Checked: core unit tests (each adjustment per axis, combinations,
+  nested, unknown, reposition, reactive; hidden; tiled per version; acked
+  incl. skipped configures and the ring), session_test.zig (CALLs 31–33,
+  EVENTs 17–18, the replay, the reset at init), node tests, headless-e2e
+  (passthrough, `--profile session`, real foot + nautilus: a real GTK
+  context menu at the output's corner stays inside), relay-e2e (a hidden
+  simple-shm stops on the stream link), run-poc foot gtk states embedder
+  (the edge menu after an Alt+drag; `?display=0`). Not done: hidden (like
+  minimized) windows' frame callbacks over a WebSocket link are still the
+  relay's (it keeps firing them); set_parent_size / set_parent_configure
+  (v3 hints for a parent mid-resize) are accepted and ignored.
 - **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
   Firefox render but ignore all input): the core kept one wl_pointer /
   wl_keyboard / data device id per client, the last made, and Firefox
