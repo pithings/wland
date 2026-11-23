@@ -578,6 +578,14 @@ with it. New findings go in the matching section.
   event: a region can change on a commit with no buffer, and arrives before
   a surface's first commit. The core never checks pointer coordinates
   against it (pointerEnter trusts the embedder's pick).
+- **An enter only ever follows a leave, whatever the embedder calls.**
+  `pointerEnter` for the surface that already holds the pointer is dropped
+  (no new serial, a held press stays held), and one for another surface
+  sends the old one's leave first. The page needs it: at the end of a
+  grab `input.ts` re-enters the surface under the pointer, and when the
+  embedder's window manager had captured the pointer on its own element
+  the browser then fires `pointerover` on that surface too (Qt logs an
+  enter without a leave, and drops its focus).
 - **A window's box is its window geometry**, not its toplevel surface
   (`windowGeometry`): what `set_window_geometry` named (GTK: the frame inside
   its shadow; foot: grid + titlebar, borders outside), else the bounds of the
