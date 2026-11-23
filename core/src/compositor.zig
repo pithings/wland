@@ -163,7 +163,6 @@ const shm_format_xrgb8888: u32 = 1;
 
 const seat_capability_pointer: u32 = 1;
 const seat_capability_keyboard: u32 = 2;
-const seat_capability_touch: u32 = 4;
 
 // wl_pointer.axis_source: our browser wheel input is always a physical wheel
 const axis_source_wheel: u32 = 0;
@@ -722,15 +721,6 @@ pub const max_source_mimes = 128;
 /// the spec's other bad requests without an error code: the object exists
 /// and stays silent.
 pub const max_seat_objects = 8;
-/// Most touch points one client has down at once (a touchscreen's ten
-/// fingers); a down beyond them is ignored, its motion and up too.
-pub const max_touch_points = 10;
-
-/// A touch point of a client's (Conn.touch_points): the embedder's id from
-/// its touchDown to its touchUp, the surface it went down on (motion keeps
-/// naming it, wherever the finger goes) and the down's serial — what a
-/// move/resize may name while the point is down (touchGrab).
-const TouchPoint = struct { id: i32, surface: u32, serial: u32 };
 
 /// The objects of one kind a client made for the one seat — from every
 /// wl_seat binding it holds (Firefox binds wl_seat twice: GTK's, whose
@@ -831,15 +821,6 @@ const Conn = struct {
     /// one made while its client has focus is sent the enter at once.
     pointers: SeatObjects = .{},
     keyboards: SeatObjects = .{},
-    /// wl_touch objects (every one gets every touch event). Points exist
-    /// only while there is one: the last released forgets them.
-    touches: SeatObjects = .{},
-    /// the points down now (TouchPoint), in down order
-    touch_points: [max_touch_points]TouchPoint = undefined,
-    touch_n: u8 = 0,
-    /// a touch event went out since the last wl_touch.frame (touchFrame
-    /// sends one only then)
-    touch_unframed: bool = false,
     pointer_focus: u32 = 0,
     /// serial of the latest pointer enter (one serial, sent to every
     /// wl_pointer; a late wl_pointer's enter repeats it) —
@@ -1083,11 +1064,6 @@ pub const Compositor = struct {
     /// and reports the grant (pointerLockGranted) and the loss
     /// (pointerLockLost); `locked` goes out only on the grant.
     pointer_lock_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32) void = null,
-    /// The conn now has a wl_touch (bound: its first get_touch) or none any
-    /// more (its last released). Touch calls for a conn without one are
-    /// ignored: the embedder sends that client the finger as a pointer.
-    /// Nothing is told when the conn closes (its CONN_CLOSE says it).
-    touch_bound_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, bound: bool) void = null,
     /// A wp_presentation_feedback.presented event (`msg`, one whole wire
     /// message) whose timestamp the transport must replace: the core's is
     /// the page's frame time, which no client can read. The transport
@@ -1687,6 +1663,7 @@ pub const Compositor = struct {
         if (std.mem.eql(u8, iface.name, "wl_seat")) {
             // every wl_seat binding's objects get the seat's events (a
             // client may bind it twice: Firefox), at their binding's version
+            // (get_touch: no touch capability, no events — nothing to track)
             const id = args[0].new_id;
             if (std.mem.eql(u8, msg.name, "get_pointer")) {
                 if (!conn.pointers.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_pointer", id);
@@ -1695,14 +1672,6 @@ pub const Compositor = struct {
                 if (!conn.keyboards.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_keyboard", id);
                 self.sendKeymap(conn_id, id, entry.version);
                 self.lateKeyboardEnter(conn_id, conn, id);
-            } else if (std.mem.eql(u8, msg.name, "get_touch")) {
-                // (no late downs: a point already down stays the other
-                // objects'; the next down reaches this one too)
-                const was = conn.touches.len;
-                if (!conn.touches.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_touch", id);
-                if (was == 0) {
-                    if (self.touch_bound_fn) |f| f(self.ctx, conn_id, true);
-                }
             }
             return;
         }
@@ -1764,8 +1733,7 @@ pub const Compositor = struct {
         {
             // CSD titlebar / border drag; args = seat, serial[, edges]. The
             // embedder owns the drag, and starts it only for a press still
-            // held on this window (inImplicitGrab) or a touch point still
-            // down on it (touchGrab): the request of a slow
+            // held on this window (inImplicitGrab): the request of a slow
             // client can arrive after the release, and a grab started then
             // follows a pointer with no button down until the next click.
             // Not while fullscreen (it neither moves nor resizes).
@@ -1774,14 +1742,9 @@ pub const Compositor = struct {
                 const is_move = msg.name[0] == 'm';
                 if (surface.fullscreen) {
                     // its size and place are the desktop's
-                } else if (inImplicitGrab(conn, args[1].uint, id) or touchGrab(conn, args[1].uint, id)) {
-                    // a finger's: the embedder's drag follows it from here,
-                    // so the client's touch sequence ends (as a gesture's)
-                    if (!inImplicitGrab(conn, args[1].uint, id)) self.cancelTouches(conn_id, conn);
-                    if (self.interactive_fn) |f| f(self.ctx, conn_id, id, if (is_move) 0 else 1, if (is_move) 0 else args[2].uint);
-                } else {
-                    self.logf("c{d}: xdg_toplevel.{s} with serial {d} outside a held press or touch — ignored", .{ conn_id, msg.name, args[1].uint });
-                }
+                } else if (!inImplicitGrab(conn, args[1].uint, id)) {
+                    self.logf("c{d}: xdg_toplevel.{s} with serial {d} outside a held press — ignored", .{ conn_id, msg.name, args[1].uint });
+                } else if (self.interactive_fn) |f| f(self.ctx, conn_id, id, if (is_move) 0 else 1, if (is_move) 0 else args[2].uint);
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and
             (std.mem.eql(u8, msg.name, "set_maximized") or std.mem.eql(u8, msg.name, "unset_maximized")))
@@ -1945,11 +1908,8 @@ pub const Compositor = struct {
                 } else self.logf("c{d}: set_selection without keyboard focus (serial {d}) — ignored", .{ conn_id, args[1].uint });
             } else if (std.mem.eql(u8, msg.name, "start_drag")) {
                 // args: source (nullable), origin, icon (nullable), serial —
-                // a press of this client's, still held (like move/resize).
-                // Not a touch point's: the dnd session follows the pointer
-                // (touch-driven dnd is not done), so a touch serial is as
-                // stale as any — even one between two held presses
-                if (pressHeld(conn, args[3].uint) and touchBySerial(conn, args[3].uint) == null) {
+                // a press of this client's, still held (like move/resize)
+                if (pressHeld(conn, args[3].uint)) {
                     self.startDrag(conn_id, conn, args[0].object, args[1].object, args[2].object);
                 } else self.logf("c{d}: start_drag with serial {d} outside a held press — ignored", .{ conn_id, args[3].uint });
             }
@@ -2229,9 +2189,6 @@ pub const Compositor = struct {
                 _ = conn.surfaces.remove(header.object_id);
                 self.dropToplevelStrings(conn, header.object_id);
                 self.restacked(conn); // it, or its children, may have been placed
-                // its touch points and its subsurfaces' (still chained to
-                // it here) go silently, like focus below: no up for them
-                dropTouchesOn(conn, header.object_id);
                 // its subsurfaces are unmapped with it, their role objects
                 // inert (the id may name another surface right after)
                 var child_it = conn.surfaces.iterator();
@@ -2302,7 +2259,6 @@ pub const Compositor = struct {
                         (surface.role == .toplevel and surface.toplevel_id == header.object_id);
                     if (match) {
                         self.positions_dirty = true;
-                        dropTouchesOn(conn, kv.key_ptr.*); // unmapped: silently, as unmapped() does
                         if (surface.role == .toplevel) {
                             self.dropToplevelStrings(conn, kv.key_ptr.*);
                             // its size hints are the xdg_toplevel's too
@@ -2360,7 +2316,6 @@ pub const Compositor = struct {
                     surface.role = .none;
                     surface.sub_obj_id = 0;
                     surface.parent_id = 0;
-                    dropTouchesOn(conn, kv.key_ptr.*); // (its own subsurfaces stop at it now)
                     self.setOnOutput(conn_id, conn, kv.key_ptr.*, surface, false);
                     self.notifySurface(conn_id, kv.key_ptr.*, @intFromEnum(Role.none));
                     break;
@@ -2455,15 +2410,6 @@ pub const Compositor = struct {
                 conn.pointers.remove(header.object_id);
             } else if (std.mem.eql(u8, iface.name, "wl_keyboard")) {
                 conn.keyboards.remove(header.object_id);
-            } else if (std.mem.eql(u8, iface.name, "wl_touch")) {
-                // the last one: its points have nobody left to end them for
-                const was = conn.touches.len;
-                conn.touches.remove(header.object_id);
-                if (was > 0 and conn.touches.len == 0) {
-                    conn.touch_n = 0;
-                    conn.touch_unframed = false;
-                    if (self.touch_bound_fn) |f| f(self.ctx, conn_id, false);
-                }
             } else if (std.mem.eql(u8, iface.name, "wl_data_device")) {
                 // v2 release; its offers live on (the client destroys them)
                 conn.data_devices.remove(header.object_id);
@@ -2510,9 +2456,6 @@ pub const Compositor = struct {
             .subsurface, .popup => {},
             else => return,
         }
-        // off screen: its touch points (and its subsurfaces') end
-        // silently, as for a destroyed surface
-        if (self.conns.get(conn_id)) |conn| dropTouchesOn(conn, surface_id);
         self.notifySurface(conn_id, surface_id, @intFromEnum(Role.none));
     }
 
@@ -3134,8 +3077,7 @@ pub const Compositor = struct {
     /// set_minimized, or the embedder's setMinimized: the window hides (the
     /// embedder is told) or comes back. Hiding takes the pointer and the
     /// keyboard from its surfaces (an active pointer constraint ends first:
-    /// unlocked/unconfined before the leave), cancels the client's touch
-    /// points when one is on it and dismisses its popups; a
+    /// unlocked/unconfined before the leave) and dismisses its popups; a
     /// v6 client gets `suspended` until it is restored. Its frame callbacks
     /// wait meanwhile (tick) and its presentation feedback is discarded
     /// (surfaceShown). Only for toplevels past their initial configure.
@@ -3147,9 +3089,6 @@ pub const Compositor = struct {
             self.refreshFloatingSize(conn_id, conn, surface);
             surface.minimized = true;
             if (conn.pointer_focus != 0 and underMinimized(conn, conn.pointer_focus)) self.pointerLeave(conn_id);
-            // a finger on it: the client's touch sequence ends (one cancel
-            // ends every point of the client's, as wl_touch has it)
-            if (touchesUnder(conn, underMinimized)) self.cancelTouches(conn_id, conn);
             // (the leave's configure, no longer activated, carries `suspended`)
             told = conn.keyboard_focus == id;
             if (conn.keyboard_focus == id) self.keyboardLeave(conn_id);
@@ -3249,8 +3188,7 @@ pub const Compositor = struct {
     /// (Surface.hidden). Hidden, it is rendered for like a minimized one —
     /// frame callbacks held (tick), feedback discarded (surfaceShown), a
     /// v6 client `suspended` — but nothing else changes: not `minimized`,
-    /// not keyboard or pointer focus, not its popups; only a finger on it
-    /// is cancelled (wl_touch.cancel, the client's points). Shown again, the held
+    /// not keyboard or pointer focus, not its popups. Shown again, the held
     /// callbacks fire at the next tick. Only `suspended` reaches the app,
     /// in a configure repeating its size, and only when it changes (not
     /// while the window is minimized or the tab hidden). Before the
@@ -3260,9 +3198,6 @@ pub const Compositor = struct {
         const surface = t.surface;
         if (surface.hidden == !visible) return;
         surface.hidden = !visible;
-        // a finger on a window the user can't see any more: the client's
-        // touch sequence ends (the only input change hiding makes)
-        if (!visible and touchesUnder(t.conn, underHidden)) self.cancelTouches(conn_id, t.conn);
         if (!surface.configured or surface.minimized or self.suspended) return;
         if (objVersion(t.conn, surface.toplevel_id) < 6) return;
         self.refreshFloatingSize(conn_id, t.conn, surface);
@@ -3653,7 +3588,7 @@ pub const Compositor = struct {
             self.sendEvent(conn_id, id, "wp_presentation", "clock_id", &.{.{ .uint = presentation_clock_monotonic }});
         } else if (std.mem.eql(u8, interface, "wl_seat")) {
             self.sendEvent(conn_id, id, "wl_seat", "capabilities", &.{
-                .{ .uint = seat_capability_pointer | seat_capability_keyboard | seat_capability_touch },
+                .{ .uint = seat_capability_pointer | seat_capability_keyboard },
             });
             if (version >= 2) {
                 self.sendEvent(conn_id, id, "wl_seat", "name", &.{.{ .string = "wland-seat" }});
@@ -4660,142 +4595,6 @@ pub const Compositor = struct {
     }
 
     // ------------------------------------------------------------------
-    // touch (wl_touch): the embedder's points, one table per conn
-    // (Conn.touch_points). Unlike the pointer there is no focus: each point
-    // stays with the surface it went down on until its up. Every event goes
-    // to every wl_touch of the conn (SeatObjects); a group ends with frame.
-    // ------------------------------------------------------------------
-
-    /// A touch point went down on `surface_id` at x,y (surface-local
-    /// wl_fixed): wl_touch.down, a serial of its own (an input serial, like
-    /// a button press: set_selection, and move/resize while the point is
-    /// down). Ignored for a conn with no wl_touch, a surface that is gone,
-    /// a cursor or dnd icon, a minimized window, during a dnd drag (its
-    /// grab owns input), for an id already down and beyond
-    /// max_touch_points.
-    pub fn touchDown(self: *Compositor, conn_id: u32, time_ms: u32, surface_id: u32, id: i32, x_fixed: i32, y_fixed: i32) void {
-        if (self.drag != null) return;
-        const conn = self.conns.get(conn_id) orelse return;
-        if (conn.touches.len == 0) return;
-        // the down names the surface: a gone one would kill the client
-        const surface = conn.surfaces.getPtr(surface_id) orelse return;
-        switch (surface.role) {
-            .cursor, .dnd_icon => return,
-            else => {},
-        }
-        if (underMinimized(conn, surface_id)) return; // an embedder lagging behind
-        if (touchById(conn, id) != null or conn.touch_n == max_touch_points) return;
-        const serial = nextSerial(conn);
-        noteInputSerial(conn, serial);
-        self.last_input_conn = conn_id;
-        conn.touch_points[conn.touch_n] = .{ .id = id, .surface = surface_id, .serial = serial };
-        conn.touch_n += 1;
-        self.seatEvent(conn_id, &conn.touches, "wl_touch", "down", &.{
-            .{ .uint = serial }, .{ .uint = time_ms }, .{ .object = surface_id },
-            .{ .int = id },      .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
-        }, 1);
-        conn.touch_unframed = true;
-    }
-
-    /// A point that is down moved: x,y local to the surface it went down
-    /// on, wherever it is now. Ignored for an id that is not down.
-    pub fn touchMotion(self: *Compositor, conn_id: u32, time_ms: u32, id: i32, x_fixed: i32, y_fixed: i32) void {
-        const conn = self.conns.get(conn_id) orelse return;
-        if (touchById(conn, id) == null) return;
-        self.seatEvent(conn_id, &conn.touches, "wl_touch", "motion", &.{
-            .{ .uint = time_ms }, .{ .int = id }, .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
-        }, 1);
-        conn.touch_unframed = true;
-    }
-
-    /// A point went up: wl_touch.up with a serial of its own (an input
-    /// serial, as a button release's), and the id is free again. Ignored
-    /// for an id that is not down.
-    pub fn touchUp(self: *Compositor, conn_id: u32, time_ms: u32, id: i32) void {
-        const conn = self.conns.get(conn_id) orelse return;
-        const i = touchById(conn, id) orelse return;
-        const serial = nextSerial(conn);
-        noteInputSerial(conn, serial);
-        self.last_input_conn = conn_id;
-        removeTouch(conn, i);
-        self.seatEvent(conn_id, &conn.touches, "wl_touch", "up", &.{
-            .{ .uint = serial }, .{ .uint = time_ms }, .{ .int = id },
-        }, 1);
-        conn.touch_unframed = true;
-    }
-
-    /// The embedder's touch calls since the last one happened together:
-    /// wl_touch.frame, if any of them sent something.
-    pub fn touchFrame(self: *Compositor, conn_id: u32) void {
-        const conn = self.conns.get(conn_id) orelse return;
-        if (!conn.touch_unframed) return;
-        conn.touch_unframed = false;
-        self.seatEvent(conn_id, &conn.touches, "wl_touch", "frame", &.{}, 1);
-    }
-
-    /// The embedder took the touch sequence (the browser's pointercancel,
-    /// its own drag): every point of the conn ends without its up.
-    pub fn touchCancel(self: *Compositor, conn_id: u32) void {
-        const conn = self.conns.get(conn_id) orelse return;
-        self.cancelTouches(conn_id, conn);
-    }
-
-    /// wl_touch.cancel if a point is down, and every point is forgotten
-    /// (cancel ends them all: wl_touch has no per-point cancel). The
-    /// embedder's later calls naming them are ignored.
-    fn cancelTouches(self: *Compositor, conn_id: u32, conn: *Conn) void {
-        if (conn.touch_n == 0) return;
-        conn.touch_n = 0;
-        conn.touch_unframed = false;
-        self.seatEvent(conn_id, &conn.touches, "wl_touch", "cancel", &.{}, 1);
-    }
-
-    fn touchById(conn: *const Conn, id: i32) ?usize {
-        for (conn.touch_points[0..conn.touch_n], 0..) |p, i| if (p.id == id) return i;
-        return null;
-    }
-
-    /// The point whose down had `serial` (still down), or null.
-    fn touchBySerial(conn: *const Conn, serial: u32) ?TouchPoint {
-        if (serial == 0) return null;
-        for (conn.touch_points[0..conn.touch_n]) |p| if (p.serial == serial) return p;
-        return null;
-    }
-
-    /// Order-preserving, like SeatObjects.remove.
-    fn removeTouch(conn: *Conn, i: usize) void {
-        std.mem.copyForwards(TouchPoint, conn.touch_points[i .. conn.touch_n - 1], conn.touch_points[i + 1 .. conn.touch_n]);
-        conn.touch_n -= 1;
-    }
-
-    /// Is `serial` the down of a point still down on `toplevel_id`'s window
-    /// (the toplevel or one of its subsurfaces)? What move/resize may name
-    /// besides a held press (inImplicitGrab).
-    fn touchGrab(conn: *Conn, serial: u32, toplevel_id: u32) bool {
-        const p = touchBySerial(conn, serial) orelse return false;
-        return subsurfaceRoot(conn, p.surface) == toplevel_id;
-    }
-
-    /// Is a point of the conn's on a surface `pred` holds for?
-    fn touchesUnder(conn: *const Conn, comptime pred: fn (*const Conn, u32) bool) bool {
-        for (conn.touch_points[0..conn.touch_n]) |p| if (pred(conn, p.surface)) return true;
-        return false;
-    }
-
-    /// `surface_id` was destroyed or unmapped: the points on it and on
-    /// surfaces whose subsurface chain leads to it are forgotten, SILENTLY
-    /// (no up: the client already dropped what it hung on that surface;
-    /// the embedder's calls naming them are ignored). Call it while the
-    /// subsurfaces are still chained to it.
-    fn dropTouchesOn(conn: *Conn, surface_id: u32) void {
-        var i: usize = 0;
-        while (i < conn.touch_n) {
-            const s = conn.touch_points[i].surface;
-            if (s == surface_id or subsurfaceRoot(conn, s) == surface_id) removeTouch(conn, i) else i += 1;
-        }
-    }
-
-    // ------------------------------------------------------------------
     // pointer constraints (lock + confine) — the state machine is the
     // core's (Constraint); the embedder only grants and loses Pointer Lock
     // ------------------------------------------------------------------
@@ -5471,8 +5270,7 @@ pub const Compositor = struct {
 
     /// The seat half of an attaching embedder's replay: per conn
     /// (ascending) the pointer image while it holds the pointer, its text
-    /// input while entered, the pointer lock it wants, whether it has a
-    /// wl_touch (touch_bound_fn, only when it has); then the clipboard
+    /// input while entered, the pointer lock it wants; then the clipboard
     /// selection (selection_fn, always once).
     pub fn replaySeat(self: *Compositor) void {
         const ids = self.connIds(self.gpa) catch return;
@@ -5490,9 +5288,6 @@ pub const Compositor = struct {
             if (conn.lock_surface != 0) {
                 if (self.pointer_lock_fn) |f| f(self.ctx, conn_id, conn.lock_surface);
             }
-            if (conn.touches.len > 0) {
-                if (self.touch_bound_fn) |f| f(self.ctx, conn_id, true);
-            }
         }
         self.notifySelection();
     }
@@ -5504,9 +5299,9 @@ pub const Compositor = struct {
     }
 
     /// The embedder went (a viewer closed): what only it held up ends —
-    /// a drag is cancelled, every pointer lock is lost, the pointer and
+    /// a drag is cancelled, every pointer lock is lost and the pointer and
     /// keyboard leave every client (held buttons and modifiers released:
-    /// the next enter starts clean), touch points are cancelled, and the apps are told they are
+    /// the next enter starts clean), and the apps are told they are
     /// suspended until an embedder says otherwise. Clients stay connected.
     pub fn embedderGone(self: *Compositor) void {
         self.dragCancel();
