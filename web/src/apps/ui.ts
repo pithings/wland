@@ -125,7 +125,7 @@ export function button(
 
 export const hit = (x: number, y: number, box: Rect | null | undefined): boolean => !!box && x >= box[0] && x < box[0] + box[2] && y >= box[1] && y < box[1] + box[3];
 
-/** Drag-to-scroll with a fling, for touch (the lib delivers a touch as a
+/** Drag-to-scroll with a fling, for touch (the toolkit plays a finger as a
  *  left-button press) and for mouse drags alike. The app feeds it presses
  *  and moves, owns the scroll value (`get`/`set` clamp), and runs `tick`
  *  from its own tick while `flinging` (win.animate). */

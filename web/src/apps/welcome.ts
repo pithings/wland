@@ -4,7 +4,8 @@
 // one way, and the pointer and key events this window receives travel back.
 // Below it, four things to try that tick off as they happen. What it
 // exercises: frame-paced animation with small damage (only the pipeline's
-// band repaints each frame), cursor shapes, an xdg_popup context menu,
+// band repaints each frame), cursor shapes, an xdg_popup context menu (a
+// right-click, or the toolkit's long press by finger),
 // keyboard focus, and xdg_toplevel maximize.
 import type { AppModule, Ctx, Rect, Theme } from '../wayland/app-types.ts';
 import { FONT, MONO, theme, menu, hit } from './ui.ts';
@@ -26,11 +27,13 @@ const STAGES: { name: string; what: string; here: string; prod: string }[] = [
 ];
 
 type TryId = 'resize' | 'popup' | 'key' | 'sketch';
+// a touch screen: the menu is a long press, and Sketch draws with wl_touch
+const COARSE = matchMedia('(pointer: coarse)').matches;
 const TRIES: { id: TryId; label: string; tag: string }[] = [
   { id: 'resize', label: 'Resize me', tag: 'xdg_toplevel' },
-  { id: 'popup', label: 'Right-click', tag: 'xdg_popup' },
+  { id: 'popup', label: COARSE ? 'Long-press' : 'Right-click', tag: 'xdg_popup' },
   { id: 'key', label: 'Press a key', tag: 'wl_keyboard' },
-  { id: 'sketch', label: 'Draw in Sketch', tag: 'wl_pointer' },
+  { id: 'sketch', label: 'Draw in Sketch', tag: COARSE ? 'wl_touch' : 'wl_pointer' },
 ];
 
 // The badge, longest first: the first that fits is shown.

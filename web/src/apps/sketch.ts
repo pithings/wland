@@ -3,6 +3,9 @@
 // press captures the pointer until release, and the crosshair cursor is
 // picked by the client (wp_cursor_shape_v1). Strokes are kept as vectors and
 // replayed into a layer, so a resize or a buffer-scale change stays sharp.
+// Fingers on the canvas are raw wl_touch points, a stroke each (draw with
+// several at once); a cancelled point takes its stroke back. The toolbar
+// takes fingers as the toolkit's emulated pointer.
 import type { AppModule, Rect } from '../wayland/app-types.ts';
 import { FONT, theme, button, hit } from './ui.ts';
 
@@ -16,11 +19,12 @@ interface Stroke { color: number; size: number; points: Point[] }
 const app: AppModule = {
   id: 'sketch',
   name: 'Sketch',
-  blurb: 'Pointer capture, per-segment damage, cursors',
+  blurb: 'Pointer capture, multi-touch, per-segment damage, cursors',
   width: 440, height: 340, minWidth: 340, minHeight: 240,
   create(win) {
     const strokes: Stroke[] = [];
     let current: Stroke | null = null;
+    const fingers = new Map<number, Stroke>(); // touch id → its stroke in progress
     let color = 1, size = 1;
     let layer: OffscreenCanvas | null = null, layerKey = '';
     let boxes: { colors: Rect[]; sizes: Rect[]; clear: Rect | null } = { colors: [], sizes: [], clear: null };
@@ -51,6 +55,38 @@ const app: AppModule = {
       for (let i = Math.max(1, from); i < p.length; i++) c.lineTo(...p[i]);
       c.stroke();
     }
+
+    // a stroke starts at content (x, y) / grows to it, damaging its box
+    function begin(x: number, y: number): Stroke {
+      const empty = !strokes.length;
+      const st: Stroke = { color, size: SIZES[size], points: [[x, y - BAR]] };
+      strokes.push(st);
+      ensureLayer();
+      drawStroke(layer!.getContext('2d')!, st, 0);
+      if (empty) win.invalidate();
+      else { const r = st.size; win.invalidate([x - r, y - r, r * 2, r * 2]); }
+      return st;
+    }
+    function extend(st: Stroke, ex: number, ey: number) {
+      const p = st.points;
+      const [lx, ly] = p[p.length - 1];
+      const x = ex, y = Math.max(0, ey - BAR);
+      if (Math.abs(x - lx) + Math.abs(y - ly) < 1.5) return;
+      p.push([x, y]);
+      ensureLayer();
+      drawStroke(layer!.getContext('2d')!, st, p.length - 1);
+      const r = st.size;
+      const x0 = Math.min(lx, x) - r, y0 = Math.min(ly, y) - r;
+      win.invalidate([x0, y0 + BAR, Math.abs(x - lx) + r * 2, Math.abs(y - ly) + r * 2]);
+    }
+    const toolbar = (x: number, y: number) => {
+      const ci = boxes.colors.findIndex((b) => hit(x, y, b));
+      if (ci >= 0) { color = ci; win.invalidate([0, 0, win.width, BAR]); return true; }
+      const si = boxes.sizes.findIndex((b) => hit(x, y, b));
+      if (si >= 0) { size = si; win.invalidate([0, 0, win.width, BAR]); return true; }
+      if (hit(x, y, boxes.clear)) { strokes.length = 0; fingers.clear(); current = null; layerKey = ''; win.invalidate(); return true; }
+      return false;
+    };
 
     return {
       paint(ctx, w, h) {
@@ -108,35 +144,34 @@ const app: AppModule = {
           if (hc !== hoverClear) { hoverClear = hc; win.invalidate([0, 0, win.width, BAR]); }
         }
         if (ev.type === 'down' && ev.button === 0) {
-          const ci = boxes.colors.findIndex((b) => hit(ev.x, ev.y, b));
-          if (ci >= 0) { color = ci; win.invalidate([0, 0, win.width, BAR]); return; }
-          const si = boxes.sizes.findIndex((b) => hit(ev.x, ev.y, b));
-          if (si >= 0) { size = si; win.invalidate([0, 0, win.width, BAR]); return; }
-          if (hit(ev.x, ev.y, boxes.clear)) { strokes.length = 0; layerKey = ''; win.invalidate(); return; }
-          if (!onCanvas) return;
-          const empty = !strokes.length;
-          current = { color, size: SIZES[size], points: [[ev.x, ev.y - BAR]] };
-          strokes.push(current);
-          ensureLayer();
-          drawStroke(layer!.getContext('2d')!, current, 0);
-          if (empty) win.invalidate();
-          else { const r = current.size; win.invalidate([ev.x - r, ev.y - r, r * 2, r * 2]); }
+          if (toolbar(ev.x, ev.y) || !onCanvas) return;
+          current = begin(ev.x, ev.y);
           return;
         }
-        if (ev.type === 'move' && current) {
-          const p = current.points;
-          const [lx, ly] = p[p.length - 1];
-          const x = ev.x, y = Math.max(0, ev.y - BAR);
-          if (Math.abs(x - lx) + Math.abs(y - ly) < 1.5) return;
-          p.push([x, y]);
-          ensureLayer();
-          drawStroke(layer!.getContext('2d')!, current, p.length - 1);
-          const r = current.size;
-          const x0 = Math.min(lx, x) - r, y0 = Math.min(ly, y) - r;
-          win.invalidate([x0, y0 + BAR, Math.abs(x - lx) + r * 2, Math.abs(y - ly) + r * 2]);
-          return;
-        }
+        if (ev.type === 'move' && current) { extend(current, ev.x, ev.y); return; }
         if ((ev.type === 'up' || ev.type === 'leave') && current) current = null;
+        if (ev.type === 'leave' && hoverClear) { hoverClear = false; win.invalidate([0, 0, win.width, BAR]); } // (a finger's tap ends so too)
+      },
+      // fingers on the canvas: one stroke each (the toolbar's are the
+      // pointer's: not taken)
+      touch(ev) {
+        if (ev.type === 'down') {
+          if (ev.y < BAR) return false;
+          fingers.set(ev.id, begin(ev.x, ev.y));
+          return true;
+        }
+        const st = fingers.get(ev.id);
+        if (!st) return;
+        if (ev.type === 'move') extend(st, ev.x, ev.y);
+        else if (ev.type === 'up') fingers.delete(ev.id);
+        else if (ev.type === 'cancel') {
+          // not a drawing after all (the window moved, was minimized…)
+          fingers.delete(ev.id);
+          const i = strokes.indexOf(st);
+          if (i >= 0) strokes.splice(i, 1);
+          layerKey = '';
+          win.invalidate();
+        }
       },
     };
   },

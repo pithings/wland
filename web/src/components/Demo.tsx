@@ -391,8 +391,9 @@ function Stats() {
 }
 
 // the per-frame cycle (frame → attach → damage → commit → done → release)
-// and pointer motion; what's left is configure, focus, keys, buttons, popups
-const NOISY = /wl_pointer@\d+\.(motion|frame)|wl_callback@\d+\.done|wl_surface@\d+\.(frame|attach|damage_buffer|commit)|wl_buffer@\d+\.release|wl_display@1\.delete_id/;
+// and pointer/touch motion; what's left is configure, focus, keys, buttons,
+// touch down/up, popups
+const NOISY = /wl_pointer@\d+\.(motion|frame)|wl_touch@\d+\.(motion|frame)|wl_callback@\d+\.done|wl_surface@\d+\.(frame|attach|damage_buffer|commit)|wl_buffer@\d+\.release|wl_display@1\.delete_id/;
 
 function Wire() {
   const host = useSession().opts.source === 'host';

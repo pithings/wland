@@ -27,7 +27,13 @@ export interface CursorImage {
 }
 
 /** Pointer input. `button`: 0 left, 1 middle, 2 right (meaningful on
- *  down/up). `dx`/`dy`: wheel deltas (0 otherwise). */
+ *  down/up). `dx`/`dy`: wheel deltas (0 otherwise).
+ *  `touch`: a finger the toolkit plays as the pointer (a wl_touch point the
+ *  app's touch() did not take): move, down (left), moves, up, then leave —
+ *  no hover before or after it, cursors ignored. A press that is abandoned
+ *  (wl_touch.cancel, e.g. the window started moving) ends with a leave and
+ *  no up; a finger held still in the content turns into a right-button
+ *  press (leave, then down with button 2: context menus). */
 export interface AppPointerEvent {
   type: 'move' | 'down' | 'up' | 'leave' | 'wheel';
   x: number;
@@ -36,6 +42,20 @@ export interface AppPointerEvent {
   shift: boolean;
   dx: number;
   dy: number;
+  touch: boolean;
+}
+
+/** A wl_touch point's event, in content coordinates (relative to the
+ *  content all along, also outside it). `id` is the point's, unique among
+ *  the points down. Events that happened together arrive back to back and
+ *  end with a 'frame' (id -1). 'cancel' ends a point without its up: the
+ *  compositor took the touch sequence (a window move, minimize…) — undo
+ *  what it started. */
+export interface AppTouchEvent {
+  type: 'down' | 'move' | 'up' | 'cancel' | 'frame';
+  id: number;
+  x: number;
+  y: number;
 }
 
 /** A key press, through the US keymap. `key` follows DOM names ('a', 'A',
@@ -86,8 +106,12 @@ export interface WindowApi {
   /** Open an xdg_popup at content (x, y). One at a time. */
   popup(x: number, y: number, opts: PopupOptions): PopupHandle;
   closePopup(): void;
-  /** Start an interactive move (from a pointer press). */
+  /** Start an interactive move (from a pointer press, or a touch point
+   *  still down: the compositor then cancels the touch sequence). */
   move(): void;
+  /** The client holds a wl_touch (the seat has touch): fingers arrive as
+   *  touch points, else the page plays them as the pointer. */
+  readonly touch: boolean;
   /** Toggle maximized. */
   maximize(): void;
   /** xdg_toplevel.set_maximized / unset_maximized. */
@@ -111,6 +135,12 @@ export interface WindowApi {
 export interface AppInstance {
   paint(ctx: Ctx, w: number, h: number): void;
   pointer?(ev: AppPointerEvent): void;
+  /** Raw touch (multi-touch). Each point that goes down on the content is
+   *  offered here first: return true from its 'down' to take it (its moves,
+   *  up or cancel then come here too); a point not taken is the toolkit's —
+   *  the first finger down plays the pointer (AppPointerEvent.touch), the
+   *  others are dropped. Without touch(), every finger is that pointer. */
+  touch?(ev: AppTouchEvent): boolean | void;
   key?(ev: AppKeyEvent): void;
   tick?(ms: number): void;
   focus?(on: boolean): void;

@@ -24,14 +24,17 @@
 //     listen (AppInstance.presented);
 //   - cursors via wp_cursor_shape_v1, or client-drawn ones: a role-less
 //     wl_surface handed to wl_pointer.set_cursor; keys through a US keymap (the core's
-//     canned us.xkb), pointer/wheel in surface-local coordinates.
+//     canned us.xkb), pointer/wheel in surface-local coordinates;
+//   - touch (wl_touch, when the seat has it): points the app takes as raw
+//     multi-touch, the first other finger played as the pointer for the
+//     content, popups and decorations (see "touch" below).
 //
 // Pixels are ARGB8888 with straight alpha: wland's presenters show bgra
 // as-is (lib/present.ts), so straight alpha is what looks right here.
 //
 // An app module is { id, name, width, height, minWidth?, minHeight?,
-// frameless?, create(win) → { paint(ctx, w, h), pointer?(ev), key?(ev),
-// tick?(ms), focus?(on), closed?() } }. `win` is the handle documented on
+// frameless?, create(win) → { paint(ctx, w, h), pointer?(ev), touch?(ev),
+// key?(ev), tick?(ms), focus?(on), closed?() } }. `win` is the handle documented on
 // makeWindowApi below.
 
 import { wlMessage, wlEach } from './proto.ts';
@@ -121,6 +124,9 @@ const BTN_LEFT = 0x110, BTN_RIGHT = 0x111;
 
 export const TITLE_H = 38;
 const EDGE = 6;
+const TOUCH_EDGE = 14;    // resize border for a finger (EDGE is a mouse's)
+const TOUCH_SLOP = 6;     // a finger that strays further is no long press (ui.ts scroller: the same)
+const LONG_PRESS = 500;   // ms held still in the content → right-button press
 const RADIUS = 10;
 
 // request / event names per interface, for the wire trace
@@ -142,6 +148,7 @@ const REQ: Record<string, string[]> = {
   wl_seat: ['get_pointer', 'get_keyboard', 'get_touch', 'release'],
   wl_pointer: ['set_cursor', 'release'],
   wl_keyboard: ['release'],
+  wl_touch: ['release'],
   wl_output: ['release'],
   xdg_wm_base: ['destroy', 'create_positioner', 'get_xdg_surface', 'pong'],
   xdg_positioner: ['destroy', 'set_size', 'set_anchor_rect', 'set_anchor', 'set_gravity',
@@ -167,6 +174,7 @@ const EVT: Record<string, string[]> = {
   wl_pointer: ['enter', 'leave', 'motion', 'button', 'axis', 'frame', 'axis_source', 'axis_stop',
     'axis_discrete', 'axis_value120', 'axis_relative_direction'],
   wl_keyboard: ['keymap', 'enter', 'leave', 'key', 'modifiers', 'repeat_info'],
+  wl_touch: ['down', 'up', 'motion', 'frame', 'cancel', 'shape', 'orientation'],
   wl_output: ['geometry', 'mode', 'done', 'scale', 'name', 'description'],
   wl_shm: ['format'],
   xdg_wm_base: ['ping'],
@@ -221,7 +229,7 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
   let writing = false;
   const inbox: [Uint8Array, ClientFd[]][] = [];
   const globals: Record<string, { name: number; version: number }> = {};
-  const g = { registry: 0, sync: 0, compositor: 0, shm: 0, wm: 0, seat: 0, pointer: 0, keyboard: 0, cursorMgr: 0, cursorDev: 0, textMgr: 0, textInput: 0,
+  const g = { registry: 0, sync: 0, compositor: 0, shm: 0, wm: 0, seat: 0, seatVersion: 0, pointer: 0, keyboard: 0, touch: 0, cursorMgr: 0, cursorDev: 0, textMgr: 0, textInput: 0,
     constraints: 0, relMgr: 0, relPtr: 0, lock: 0, presentation: 0 };
   const stats: ClientStats = { frames: 0, commits: 0, bytes: 0, alive: true, reason: '' };
   const surfaces = new Map<number, Surf>(); // wl_surface id → surface record
@@ -442,12 +450,24 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
   const buttons = (): { close: Rect; max: Rect } => ({ close: [top!.W - 36, 7, 26, 24], max: [top!.W - 66, 7, 26, 24] });
   const inBox = (x: number, y: number, [bx, by, bw, bh]: Rect) => x >= bx && x < bx + bw && y >= by && y < by + bh;
 
-  function edgeAt(x: number, y: number) {
+  function edgeAt(x: number, y: number, size = EDGE) {
     if (win.maximized || win.fullscreen) return 0;
     let e = 0;
-    if (y < EDGE) e |= 1; else if (y >= top!.H - EDGE) e |= 2;
-    if (x < EDGE) e |= 4; else if (x >= top!.W - EDGE) e |= 8;
+    if (y < size) e |= 1; else if (y >= top!.H - size) e |= 2;
+    if (x < size) e |= 4; else if (x >= top!.W - size) e |= 8;
     return e;
+  }
+
+  // the decoration at surface (x, y), and the resize edge when it is one
+  function zoneAt(x: number, y: number, size = EDGE): { zone: Zone; edge: number } {
+    const edge = edgeAt(x, y, size);
+    const b = chrome ? buttons() : null;
+    let zone: Zone = 'content';
+    if (edge) zone = 'edge';
+    else if (b && inBox(x, y, b.close)) zone = 'close';
+    else if (b && inBox(x, y, b.max)) zone = 'max';
+    else if (chrome && y < TITLE_H) zone = 'title';
+    return { zone, edge };
   }
 
   function paintTop(ctx: Ctx, W: number, H: number) {
@@ -477,11 +497,12 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
       const b = buttons();
       for (const [name, box] of Object.entries(b)) {
         const [bx, by, bw, bh] = box;
-        if (hover === name) {
+        const lit = hover === name || touchBtn === name;
+        if (lit) {
           ctx.fillStyle = name === 'close' ? '#e5484d' : t.hover;
           ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 6); ctx.fill();
         }
-        ctx.strokeStyle = hover === name && name === 'close' ? '#fff' : (win.activated ? t.fg : t.muted);
+        ctx.strokeStyle = lit && name === 'close' ? '#fff' : (win.activated ? t.fg : t.muted);
         ctx.lineWidth = 1.25;
         const cx = bx + bw / 2, cy = by + bh / 2;
         ctx.beginPath();
@@ -567,7 +588,7 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
   const btn = (b: number): 0 | 1 | 2 => (b === BTN_LEFT ? 0 : b === BTN_RIGHT ? 2 : 1);
   function topPointer(type: Exclude<PointerType, 'wheel'>, x: number, y: number, button: number) {
     const toApp = (t: PointerType) =>
-      api.pointer?.({ type: t, x, y: y - chrome, button: btn(button), shift: !!(mods & MOD_SHIFT), dx: 0, dy: 0 });
+      api.pointer?.({ type: t, x, y: y - chrome, button: btn(button), shift: !!(mods & MOD_SHIFT), dx: 0, dy: 0, touch: false });
     if (type === 'leave') {
       if (hover === 'content' || captured) toApp('leave');
       captured = false;
@@ -579,14 +600,7 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
       if (type === 'up') captured = false;
       return;
     }
-    const edge = edgeAt(x, y);
-    const b = chrome ? buttons() : null;
-    let zone: Zone = 'content';
-    if (edge) zone = 'edge';
-    else if (b && inBox(x, y, b.close)) zone = 'close';
-    else if (b && inBox(x, y, b.max)) zone = 'max';
-    else if (chrome && y < TITLE_H) zone = 'title';
-
+    const { zone, edge } = zoneAt(x, y);
     const wasContent = hover === 'content';
     setHover(zone);
     if (zone !== 'content') {
@@ -604,6 +618,132 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
     if (!wasContent) setCursor('default'); // the app's move handler may pick another
     if (type === 'down') captured = true;
     toApp(type);
+  }
+
+  // --- touch (wl_touch) ------------------------------------------------------
+  // A point that goes down on the content is offered to the app's touch()
+  // first; taken, all of it goes there (raw multi-touch). Otherwise the first
+  // finger down while no other plays it is the pointer, for the content,
+  // popups and decorations alike (AppPointerEvent.touch); the rest are
+  // dropped. Its serial is the input serial while it lasts, so move, resize
+  // and popup grabs made from it name the touch-down. Decoration buttons act
+  // on a release still over them, so a cancelled press does nothing.
+  interface TouchQ { type: 'down' | 'move' | 'up'; id: number; x: number; y: number; sid: number; serial: number }
+  interface Emu { id: number; s: Surf; zone: Zone; x0: number; y0: number; x: number; y: number; button: 0 | 2; timer: ReturnType<typeof setTimeout> | 0 }
+  let touchQ: TouchQ[] = [];
+  const touches = new Map<number, { x: number; y: number; raw: boolean }>(); // every point down, surface-local
+  let emu: Emu | null = null;   // the finger playing the pointer
+  let touchBtn: Zone = '';      // a decoration button under that finger (lit)
+  let touching = false;         // dispatching its events: no cursors
+
+  function emuEvent(e: Emu, type: Exclude<PointerType, 'wheel'>) {
+    const ev = { type, x: e.x, y: e.y, button: e.button, shift: !!(mods & MOD_SHIFT), dx: 0, dy: 0, touch: true };
+    touching = true;
+    try {
+      if (e.s === top) api.pointer?.({ ...ev, y: e.y - chrome });
+      else if (e.s === popup) popup.pointer?.(ev);
+    } finally { touching = false; }
+  }
+
+  function emuDown(id: number, s: Surf, x: number, y: number) {
+    const e: Emu = emu = { id, s, zone: 'content', x0: x, y0: y, x, y, button: 0, timer: 0 };
+    if (s === top) {
+      const { zone, edge } = zoneAt(x, y, TOUCH_EDGE);
+      e.zone = zone;
+      if (zone === 'edge') return req(top.role, 6, [g.seat, inputSerial, edge]);   // resize
+      if (zone === 'title') {
+        const now = performance.now();
+        if (now - lastDown < 350) { lastDown = 0; return toggleMaximize(); }
+        lastDown = now;
+        return req(top.role, 5, [g.seat, inputSerial]);                          // move
+      }
+      if (zone !== 'content') { touchBtn = zone; invalidateTitle(); return; }
+      e.timer = setTimeout(() => longPress(e), LONG_PRESS);
+    } else if (s !== popup) { emu = null; return; }
+    emuEvent(e, 'move');
+    emuEvent(e, 'down');
+  }
+
+  function emuMove(e: Emu, x: number, y: number) {
+    e.x = x; e.y = y;
+    if (e.timer && Math.hypot(x - e.x0, y - e.y0) > TOUCH_SLOP) { clearTimeout(e.timer); e.timer = 0; }
+    if (e.zone === 'content') return emuEvent(e, 'move');
+    if (e.zone !== 'close' && e.zone !== 'max') return;
+    const over = zoneAt(x, y, TOUCH_EDGE).zone === e.zone ? e.zone : '';
+    if (over !== touchBtn) { touchBtn = over; invalidateTitle(); }
+  }
+
+  // the finger lifted (released) or its press is abandoned (cancel, the
+  // wl_touch gone): an abandoned one gets a leave and no up
+  function emuEnd(released: boolean) {
+    const e = emu;
+    if (!e) return;
+    emu = null;
+    clearTimeout(e.timer);
+    if (e.zone === 'content') {
+      if (released) emuEvent(e, 'up');
+      emuEvent(e, 'leave');
+    } else if (e.zone === 'close' || e.zone === 'max') {
+      const hitBtn = touchBtn === e.zone;
+      touchBtn = '';
+      invalidateTitle();
+      if (released && hitBtn) e.zone === 'close' ? close('closed by its close button') : toggleMaximize();
+    }
+  }
+
+  // held still: the left press is given up for a right one (context menus;
+  // a popup's grab names the touch-down, still held)
+  function longPress(e: Emu) {
+    e.timer = 0;
+    if (emu !== e || e.s !== top || !stats.alive) return;
+    emuEvent(e, 'leave');
+    e.button = 2;
+    emuEvent(e, 'move');
+    emuEvent(e, 'down');
+    flush();
+  }
+
+  function touchFrame() {
+    const q = touchQ;
+    touchQ = [];
+    let raw = false;
+    for (const ev of q) {
+      if (ev.type === 'down') {
+        const s = surfaces.get(ev.sid);
+        const p = { x: ev.x, y: ev.y, raw: false };
+        touches.set(ev.id, p);
+        if (!s) continue;
+        if (s === top && api.touch && zoneAt(ev.x, ev.y, TOUCH_EDGE).zone === 'content') {
+          const was = inputSerial;
+          inputSerial = ev.serial; // for a move or popup the app makes from it
+          if (api.touch({ type: 'down', id: ev.id, x: ev.x, y: ev.y - chrome }) === true) { p.raw = raw = true; continue; }
+          inputSerial = was;
+        }
+        if (emu) continue;
+        inputSerial = ev.serial;
+        emuDown(ev.id, s, ev.x, ev.y);
+        continue;
+      }
+      const p = touches.get(ev.id);
+      if (!p) continue;
+      if (ev.type === 'move') { p.x = ev.x; p.y = ev.y; } else touches.delete(ev.id);
+      if (p.raw) { raw = true; api.touch?.({ type: ev.type, id: ev.id, x: p.x, y: p.y - chrome }); }
+      else if (emu?.id === ev.id) {
+        if (ev.type === 'move') emuMove(emu, p.x, p.y);
+        else emuEnd(true);
+      }
+    }
+    if (raw) api.touch?.({ type: 'frame', id: -1, x: 0, y: 0 });
+  }
+
+  // wl_touch.cancel: every point ends, none with its up
+  function touchCancel() {
+    touchQ = [];
+    const raw = [...touches].filter(([, p]) => p.raw);
+    touches.clear();
+    emuEnd(false);
+    for (const [id, p] of raw) api.touch?.({ type: 'cancel', id, x: p.x, y: p.y - chrome });
+    if (raw.length) api.touch?.({ type: 'frame', id: -1, x: 0, y: 0 });
   }
 
   function setFocus(on: boolean) {
@@ -771,6 +911,14 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
             if (g.relMgr) req(g.relMgr, 1, [g.relPtr = newId('zwp_relative_pointer_v1'), g.pointer]);
           }
           if (caps & 2 && !g.keyboard) req(g.seat, 1, [g.keyboard = newId('wl_keyboard')]);
+          if (caps & 4 && !g.touch) req(g.seat, 2, [g.touch = newId('wl_touch')]);
+          else if (!(caps & 4) && g.touch) {
+            // gone: what is down ends as cancelled (release is v3+; before
+            // that the object just stays, silent)
+            touchCancel();
+            if (g.seatVersion >= 3) req(g.touch, 0);
+            g.touch = 0;
+          }
           break;
         }
         case 'wl_buffer.0': {
@@ -820,6 +968,30 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
           pointerEvent('wheel', ptr.x, ptr.y, 0, axis ? 0 : value, axis ? value : 0);
           break;
         }
+        // touch: queued until the frame that ends them (wl_touch.frame)
+        case 'wl_touch.0': {
+          const serial = r.u32(); r.u32();
+          const sid = r.u32(), id = r.i32(), x = r.fixed(), y = r.fixed();
+          evt(iface, obj, op, `${serial}, ${sid}, ${id}, ${x.toFixed(1)}, ${y.toFixed(1)}`);
+          touchQ.push({ type: 'down', id, x, y, sid, serial });
+          break;
+        }
+        case 'wl_touch.1': {
+          const serial = r.u32(); r.u32();
+          const id = r.i32();
+          evt(iface, obj, op, `${serial}, ${id}`);
+          touchQ.push({ type: 'up', id, x: 0, y: 0, sid: 0, serial });
+          break;
+        }
+        case 'wl_touch.2': {
+          r.u32();
+          const id = r.i32(), x = r.fixed(), y = r.fixed();
+          evt(iface, obj, op, `${id}, ${x.toFixed(1)}, ${y.toFixed(1)}`);
+          touchQ.push({ type: 'move', id, x, y, sid: 0, serial: 0 });
+          break;
+        }
+        case 'wl_touch.3': evt(iface, obj, op); touchFrame(); break;
+        case 'wl_touch.4': evt(iface, obj, op); touchCancel(); break;
         case 'zwp_relative_pointer_v1.0': {
           r.u32(); r.u32();
           const dx = r.fixed(), dy = r.fixed();
@@ -903,11 +1075,11 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
     const s = ptr.surface;
     if (!s) return;
     if (s === top) {
-      if (type === 'wheel') api.pointer?.({ type, x, y: y - chrome, button: 0, shift: !!(mods & MOD_SHIFT), dx, dy });
+      if (type === 'wheel') api.pointer?.({ type, x, y: y - chrome, button: 0, shift: !!(mods & MOD_SHIFT), dx, dy, touch: false });
       else topPointer(type, x, y, button);
     } else if (s === popup && s.pointer) {
       if (type === 'move') setCursor('default');
-      s.pointer({ type, x, y, button: button === BTN_LEFT ? 0 : button === BTN_RIGHT ? 2 : 1, shift: !!(mods & MOD_SHIFT), dx, dy });
+      s.pointer({ type, x, y, button: btn(button), shift: !!(mods & MOD_SHIFT), dx, dy, touch: false });
     }
   }
 
@@ -916,6 +1088,7 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
     g.shm = bind('wl_shm', 1);
     g.wm = bind('xdg_wm_base', 3);
     g.seat = bind('wl_seat', 5);
+    g.seatVersion = Math.min(5, globals.wl_seat?.version ?? 0);
     g.cursorMgr = bind('wp_cursor_shape_manager_v1', 1);
     g.constraints = bind('zwp_pointer_constraints_v1', 1);
     g.relMgr = bind('zwp_relative_pointer_manager_v1', 1);
@@ -952,10 +1125,12 @@ export function launch(app: AppModule, relay: Relay, env: LaunchEnv = {}): Clien
       win.animating = !!on;
       if (on && top) schedule(top);
     },
-    cursor(name) { if (ptr.surface === top && hover === 'content') setCursor(name); },
+    // (not from a finger played as the pointer: the mouse's cursor stays)
+    cursor(name) { if (!touching && ptr.surface === top && hover === 'content') setCursor(name); },
     popup: openPopup,
     closePopup,
     move() { req(top!.role, 5, [g.seat, inputSerial]); flush(); },
+    get touch() { return !!g.touch; },
     maximize() { toggleMaximize(); flush(); },
     setMaximized(on) { req(top!.role, on ? 9 : 10); flush(); },
     setFullscreen(on) { setFullscreen(on); flush(); },

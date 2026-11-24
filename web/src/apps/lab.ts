@@ -8,12 +8,14 @@
 // Pointer lock: a click in the pad asks for a oneshot
 // zwp_locked_pointer_v1 over it; while locked the dot moves by
 // zwp_relative_pointer_v1 deltas (the pointer itself stays put), Esc or a
-// second click releases it. The footer counts wp_presentation feedback
+// second click releases it. Touch: the pad takes raw wl_touch points and
+// draws each live, with its id; counts frames and cancels. The footer counts wp_presentation feedback
 // for the window's own commits.
 import type { AppModule, CursorImage, Ctx, Rect } from '../wayland/app-types.ts';
 import { FONT, MONO, theme, button, hit } from './ui.ts';
 
 const PAD = 16, MAXW = 560;
+const TOUCH_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#a855f7'];
 
 // client-drawn cursors: a target ring (hotspot in the middle) and an arrow
 // in the accent colour (hotspot at its tip)
@@ -48,8 +50,8 @@ const CURSORS: { label: string; image: CursorImage }[] = [
 const app: AppModule = {
   id: 'lab',
   name: 'Lab',
-  blurb: 'Window states, cursor surfaces, pointer lock, presentation',
-  width: 480, height: 520, minWidth: 360, minHeight: 220,
+  blurb: 'Window states, cursor surfaces, touch, pointer lock, presentation',
+  width: 480, height: 610, minWidth: 360, minHeight: 220,
   create(win) {
     let boxes: Record<string, Rect> = {};
     let hover = '';
@@ -59,6 +61,10 @@ const app: AppModule = {
     let lockState: 'off' | 'asked' | 'locked' = 'off';
     const dot = { x: 0.5, y: 0.5 }; // in the pad, 0..1
     let last = [0, 0], total = [0, 0], moves = 0;
+    // touch pad: the points down (content coordinates), frames and cancels
+    let touchPad: Rect | null = null;
+    const points = new Map<number, [x: number, y: number]>();
+    const tstats = { frames: 0, cancels: 0, max: 0 };
     // presentation feedback
     const pres = { presented: 0, discarded: 0, lastMs: 0, interval: 0, refresh: 0 };
     let footY = 0;
@@ -132,6 +138,31 @@ const app: AppModule = {
         });
         y += 56;
 
+        // --- touch
+        title(ctx, x0, y + 13, 'Touch', 'wl_touch');
+        y += 24;
+        touchPad = [x0, y, cw, 84];
+        ctx.fillStyle = t.card;
+        ctx.beginPath(); ctx.roundRect(x0 + 0.5, y + 0.5, cw - 1, 83, 8); ctx.fill();
+        ctx.strokeStyle = points.size ? t.accent : t.border;
+        ctx.lineWidth = points.size ? 2 : 1;
+        ctx.stroke();
+        line(ctx, x0 + 12, y + 20, !win.touch ? 'No wl_touch here: fingers arrive as the pointer'
+          : tstats.frames ? `${points.size} down · ${tstats.frames} frames · ${tstats.cancels} cancelled · most ${tstats.max}`
+            : 'Touch with one or more fingers', `500 12px ${FONT}`, points.size ? t.fg : t.muted);
+        ctx.save();
+        ctx.beginPath(); ctx.rect(x0, y, cw, 84); ctx.clip();
+        for (const [id, [px, py]] of points) {
+          const c = TOUCH_COLORS[id % TOUCH_COLORS.length];
+          ctx.fillStyle = c + '33';
+          ctx.beginPath(); ctx.arc(px, py, 18, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = c;
+          ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill();
+          line(ctx, px + 22, py + 4, `#${id} ${(px - x0).toFixed(0)},${(py - y).toFixed(0)}`, `400 11px ${MONO}`, t.fg);
+        }
+        ctx.restore();
+        y += 84 + 18;
+
         // --- pointer lock
         title(ctx, x0, y + 13, 'Pointer lock', 'zwp_pointer_constraints_v1 · zwp_relative_pointer_v1');
         y += 24;
@@ -179,6 +210,16 @@ const app: AppModule = {
           const k = Object.keys(boxes).find((k) => hit(ev.x, ev.y, boxes[k]));
           if (k && actions[k]) actions[k]();
         }
+      },
+      // raw points in the touch pad (outside it fingers play the pointer)
+      touch(ev) {
+        if (ev.type === 'frame') { tstats.frames++; win.invalidate(touchPad ?? undefined); return; }
+        if (ev.type === 'down' && !hit(ev.x, ev.y, touchPad)) return false;
+        if (ev.type === 'down' || ev.type === 'move') points.set(ev.id, [ev.x, ev.y]);
+        else points.delete(ev.id);
+        if (ev.type === 'cancel') tstats.cancels++;
+        tstats.max = Math.max(tstats.max, points.size);
+        return true;
       },
       key(ev) {
         if (ev.ctrl || ev.alt || ev.meta) return;

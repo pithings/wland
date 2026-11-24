@@ -3,7 +3,8 @@
 // through; it has no title bar, so a press anywhere starts an
 // xdg_toplevel.move. Its input region (wl_surface.set_input_region) is the
 // disc, as rows of rects, so presses in the transparent corners fall
-// through to what is behind. Right-click for a menu. The second hand sweeps with
+// through to what is behind. Right-click for a menu. A finger moves it once it
+// drags (the toolkit's long press is the menu). The second hand sweeps with
 // frame callbacks while smooth mode is on; otherwise it ticks once a second
 // and damages only the dial.
 import type { AppModule, Rect } from '../wayland/app-types.ts';
@@ -19,6 +20,7 @@ const app: AppModule = {
     let smooth = true;
     let digital = false;
     let timer: ReturnType<typeof setInterval> | undefined;
+    let press: [x: number, y: number] | null = null; // a finger down, not yet a drag
 
     const start = () => {
       clearInterval(timer);
@@ -103,8 +105,16 @@ const app: AppModule = {
         ctx.fillText('wland', cx - ctx.measureText('wland').width / 2, cy + r * 0.4);
       },
       pointer(ev) {
+        if (ev.type === 'move' && press && Math.hypot(ev.x - press[0], ev.y - press[1]) > 4) {
+          press = null;
+          win.move(); // names the touch-down, still held
+          return;
+        }
         if (ev.type === 'move') win.cursor('grab');
+        if (ev.type === 'up' || ev.type === 'leave') press = null;
         if (ev.type !== 'down') return;
+        press = null;
+        if (ev.button === 0 && ev.touch) { press = [ev.x, ev.y]; return; }
         if (ev.button === 0) { win.move(); return; }
         if (ev.button === 2) {
           menu(win, ev.x, ev.y, [
