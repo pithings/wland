@@ -435,7 +435,7 @@ with it. New findings go in the matching section.
   unless a surface holds pointer focus — `wheel` can fire with no preceding
   pointerenter, and foot SIGSEGVs on axis-after-leave.
 - **Seat events go to every object of the client, never to "its" one**
-  (`Conn.pointers/keyboards/data_devices/primary_devices/
+  (`Conn.pointers/keyboards/touches/data_devices/primary_devices/
   relative_pointers`, a `SeatObjects` each). Firefox binds wl_seat twice —
   GTK's at v5, then its own at v8 — and GTK's wl_pointer/wl_keyboard are
   the ones its input handling listens on: one id per conn, overwritten by
@@ -450,8 +450,42 @@ with it. New findings go in the matching section.
   focused gets the enter it missed (the focus's serial, weston-style), a
   data device the selection. Over `max_seat_objects` (8) per kind an
   object is ignored — it exists, gets nothing. Releases leave the set. Not
-  fanned out: zwp_text_input_v3 (one per conn, a second replaces it);
-  touch has no capability, so nothing to track.
+  fanned out: zwp_text_input_v3 (one per conn, a second replaces it).
+  wl_touch has no focus to repeat: a late wl_touch gets no downs for
+  points already down (the next down reaches it), and the conn's points
+  exist only while it has one (the last release forgets them, nothing sent).
+- **Touch points are per conn, bound to their down's surface**
+  (`Conn.touch_points`, at most `max_touch_points` = 10; a down beyond,
+  or for an id already down, is ignored with its motion and up). No
+  focus: motion and up name no surface, the embedder's x,y stay local to
+  the down's surface wherever the finger goes. The embedder learns which
+  conns have a wl_touch from `touch_bound_fn` (first get_touch / last
+  release; replayed by `replaySeat`, not told at close) and sends the
+  others the finger as the pointer — so every touch call on a conn
+  without one is a no-op, no serial spent. Downs are ignored on a gone
+  surface (the down names it: a dead id kills the client), a cursor or
+  dnd icon, a minimized window, and while a dnd drag owns input.
+  `touchFrame` sends wl_touch.frame only if something went out since the
+  last (`touch_unframed`). Down and up serials are input serials
+  (`noteInputSerial`, `last_input_conn`): set_selection may name them, and
+  move/resize may name a down still down on that window (`touchGrab`,
+  beside `inImplicitGrab`) — then the core cancels the client's points
+  itself, since the embedder's drag follows the finger from there.
+  start_drag refuses a touch serial even when it falls inside the held
+  pointer presses' first…latest range (`pressHeld` checks only the
+  range): the dnd session follows the pointer. A popup grab with a tap's
+  serial is fine (popup grabs are not serial-checked).
+- **wl_touch.cancel ends every point of the client** (there is no
+  per-point cancel); `cancelTouches` forgets them all and the embedder's
+  later calls naming them are ignored. The core cancels by itself at a
+  touch-serial move/resize, minimizing (`applyMinimized`) or hiding
+  (`setVisible`) a window with a point on it, and `embedderGone`. A hidden
+  window still takes downs (hidden is the embedder's; a minimized one
+  doesn't). A surface destroyed or unmapped (its role object gone —
+  wl_subsurface included —, attach(NULL) + commit) drops its points and its
+  subsurfaces' SILENTLY (`dropTouchesOn`, called while the subsurfaces
+  are still chained to it): the client already dropped what it hung on
+  that surface, and an up would name a point it has forgotten.
 - **Roles arrive late and go away**: GTK commits its cursor buffer BEFORE
   `set_cursor`, and reuses popover wl_surfaces (dismiss destroys only the
   xdg_popup/xdg_surface). Role changes flow to JS (`js_surface_event`) so the
@@ -1065,9 +1099,58 @@ with it. New findings go in the matching section.
   took for its drag moved it away, its event arrives late) end nothing;
   any other does (Alt+drag's capture on the box, the embedder's on its
   frame) — Alt+drag used to go on moving the window on hover after one.
-- A move/resize grab starts at the WM's `lastPointer`, which `pointerdown`
-  must update too: touch has no hover moves, so `pointermove` alone leaves it
-  where the previous touch ended (the window jumps, then drags relatively).
+- **Which pointer an app's grab or drag follows** (wm.ts `grabPointer`):
+  the request names a serial, not a pointer, so the wm picks from `held`
+  (in press order, each with the client and root window it pressed): the
+  latest press on that window, else on that client, else the latest of
+  all — a second finger or the mouse pressed elsewhere since must not
+  take the window's drag (a single `lastPressed` let it). 'drag-start'
+  ranks by client only. The grab starts from that pointer's own place
+  (`held` x/y, kept by its moves while down; a touch has no hover moves
+  before its press). `lastPointer` (pointerdown sets it too, for the
+  same reason) only places the dnd icon now.
+- **A finger is touch or pointer, decided at its pointerdown, never both**
+  (input.ts `routeTouch`, capture phase, so a grab the wm starts from the
+  same press — Alt+drag — already sees it): a `pointerType` 'touch'
+  pressed on a surface whose client is `engine.touchBound` goes in
+  `touchPath` (pointerId → the pressed element) until its pointerout
+  after the up (or the next touch down, if that pointerout went missing);
+  pen, mouse and a finger on any other client stay pointers (the
+  emulation apps relied on). Every pointer-path listener skips touchPath
+  ids, boundary events included. A finger's pointerover comes BEFORE the
+  press that decides: it is held (`overHeld`), and a finger that turns
+  out pointer-path gets that enter from its pointerdown (`enterOwed`)
+  before the button; a held over's pointerout sends no leave. `points`
+  (pointerId → point) is narrower: the fingers forwarded now. A cancel
+  forgets them while their fingers stay touchPath until lifted, so nothing
+  of a cancelled finger falls back to the pointer. Point ids are input's,
+  the lowest free per client (`touchSlot`: browser pointerIds grow without
+  bound); x,y come from the surface's current hit target (an input region
+  coming or going swaps it), the pressed element capturing the finger.
+  Each call is followed by touchFrame (the browser hands over one finger
+  per event).
+- **What ends a touch point in input**: its pointerup (touchUp); a
+  touchCancel of all of that client's points at its pointercancel (the
+  browser took the gesture), a lostpointercapture at the pressed element
+  (someone else captured the finger; an element removed from the document
+  has its loss at the document, which ends nothing — 'destroy' says if the
+  surface went), a 'move'/'resize' event of the client (the core already
+  cancelled if the request named a point; input cancels for a pointer's
+  too: the window moves under them) and a grab; every client's at the
+  window's blur. A destroyed surface's points are `gone`: no more motion,
+  the up still sent (it names no surface; the core ignores it) and the id
+  taken until then. 'disconnect' forgets without calls. Minimize and hide
+  are the core's cancels: input keeps the points, its later calls ignored.
+- **A grab of a touch-path finger is finger-only** (`PointerGrab.touch`):
+  it cancels that client's points and takes nothing else — no implicit
+  grab let go, no pointer leave at the start, no enter at its end, and
+  `target()` still resolves (only a non-touch grab, `pointerGrabbed()`,
+  holds the pointer path off), so a mouse and other fingers go on reaching
+  the apps. Its `ignore` is the pressed element (a capture moved for the
+  drag ends nothing). Any other grab — `suppress` always (startGrab's
+  `fingerOnly` false) — cancels every touch point and blocks new downs.
+  The wm's beginGrab sends no pointerLeave for a touch grab (the cancel
+  ended the app's gesture).
 - Cursor-shape reset clears the windows' `style.cursor = ''` (not
   `'default'`), so a grab's body cursor shows through.
 - **A cursor surface is CSS, not an element**: `image-set(url("data:…png")
@@ -1097,6 +1180,12 @@ with it. New findings go in the matching section.
   position but SUMS the relative parts — replacing them, like positions,
   would drop movement (a locked pointer has nothing else). µs timestamps
   cross as an f64.
+- **Touch calls flush the pending pointer motion first** (`call(…, true)`)
+  and are not coalesced themselves: one finger may be one app's touch and
+  another's pointer (input decides per finger), so the two streams must
+  keep their order. `touchBound()` mirrors the 'touch-bound' events
+  (`touchConns`, cleared at conn close and link reset; false while not
+  live).
 - **Pointer Lock is requested on the surface's hit target**
   (`view.hitTarget`: the input region's hit element, else the canvas — a
   `pointer-events: none` canvas is the wrong element), at once only while

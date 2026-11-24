@@ -147,6 +147,30 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   minimized) windows' frame callbacks over a WebSocket link are still the
   relay's (it keeps firing them); set_parent_size / set_parent_configure
   (v3 hints for a parent mid-resize) are accepted and ignored.
+- **Touch (wl_touch)**, done (2026-11-23): wl_seat advertises the touch
+  capability; core per-conn points (`Conn.touches`/`touch_points`, 10 at
+  most, bound to the down's surface; down/up serials are input serials:
+  set_selection, and move/resize while the point is down — then the core
+  cancels the client's points; start_drag refuses them; cancelled by the
+  core at minimize, hide and `embedderGone`; a destroyed/unmapped surface
+  drops its points silently); `touch_bound_fn` → 'touch-bound' /
+  `Engine.touchBound` (first get_touch, last release; replayed); engine
+  `touchDown/Motion/Up/Frame/Cancel`. Both links: wasm exports and session
+  CALLs 34–38 / EVENT 19 (STREAM.md). Page routing (input.ts): a finger
+  pressed on a client with a wl_touch is its touch point, anything else
+  the pointer as before, decided per finger at its down; a grab of such a
+  finger is finger-only (`PointerGrab.touch`); wm.ts picks the pointer an
+  app's move/resize follows by window (`grabPointer`). Checked: core unit
+  tests (capability, bind/release, fan-out over two bindings, cap, cancel,
+  move/resize/start_drag serials, destroyed/unmapped surfaces, popup grab
+  on a tap, minimize/hide, replay), session_test.zig, node tests (engine,
+  session; client.test: routing on the fake DOM, cancels, a window move by
+  a finger beside the mouse and another finger). Open: touch-driven
+  drag-and-drop (start_drag with a touch serial: the wm's dnd follows a
+  pointer); wl_touch v6 shape/orientation (never sent); touch motion
+  coalescing in the engine (every move is a call); pointer-gestures
+  (touchpad pinch/swipe: Deferred below); a wl_touch made while a finger
+  is down does not get that down (its motion and up do).
 - **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
   Firefox render but ignore all input): the core kept one wl_pointer /
   wl_keyboard / data device id per client, the last made, and Firefox
@@ -576,9 +600,16 @@ Any of them is fair game to lift.
   text-input-v3 + a hidden IME sink.
 - One zwp_text_input_v3 per client: a second get_text_input replaces the
   first, which gets no leave and no more events (GTK3/4 make one, on their
-  seat; Firefox's goes through GTK's). No touch: the seat never advertises
-  the capability. Wayland seat objects beyond 8 of a kind per client
-  (`max_seat_objects`) get no events.
+  seat; Firefox's goes through GTK's). Wayland seat objects beyond 8 of a
+  kind per client (`max_seat_objects`) get no events.
+- Touch: a finger reaches an app as wl_touch only if it has one, else as
+  the pointer (the browser's touch pointer events; pen and mouse are
+  always the pointer). Down, motion, up, frame and cancel only — no v6
+  shape or orientation; 10 points per client. Touch can't start a drag
+  and drop (start_drag refuses a touch serial); a wl_touch made while a
+  finger is down misses that down; touch motion is forwarded per browser
+  event (not coalesced like the pointer's). No pointer-gestures
+  (touchpad pinch/swipe).
 - Pointer images: shapes (cursor-shape-v1) and cursor surfaces
   (`wl_pointer.set_cursor`) are CSS on the client's windows; a cursor image
   over 128 CSS px (or a hotspot off it, a non-uniform viewport scale, no
@@ -595,8 +626,9 @@ Any of them is fair game to lift.
   resize): the core doesn't know where windows are, so a menu near the
   desk's edge can hang off it.
 - xdg_toplevel.move/resize are honoured only with the serial of a press
-  still held on the window (core and wm), wl_data_device.start_drag only
-  with one of the client's held presses (the wm and headless still cancel
+  still held on the window or of a touch point still down on it (core and
+  wm), wl_data_device.start_drag only with one of the client's held
+  pointer presses (the wm and headless still cancel
   a drag that starts with no button down). set_selection (clipboard and
   primary) only from the keyboard-focused client, or with a recent input
   serial of the client's while no other client had input since

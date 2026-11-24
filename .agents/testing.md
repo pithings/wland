@@ -70,6 +70,16 @@ with the data devices, pointer and keyboard; its own v8 on a second
 registry). By hand only: no test depends on it (the headless E2E's
 `browser` phase is fixtures-only).
 
+Touch clients: `weston-simple-touch` (weston-demo) is the real `touch`
+role: it binds wl_seat v1 and takes wl_touch ONLY (no pointer, no
+keyboard), paints a 5×5 dot per down/motion and never moves its window —
+read its WAYLAND_DEBUG (`test/support/touch-log.ts` parses libwayland's
+lines and the fixture's alike). Every other installed real app binds
+wl_touch too (weston's toytoolkit — weston-flower, weston-constraints —,
+foot, GTK, SDL), so the "client without wl_touch → pointer emulation"
+case exists only with fixtures (`cursor`); the E2Es skip it when the
+app turns out touch-bound.
+
 Pointer-constraint clients: `weston-constraints` (weston-demo; a press on
 its gray subsurface cycles unconstrained → confined → locked, both
 oneshot; read its WAYLAND_DEBUG for `confined()`/`locked()`/
@@ -136,6 +146,7 @@ apps do through the compositor is checked without a browser, by
 | `lib/view.ts`, `lib/present.ts` | run-poc `foot retina handle-demo`; GL code: `bun tools/browser-e2e.ts webgl` |
 | Pointer images (cursor surfaces/shapes: core, `view.ts`, headless) | `zig build test` + `node --test test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (weston-flower) + run-poc `cursor` |
 | `lib/input.ts` (DOM events → engine) | run-poc `foot` (its `sweep` phase is the pointer-path check); keys / lock state: `node --test test/client.test.ts` + `node tools/headless-e2e-test.ts` (its foot phase types keypad digits) |
+| Touch (core wl_touch, engine touch calls, input.ts `touchPath`, wm grabs by a finger, headless `touchDown`…) | `zig build test` (also Debug) + `node --test test/engine.test.ts test/session.test.ts test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (its touch phase, fixture `touch` + `cursor`; also `--profile session` and `WLAND_E2E_APPS=real`) + run-poc `touch` (CDP fingers) and `foot` (the pointer paths beside) |
 | Pointer constraints / relative pointer (core, engine, `input.ts` Pointer Lock, headless) | `zig build test` + `node --test test/engine.test.ts test/client.test.ts test/headless.test.ts` + `node tools/headless-e2e-test.ts` (weston-constraints, SDL3) + run-poc `constraints` |
 | Clipboard bridge (core own selection / `readSelection`, relay pipe_read and pipe writes, engine selection API, `lib/clipboard.ts`, input's paste-chord queue) | `zig build test` (also Debug) + `node --test test/clipboard.test.ts` + both Node E2Es (their clipboard phases) + run-poc `foot` (its `clipboard` phase; CDP grants the clipboard permissions) + `node tools/firefox-smoke.ts` (step 3: Gecko's late paste event targets the body; step 4: a page selection Gecko keeps across the click into the desktop is not copied by Ctrl+C or a copy command there) |
 | `lib/wm.ts` (grabs, maximize, popups, dnd) | run-poc `foot gtk` (gtk's `dnd` phase drags in the `files` fixture); real nautilus: `tools/dnd-test.sh` |
@@ -146,11 +157,11 @@ apps do through the compositor is checked without a browser, by
 | `lib/client.ts`, the server's page serving and takeover | run-poc `foot takeover` |
 | Anything browser-facing that may differ in Gecko (input, present, view, client) | also `node tools/firefox-smoke.ts` (headless Firefox, its own port 8951 / BiDi 9351 / socket `wayland-ffsmoke`) |
 | `test/support/`, `test/browser/` | `node --test test/*.test.ts` + run-poc `handle-demo` (its `sab=1` modes load through `test/support/isolated.ts`, a COOP/COEP mirror of wlandr: wlandr's own pages can't make a SharedArrayBuffer) + `node tools/firefox-smoke.ts` |
-| `test/fixture/` (wland-fixture), `test/support/apps.ts` | `zig build` + both Node E2Es + the run-poc groups using the mode changed (`term`: foot, states; `files`: gtk; `cursor`; `constraints`; `browser` is headless-e2e only) |
+| `test/fixture/` (wland-fixture), `test/support/apps.ts` | `zig build` + both Node E2Es + the run-poc groups using the mode changed (`term`: foot, states; `files`: gtk; `cursor`: cursor, touch; `constraints`; `touch`; `browser` is headless-e2e only) |
 | `web/` | nothing here: build it and look (`tools/run-poc.sh --demo`) |
 | Before a release, or a change that cuts across the above | all of the above: `npm test`, both Node E2Es, the whole `tools/run-poc.sh`; then the same with `WLAND_E2E_APPS=real` |
 
-run-poc groups, in run order: `foot gtk cursor constraints states embedder retina takeover handle-demo relay`
+run-poc groups, in run order: `foot gtk cursor constraints touch states embedder retina takeover handle-demo relay`
 (`relay` is relay-e2e; alone it starts no browser).
 
 ## Approach
@@ -188,6 +199,24 @@ run-poc groups, in run order: `foot gtk cursor constraints states embedder retin
   durable findings in `.agents/gotchas.md` / this file.
 
 ## E2E / CDP pitfalls
+
+- CDP `Input.dispatchTouchEvent` gives the page real PointerEvents with
+  `pointerType: 'touch'` (and TouchEvents) in headless chromium with no
+  `Emulation.setTouchEmulationEnabled` (navigator.maxTouchPoints stays 0;
+  input.ts doesn't care). `touchPoints` are the active points, one event
+  per changed point; for `touchEnd` the listed points are the ones that
+  lift and `[]` lifts all. Its gotpointercapture comes at the next move.
+- A touch drag on an element with `touch-action: auto` gets a
+  pointercancel at its first move (a pan) even when nothing can scroll
+  (a fixed, overflow-hidden container): the browser-e2e `touch` phase
+  uses that as its control (the app logs wl_touch.cancel), then puts the
+  view's `none` back.
+- `test/fake-dom.ts` runs a dispatch's capture listeners before its
+  bubble ones (it used to run them in registration order, so input.ts's
+  bubble pointerdown ran before wm.ts's capture one — a test of anything
+  done in the capture phase, like an embedder's grab at an Alt+press,
+  passed or failed for the wrong reason). It still ignores
+  stopPropagation.
 
 - Run run-poc redirected to a file (`tools/run-poc.sh > /tmp/poc.log 2>&1`);
   `| grep | head` from a background shell hangs on the pipe.

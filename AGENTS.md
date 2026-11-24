@@ -66,12 +66,22 @@ any of them (update this list when it does).
   claim; SIGBUS).
 - Input is role-gated (keyboard → toplevels only, pointer not to cursor
   surfaces) and focus-gated; a leave for a destroyed surface kills the client.
-  Seat events go to every wl_pointer/wl_keyboard/data device a client made,
-  from every wl_seat binding (Firefox binds it twice), one serial, versions
-  gated per object (`SeatObjects`, at most 8 per kind).
+  Seat events go to every wl_pointer/wl_keyboard/wl_touch/data device a
+  client made, from every wl_seat binding (Firefox binds it twice), one
+  serial, versions gated per object (`SeatObjects`, at most 8 per kind).
+- Touch: a finger reaches a client as wl_touch only if it has one
+  (`touchBound`, 'touch-bound'), else as the pointer — never both, decided
+  per finger at its down (input.ts `touchPath`); touch calls for a client
+  without one are ignored. A point stays with the surface it went down
+  on; its down serial counts where a held press does (move/resize,
+  set_selection), but start_drag refuses it. The core cancels a client's
+  points itself when a move/resize names one, its window is minimized or
+  hidden, or the embedder goes; a destroyed or unmapped surface drops its
+  points silently (no up, no cancel).
 - xdg_toplevel.move/resize start a grab only for a press still held on
-  that window (core `inImplicitGrab`; wm.ts re-checks the DOM's buttons and
-  ends a grab whose button is up). A popup's x/y counts from the parent's
+  that window, or a touch point still down on it (core `inImplicitGrab` /
+  `touchGrab`; wm.ts re-checks the DOM's buttons and ends a grab whose
+  button is up). A popup's x/y counts from the parent's
   set window geometry to its own (`surfaceAbs`), not from surface origins.
   Popups are constrained to the output (xdg_positioner flip/slide/resize)
   only once the embedder told the core where the window's geometry is
@@ -117,8 +127,8 @@ any of them (update this list when it does).
   reads the pipe). Offered to the keyboard-focused client only, like any
   selection; set or cleared (set_selection, primary too) only by the
   keyboard-focused client, or one naming a recent input serial of its own
-  while no other client had input since; start_drag needs a press still
-  held. In the page, a paste chord's keys wait for the browser's paste
+  while no other client had input since; start_drag needs a pointer press
+  still held (not a touch down). In the page, a paste chord's keys wait for the browser's paste
   event (input's `clipboard` hooks), so the app reads the new selection.
 - Window states (maximized, fullscreen, minimized) are core state: the embedder
   asks (`setMaximized/setFullscreen/setMinimized`) and reacts to the events;

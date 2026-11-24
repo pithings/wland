@@ -353,7 +353,9 @@ one, for example to draw your own window frames.
 
 - **engine** — the compositor itself. Plain data in, plain data out. No DOM.
 - **view** — turns events into canvases and window elements.
-- **input** — turns DOM pointer and keyboard events into engine calls.
+- **input** — turns DOM pointer, touch and keyboard events into engine
+  calls. A finger on an app that asked for touch (`wl_touch`) is a touch
+  point for it; on any other app it works as the mouse pointer.
 - **wm** — the window manager: move, resize, maximize, popups, drag and drop.
 - **clipboard** — the page clipboard bridge (`createClipboardBridge`; pass
   its `hooks` to `createInput({ clipboard })` and feed it every event).
@@ -494,6 +496,12 @@ focus, and when the focused one closes or is minimized none has it until
 you say. The `maximize`, `fullscreen` and `minimize` events are there for
 your frames to follow.
 
+Touch works the same way: an app can ask to move its window from a finger
+(`press.pointerType` is `'touch'`). If that app has touch, the grab takes
+only that finger (`grab.touch` is true): the app's touch points end, and
+the mouse and other fingers keep reaching the apps. Otherwise the finger
+is the app's pointer, and the grab takes the pointer as usual.
+
 The container is wland's: the view sets `touch-action: none` on it (touch
 drags are window moves and app input, not page pans — without it the
 browser cancels them), turns off text selection and the touch callout, and
@@ -531,6 +539,21 @@ A few things to know:
   module does (on macOS, which has no NumLock, it infers NumLock from what
   the keypad typed). The state, toggles included, carries over when the
   link reconnects.
+- **Touch.** Send a finger as touch only to an app that has it:
+  `touchBound(conn)` says so, and a `touch-bound` event tells when it
+  changes. Pick that per finger when it goes down, and send it one way
+  only, never both. As touch: `touchDown(conn, time, surface, id, x, y)`,
+  then `touchMotion(conn, time, id, x, y)` and `touchUp(conn, time, id)`,
+  with `id` a small non-negative number not in use by that app's other
+  fingers, and x, y relative to the surface the finger went down on, even
+  after it leaves that surface. Call `touchFrame(conn)` after each group
+  of calls that happened together, and `touchCancel(conn)` when the
+  gesture is taken away (`pointercancel`, your own drag): it ends all of
+  that app's fingers. The compositor also ends them itself when the app
+  moves its window with one, when the window a finger is on is minimized
+  or hidden, or when its surface goes; later calls for those fingers are
+  ignored. For an app without touch, send the finger with the pointer
+  calls. The input module does all of this.
 
 All events and calls are typed in [`lib/engine.ts`](lib/engine.ts).
 
@@ -753,6 +776,7 @@ authentication.
   on an outside click and stay on screen near its edges (flipped, slid or
   shrunk as the app allows). Clicks on transparent parts fall through.
 - **Input** — keyboard, pointer, wheel, cursor shapes and app-drawn cursors.
+  Touch for apps that support it, the pointer for the rest.
 - **Pointer lock** — for games and 3D apps.
 - **Text input** — dead keys, CJK and the emoji picker.
 - **Clipboard** — `wl-copy`, `wl-paste`, copy/paste between apps,
@@ -787,6 +811,8 @@ authentication.
   not run on a Mac or an iPad in any browser: it follows the browsers'
   documented key events.
 - Pointer lock needs a click to start. Esc or switching tabs ends it.
+- Touch can't start a drag and drop, and apps get no finger size or
+  angle. Touchpad gestures (pinch, swipe) are not passed on.
 - Wland draws no window frames. Apps without their own titlebar can be
   moved with Alt+drag, but not resized, unless the page draws frames for
   them (`decorations: 'server'`).

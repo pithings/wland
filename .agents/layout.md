@@ -62,7 +62,8 @@ import lib/ source, never dist/.
   images (CSS cursors; an oversized cursor surface, or any while the
   pointer is locked, follows the pointer) (+ `present.ts` 2D/WebGL) ·
   `input.ts` DOM → evdev, IME sink, the implicit grab (pointer capture),
-  Pointer Lock for pointer-constraints locks, relative motion ·
+  Pointer Lock for pointer-constraints locks, relative motion, fingers →
+  wl_touch or the pointer (per finger, `touchPath`) ·
   `wm.ts` move/resize grabs, maximize/fullscreen placement, minimize/restore,
   Alt+F9/F10/F11, the browser's Fullscreen API (browserFullscreen),
   popups, dnd ·
@@ -115,12 +116,15 @@ import lib/ source, never dist/.
   toplevels, `simple.zig` shm + presentation, `clip.zig`, `pointer.zig`
   cursor/constraints/relative, `term.zig` (foot), `files.zig` (nautilus),
   `browser.zig` (Firefox's seat shape: wl_seat bound twice),
-  `dmabuf.zig` (a linux-dmabuf GPU client over memfds).
+  `dmabuf.zig` (a linux-dmabuf GPU client over memfds), `touch.zig`
+  (weston-simple-touch: wl_touch; its title strip moves it by a finger).
   `test/support/apps.ts` maps E2E roles to a fixture or the real app.
   `test/support/` — plain-JS Wayland helpers for tests (STREAM encoder, JS
   relay, synthetic clients, kwshm fake), `handles-procfd.ts` (a Node procfd
   `HandleSource`, not in the package), `presentation-shm.ts` (reads
-  weston-presentation-shm's output for both E2Es) and `isolated.ts` (a
+  weston-presentation-shm's output for both E2Es), `touch-log.ts` (a
+  client's wl_touch / wl_pointer events and move requests off its
+  WAYLAND_DEBUG) and `isolated.ts` (a
   COOP/COEP mirror of a web root, for the handle demo's SharedArrayBuffer
   modes);
   `test/browser/` — the browser E2E's pages. Nothing under `test/` or `tools/` imports from `web/`.
