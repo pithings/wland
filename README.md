@@ -194,6 +194,7 @@ await createWland({
   browserFullscreen: true,    // fullscreen windows also go browser-fullscreen
   shortcuts: false,           // turn off Alt+F9/F10/F11 ({ keys, drag }: the keys and Alt+drag apart)
   clipboard: false,           // keep the Wayland clipboard inside the desktop
+  dnd: false,                 // leave drags over the desktop to the page
 });
 ```
 
@@ -271,6 +272,58 @@ engine.setSelection({ 'text/html': '<b>hi</b>', 'text/plain': 'hi' });
 engine.selectionBridged();             // false on a relay too old for this:
 // reads then reject (NO_SELECTION_BRIDGE) and setSelection returns false
 ```
+
+### Drag and drop from the page
+
+Text, HTML or a link dragged onto a window — from the page around the
+desktop, another tab or another program — is dropped into that app, as
+any Wayland drag is: the app under the pointer sees it hover (and shows
+what it would do: the pointer's copy/move/no-drop follows its answer) and
+gets the data when you let go. What crosses: plain text (as the UTF-8
+types the clipboard uses), `text/html`, and `text/uri-list` for a dragged
+link, up to 4 MiB each — and files. Drops on the desktop never reach the
+page (a link or file dropped there does not replace the page). The other way, dragging
+out of an app onto the page, is not bridged.
+Like the clipboard bridge it needs a relay that speaks it (in front of
+`wlandr` 0.1.0 no drag starts); `dnd: false` turns it off.
+
+Where dropped files go is yours to say. Give a `files` hook and wland
+hands it the dropped `File`s; you put them where the apps can read them
+(upload them, write them to a shared directory, a guest's filesystem) and
+return their `file://` URIs (or absolute paths), which the app gets as
+`text/uri-list` — the file manager, editor or terminal under the pointer
+sees ordinary local files:
+
+```js
+await createWland({
+  container,
+  dnd: {
+    async files(files) {
+      const paths = [];
+      for (const f of files) paths.push(await uploadSomewhere(f)); // → '/srv/drops/report.pdf'
+      return paths;                 // null or a rejection: no files dropped
+    },
+    filesTimeout: 30000,            // how long the app waits for them (ms)
+  },
+});
+```
+
+The drop happens at once and the app's read waits for the hook (up to
+`filesTimeout`, then it gets an empty list). Without a hook, a dropped file
+of up to 4 MiB is handed over as its content under its own type
+(`image/png`, `text/plain`, …: what an image editor or a text field takes);
+with several files, the first of each type that fits. A file with no type,
+or none within 4 MiB, gives nothing, and a drop with nothing at all to hand
+over is cancelled. File drags are always a copy.
+
+From code, an embedder drag is `engine.dragBegin(mimes, actions)`, driven
+like an app's drag (`dragMotion`, then `dragDrop` or `dragCancel`), with
+its bytes handed over by `engine.dragData({...})` before the drop;
+`engine.dragAction()` (and `'drag-action'` events) says what the app under
+it would do; `dragDrop(true)` makes a drop whose bytes follow (a later
+`dragData`). `wland/headless` scripts the same: `hl.dragIn(x, y, { 'text/uri-list': url })`
+(or `hl.dragIn(x, y, {}, { files: [file] })`, with `createHeadless({ dnd: { files } })`),
+`hl.pointerMove(...)`, `await hl.drop()`.
 
 ### Output size and scale
 
@@ -359,6 +412,8 @@ one, for example to draw your own window frames.
 - **wm** — the window manager: move, resize, maximize, popups, drag and drop.
 - **clipboard** — the page clipboard bridge (`createClipboardBridge`; pass
   its `hooks` to `createInput({ clipboard })` and feed it every event).
+- **dnd** — HTML drags dropped into apps (`createDndBridge({ engine, view,
+  input, container })`; feed it every event).
 
 ```js
 import {

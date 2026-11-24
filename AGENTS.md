@@ -130,6 +130,23 @@ any of them (update this list when it does).
   while no other client had input since; start_drag needs a pointer press
   still held (not a touch down). In the page, a paste chord's keys wait for the browser's paste
   event (input's `clipboard` hooks), so the app reads the new selection.
+- The embedder's own drag (an HTML drag over the page, `lib/dnd.ts`;
+  `Engine.dragBegin`, core `beginOwnDrag`) is a `Drag` with `own` set and
+  no client source: no press needed, no 'drag-start'/'drag-end', driven
+  by the same dragMotion/dragDrop/dragCancel. Its types are known from the
+  start, its bytes only at the page's drop (`dragData`, before
+  `dragDrop`): a receive before then is held in the core (`OwnDrag.held`)
+  and answered then, or EOF the moment its offer stops being the target or
+  the drag ends without them — never left blocking. Answers are FDMSG pipe
+  with the bytes (the relay's writer thread; no pipe fd leaves it), so
+  like the clipboard bridge it exists only on a link with FEATURE
+  selection_cache. The page holds a pointerless input grab while the drag
+  is over the desktop; drops on the desktop never reach the page. Dropped
+  files: the embedder's `files` hook turns them into URIs (text/uri-list),
+  else a file ≤ 4 MiB is its content under its type; their bytes come
+  after the drop (`dragDrop(true)`, then `dragData`): receives on the
+  drop's offers wait in the core, and the page gives up after
+  `filesTimeout` — wland itself never stores a file.
 - Window states (maximized, fullscreen, minimized) are core state: the embedder
   asks (`setMaximized/setFullscreen/setMinimized`) and reacts to the events;
   restoring a minimized window is only ever the embedder's. Tiled edges

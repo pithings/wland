@@ -70,8 +70,11 @@ import lib/ source, never dist/.
   `clipboard.ts` the page clipboard bridge (text both ways, on input's
   paste-chord hooks; engine selection API: `readSelection`/`setSelection`,
   `readSelectionText`/`setSelectionText` in engine.ts) ·
+  `dnd.ts` HTML drags from the page dropped into apps (engine
+  `dragBegin`/`dragData`/`dragAction`, the core's own drag; `dropTypes`/
+  `dropData` shared with headless `dragIn`) ·
   `client.ts` (`wland/client`) `createWland()` composes them and re-exports
-  all of them (view/input/wm/clipboard/present have no subpath of their own).
+  all of them (view/input/wm/clipboard/dnd/present have no subpath of their own).
 - `headless.ts` (`wland/headless`) `createHeadless()` — the engine plus a
   DOM-free scene (RGBA buffers, positions/z, hit-testing, scripted input,
   screenshots, `encodePNG`, the current pointer image, a scripted pointer

@@ -171,6 +171,65 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
   coalescing in the engine (every move is a call); pointer-gestures
   (touchpad pinch/swipe: Deferred below); a wl_touch made while a finger
   is down does not get that down (its motion and up do).
+- **Inbound drag-and-drop from the page**, done (2026-11-24): an HTML drag
+  over the desktop (from the page, another tab, the OS) is a Wayland drag
+  to the app under the pointer. Core: the embedder's own drag
+  (`beginOwnDrag`: a `Drag` with `own`, types + source actions, no client
+  source, no press, no drag-start/drag-end; `OwnDrag` holds the types, the
+  bytes once given — `setOwnDragData`, before the drop — and the receives
+  held until then; held ones read EOF when their offer stops being the
+  target or the drag ends without bytes; answers are FDMSG pipe with bytes,
+  the relay's writer thread — no relay change; accept/set_actions/finish
+  without a source; `drag_action_fn` → 'drag-action' / `dragAction()`, the
+  page's dropEffect). Only with FEATURE selection_cache. Both links: wasm
+  `wland_drag_begin` / `wland_drag_data` / `js_drag_action`, session CALLs
+  39–40 / EVENT 20 (STREAM.md). Page: `lib/dnd.ts` (createWland `dnd`,
+  default on): dragenter begins (text/plain as TEXT_MIMES, text/html,
+  text/uri-list; effectAllowed → actions), dragover moves and answers the
+  dropEffect, the drop reads getData, hands it over and drops; a
+  pointerless `input.grab(-1)` while it lasts (`PointerGrab.end(at)`
+  re-enters where it fell); ended by a dragleave out of the desktop (or the
+  window), blur, a press, dragend, 2 s without dragover, the link closing;
+  every drop on the desktop is prevented (no navigation). Headless:
+  `dragIn` / `drop`. Checked: core unit tests (offer/enter/drop, receive
+  held until bytes, EOF at leave/cancel/drop without bytes/conn close, two
+  data devices, no common action, no selection_cache), session_test.zig (a
+  real relay writes the bytes into the app's pipe), node tests (engine,
+  session, dnd.test.ts on the fake DOM, headless), headless-e2e (fixture
+  `files`: a link dragged in lands on its folder; passthrough and `--profile
+  session`), run-poc `pagednd` (real Chromium, CDP
+  Input.dispatchDragEvent: dropEffect follows the app, the drop arrives; a
+  files-only drag starts nothing and doesn't navigate). Then dropped files
+  (same day): the embedder's hook (`dnd.files` on createWland / the
+  bridge, `dnd.files` on createHeadless: `DropFilesHook`, File[] → file://
+  URIs or paths) makes them text/uri-list (offered from dragenter: the
+  items' kind says files; a drag's own text/uri-list wins and the hook is
+  not called); without a hook each file type (DataTransferItem.type) is
+  offered as itself, the first file of the type ≤ 4 MiB its content
+  (sizes are known only at the drop; nothing that fits and no text → the
+  drop is cancelled). File drags are copy only. The bytes (hook, or
+  File.arrayBuffer) come after the drop event, so the core grew a drop
+  whose bytes follow (`dragDropBytes(true)` / `dragDrop(true)`, CALL 25's
+  `later` word): the drop target's receives on the drop's offers wait
+  until `setOwnDragData`, the next own drag, or that conn closing; the
+  page bounds the wait (`filesTimeout`, 30 s, then empty). wland stores no
+  file (no upload frame, no relay temp files). Checked: core unit tests
+  (held before and after such a drop, answered at the bytes; EOF at the
+  next own drag and at conn close), dnd.test.ts (plan, uriList, file data,
+  finishDrop: resolve / reject / null / timeout / stale / over the cap;
+  the bridge with and without a hook), headless.test.ts (real core: the
+  read across the drop), headless-e2e (a hook that writes the file next
+  to the `files` fixture's: the app reads its URI and the file is there;
+  passthrough and session), run-poc `pagednd` (real Chromium, CDP files:
+  without a hook text/plain content after the drop, no navigation; with
+  the test page's `?dndfiles=1` hook the app reads `file:///hooked/…`).
+  Open: outbound (an app's drag onto the page: the browser can't start an
+  HTML drag without a press in the page); directories dropped (a File for
+  a directory has no bytes: the hook gets it as is, the fallback offers
+  nothing for it — untested); not tried by hand in Firefox or Safari, nor
+  with real GTK/Qt targets or real nautilus taking a file drop (inferred
+  from the protocol flow they share with app-to-app dnd, which is
+  checked).
 - **Seat objects of every wl_seat binding**, done (2026-11-22; unkernel saw
   Firefox render but ignore all input): the core kept one wl_pointer /
   wl_keyboard / data device id per client, the last made, and Firefox
@@ -487,7 +546,7 @@ approach shows up.
   (→ page beep/notification), keyboard-shortcuts-inhibit (pairs with the
   browser Keyboard Lock API), pointer-warp-v1, alpha-modifier, fifo /
   commit-timing, xdg-toplevel-tag, xdg-toplevel-drag, xdg-output, DOM-titlebar SSD for no-CSD apps,
-  viewport src-crop compositing, HTML5-dnd bridge to the host page,
+  viewport src-crop compositing, HTML5-dnd from an app out to the host page,
   OffscreenCanvas/worker present (after the GL path is hardware-verified; the
   frame-order invariant vs WIRE makes it non-trivial), WebGPU upload,
   multi-stream link / WebTransport (head-of-line blocking: one big frame from
@@ -555,7 +614,20 @@ Any of them is fair game to lift.
   ≤ 100 ms (none with `--no-fence-wait`) for implicit fences. X11 apps need `xwayland-satellite` + Xwayland
   installed (software rendering, no maximize, fullscreen untested; see the
   satellite entry above); no in-tree Xwayland.
-- dnd works between wland clients only, not to/from the host page.
+- dnd from the host page into apps: text/plain (as the UTF-8 types),
+  text/html and text/uri-list, ≤ 4 MiB each (`lib/dnd.ts`). Dropped files
+  reach apps as paths only through the embedder's `files` hook (wland has
+  no place to put them); without it a file is its content (≤ 4 MiB, the
+  first of each type, its own MIME type — no type: nothing), and an app
+  that wants a path (a file manager) gets none. A hook slower than
+  `filesTimeout` (30 s) drops no files. A drag carrying both files and its
+  own text/uri-list (an image from a web page) offers that link, not the
+  files, to a hook. Nothing goes the other way (an app's drag stays inside
+  the desktop). Needs FEATURE selection_cache (wlandr 0.1.0: no drag starts).
+  The page's dropEffect lags the app's answer by a round trip: a drop
+  released before the app accepted is refused by the browser (dragleave →
+  cancelled). Over a session link a refused drag_begin (an app's drag on —
+  not reachable from a page in an HTML drag) is not reported back.
 - The page clipboard bridge carries text/plain (UTF-8, ≤ 4 MiB) only; an
   app's copy reaches the page clipboard only around a user gesture in the
   desktop (5 s window, the next key/click, or a copy event), and the page's

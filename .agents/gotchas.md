@@ -370,7 +370,12 @@ with it. New findings go in the matching section.
   detach mark transfers cancelled, and dropConn leaves a tombstone (a
   ring of recent conn ids) so a receive the link thread found live just
   before its conn closed is still closed at once. A stale own offer (an
-  older generation) reads EOF like an orphaned one.
+  older generation) reads EOF like an orphaned one. The embedder's own
+  drag answers with the pipe-with-bytes form, not own_pipe: own_pipe's
+  relay cache holds ONE generation, so a drag's bytes sent that way would
+  drop the clipboard's copy while the core's `sent` bits still say the
+  relay has it (later pastes read EOF). A drop is read once; per-receive
+  bytes cost nothing.
 - **A receive's fd must be a pipe** (`interceptPipeReceive`, checked with
   F_GETPIPE_SZ — it never calls into a filesystem, fstat on FUSE can).
   O_NONBLOCK doesn't make every write()/close() return: a FUSE file whose
@@ -569,6 +574,35 @@ with it. New findings go in the matching section.
   sets the selection at its keyboard enter — the headless embedder and
   the wm focus new toplevels; the `copy` fixture does the same.
   start_drag needs a held press of the client's (`pressHeld`).
+- **The embedder's own drag has no source, and its bytes come late**
+  (`beginOwnDrag`, `Drag.own`, `OwnDrag`): a page knows an HTML drag's
+  types from dragenter but reads its data only in the drop handler. So
+  receives on its offers (`Selection.dnd`, conn 0, source = its
+  generation) are held (`OwnDrag.held`, ≤ 64) while the bytes are unknown
+  and the offer is the current target, answered at `setOwnDragData`, and
+  read EOF at the first `settleOwnDrag` that finds their offer no longer
+  the target (leave, retarget, surface destroyed, conn closed — the relay
+  parks fds by token, not conn, so a closing conn's are answered too) or
+  at a cancel; a drop with no bytes given finalizes them as none. A held
+  receive left unanswered leaves the app waiting on its pipe for good. Everything that checks `source_id != 0` for
+  "a source to notify" must also exclude `own` (accept, set_actions,
+  finish, drop's accept rule, connClose's `source_conn == conn` — conn
+  ids are never 0, but don't lean on it). Its drop needs `ownDragEffect()
+  != 0` (accepted, and set_actions agreed on an action if the target
+  negotiated): that is what the page showed as dropEffect, so a drop the
+  page allowed is one the app takes. endDrag sends no interactive kind 5
+  for it: the wm reads 'drag-end' as its own drag's. The bytes stay past
+  the drop (receives come after it) until `finish` on the drop target's
+  offer, that conn closing, or the next own drag. A drop may go before
+  its bytes (`dragDropBytes(true)`: a page's files are read, or placed by
+  the embedder's hook, only after the drop event): the drop's offers are
+  copied into `OwnDrag.drop_offers` (the Drag and its focus are gone by
+  then) and receives on them wait (`awaitsOn`); without `later` a drop
+  with no bytes finalizes them as none — the safe default for an embedder
+  that forgets dragData. The page side must then ALWAYS call dragData
+  (finishDrop: on resolve, reject, null and its timeout), and must not
+  call it for a drag that is no longer the core's own (`stale`: a newer
+  dragBegin's data would be taken as this drop's).
 - `xdg_surface.get_popup`'s parent is nullable — id 0 must not match a surface.
 - **Mesa's Wayland EGL/Vulkan find their GPU through linux-dmabuf v4
   feedback** (`main_device` → drmGetDeviceFromDevId); Mesa 26 has no wl_drm
@@ -1015,7 +1049,29 @@ with it. New findings go in the matching section.
   set the core drops every pointer enter/motion/button/axis and ignores further
   `start_drag`; only dragDrop/dragCancel (or the source dying) end it. An
   embedder that can't drive the drag must `dragCancel()` (wland/headless does
-  when no scripted button is held).
+  when no scripted button is held). The same holds for the embedder's own
+  drag (`dragBegin`): `lib/dnd.ts` ends it on every way an HTML drag can
+  end unseen (below).
+- **An HTML drag over the desktop (`lib/dnd.ts`) has no pointer events
+  and no reliable leave**: browsers fire no pointer events during a drag,
+  so the bridge holds a pointerless `input.grab(-1)` (the app under the
+  pointer gets its leave; it ends only at blur or end()) and ends it at
+  the drop with `end(at)` — the page saw no motion, so the re-enter must
+  be told where. dragleave fires for every element boundary inside the
+  container; the new element's dragenter comes first, in the same task,
+  and relatedTarget is null in some browsers: a dragleave right after a
+  dragenter on the desktop (`enteredFresh`, cleared by a setTimeout 0) is
+  a move within it, one with no fresh dragenter is the drag leaving the
+  page or the window. Belt and braces: a pointerdown, the page's dragend,
+  the window blur (the grab's) and 2 s with no dragover (browsers send one
+  every ≤ 350 ms while hovering) cancel too. dropEffect is read in
+  dragover from `dragAction()`, which lags the app's accept by a round
+  trip; a dropEffect of none makes the browser skip the drop event (a
+  dragleave comes instead → cancel). Every dragover/drop on the desktop is
+  preventDefault'ed, even with no drag begun (files only, no bridge): a
+  dropped link or file would otherwise navigate the page away and end the
+  session. CDP's synthetic drag (run-poc `pagednd`) shows the app's answer
+  can beat the first dragover (the `files` fixture accepts at enter).
 - **Node's `fetch` can't load `file:` URLs**: createEngine's default wasm
   (`new URL('wland.wasm', import.meta.url)`) is one in Node, so
   `instantiate()` reads `file:` URLs with node:fs, got through
