@@ -553,8 +553,41 @@ export interface Engine {
   /** During a drag ('drag-start'): the surface under the pointer (0, 0 =
    *  none), then dragDrop or dragCancel exactly once. */
   dragMotion(conn: number, surface: number, time: number, x: number, y: number): void;
-  dragDrop(): void;
+  /** `later` (the embedder's own drag only): its bytes come after the drop
+   *  (dragData then — files read or uploaded once dropped); the app's reads
+   *  wait for them meanwhile. Give them (null for none), or those reads
+   *  wait until the next drag of the embedder's, the app goes, or the link
+   *  closes. */
+  dragDrop(later?: boolean): void;
   dragCancel(): void;
+  /** Begin a drag of the embedder's own (an HTML drag entering the page,
+   *  lib/dnd.ts): offered to the apps under it like an app's drag, driven
+   *  the same way (dragMotion, then dragDrop or dragCancel exactly once) —
+   *  no button held, no 'drag-start'/'drag-end'. `mimes`: the types it
+   *  offers (1…32, each ≤ 256 bytes); `actions`: DND_COPY / DND_MOVE bits
+   *  it allows (default DND_COPY). The bytes come later (dragData, before
+   *  dragDrop: a page has them only at its drop event); an app reading
+   *  before then waits for them. What the target would do with a drop is
+   *  dragAction() ('drag-action' events). False: not begun (the link is
+   *  not open, its relay can't write the embedder's bytes into an app's
+   *  pipe — selectionBridged() not true —, another drag is on (passthrough
+   *  only: a session relay is asked anyway, with no answer), a bad type
+   *  list). */
+  dragBegin(mimes: readonly string[], actions?: number): boolean;
+  /** The bytes of the embedder's drag, per type (setSelection's shape: a
+   *  string is UTF-8, one value under several types is kept once), once,
+   *  before dragDrop (or after dragDrop(true)): apps' reads waiting for
+   *  them are answered. A type
+   *  given no bytes reads empty; `null` = none at all (every read ends
+   *  empty). A drop with none given is the same — no app is ever left
+   *  waiting. False: no drag of the embedder's on, given already, or too
+   *  much (64 MiB). */
+  dragData(data: Record<string, string | Uint8Array> | null): boolean;
+  /** What the app under the embedder's drag would do with a drop now:
+   *  DND_COPY, DND_MOVE, or 0 (nothing there takes it — a page shows
+   *  dropEffect 'none', and dragDrop then cancels). 0 when no such drag is
+   *  on. */
+  dragAction(): number;
 
   // --- clipboard (wl_data_device selection; not the primary) ---
   /** The clipboard selection now: its owner (0 = the embedder's own, or
@@ -612,7 +645,7 @@ export type Event =
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
   | TitleEvent | AppIdEvent | SizeLimitsEvent | DecorationEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
   | TouchBoundEvent
-  | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
+  | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent | DragActionEvent
   | ConfigureEvent | AckedEvent
   | SelectionEvent | PositionEvent | SyncedEvent;
 
@@ -915,6 +948,14 @@ export interface MinimizeEvent { type: 'minimize'; conn: number; surface: number
 export interface DragStartEvent { type: 'drag-start'; conn: number; surface: number; icon: number }
 /** The dnd session ended (dropped, cancelled, or the source died). */
 export interface DragEndEvent { type: 'drag-end' }
+/** What the app under the embedder's own drag (Engine.dragBegin) would do
+ *  with a drop changed: DND_COPY, DND_MOVE, or 0 (no app there, it did not
+ *  accept, or no common action). 0 again when the drag ends. */
+export interface DragActionEvent { type: 'drag-action'; action: number }
+
+/** wl_data_device_manager dnd actions (Engine.dragBegin, dragAction). */
+export const DND_COPY = 1;
+export const DND_MOVE = 2;
 
 /** A motion's relative part (zwp_relative_pointer_v1.relative_motion):
  *  the movement in logical px, unclipped by surface or screen edges and
@@ -1101,6 +1142,8 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   // the embedder's own (setSelection) while it is the selection
   let selection: { conn: number; mimes: string[] } = { conn: 0, mimes: [] };
   let ownSelection: Map<string, Uint8Array> | null = null;
+  // the embedder's own drag's action as the core last told it (dragAction)
+  let dragAct = 0;
   // readSelection calls waiting for the relay's answer, by read id
   const selectionReads = new Map<number, { resolve: (v: Uint8Array | null) => void; timer: ReturnType<typeof setTimeout> }>();
   let nextRead = 1;
@@ -1276,6 +1319,10 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       js_input_region: (conn, surface, infinite, ptr, n) =>
         emit({ type: 'input-region', conn: conn >>> 0, surface,
                region: infinite ? null : new Int32Array(ex.memory.buffer, ptr, n * 4).slice() }),
+      js_drag_action: (action) => {
+        dragAct = action >>> 0;
+        emit({ type: 'drag-action', action: dragAct });
+      },
       js_interactive: (conn, surface, kind, value) => {
         conn >>>= 0;
         switch (kind) {
@@ -1863,13 +1910,49 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   };
 
   function withUtf8(text: string, fn: (ptr: number, len: number) => void) {
-    const bytes = enc.encode(text);
+    inWasm(enc.encode(text), fn);
+  }
+  // `bytes` in wasm memory for the length of `fn` (not called when the
+  // allocation fails); `pointer`: an order-sensitive pointer call (the
+  // pending motion ships first)
+  function inWasm(bytes: Uint8Array, fn: (ptr: number, len: number) => void, pointer = false) {
+    if (pointer) flushMotion(true);
     const size = Math.max(1, bytes.length);
     const ptr = ex.wland_alloc(size);
     if (!ptr) return;
     new Uint8Array(ex.memory.buffer, ptr, bytes.length).set(bytes);
-    fn(ptr, bytes.length);
-    ex.wland_free(ptr, size);
+    try { fn(ptr, bytes.length); } finally { ex.wland_free(ptr, size); }
+  }
+
+  // setSelection / dragData's packed entries (wasm.zig wland_set_selection):
+  // { u32 mime_len, mime, u32 data_len | 0xffffffff (the previous entry's
+  // data again), data }, one copy per distinct value; `own` maps each type
+  // to its bytes. null: a value that is neither a string nor bytes.
+  function packEntries(data: Record<string, string | Uint8Array>): { bytes: Uint8Array; own: Map<string, Uint8Array> } | null {
+    const groups = new Map<string | Uint8Array, string[]>();
+    for (const [mime, value] of Object.entries(data)) {
+      if (typeof value !== 'string' && !(value instanceof Uint8Array)) return null;
+      const list = groups.get(value);
+      if (list) list.push(mime); else groups.set(value, [mime]);
+    }
+    const parts: Uint8Array[] = [];
+    const own = new Map<string, Uint8Array>();
+    const u32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+    for (const [value, mimes] of groups) {
+      const bytes = typeof value === 'string' ? enc.encode(value) : value;
+      mimes.forEach((mime, i) => {
+        const m = enc.encode(mime);
+        parts.push(u32(m.length), m);
+        if (i === 0) parts.push(u32(bytes.length), bytes); else parts.push(u32(0xffffffff));
+        own.set(mime, bytes.slice());
+      });
+    }
+    let total = 0;
+    for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) { out.set(p, off); off += p.length; }
+    return { bytes: out, own };
   }
 
   // the link's callbacks; none of them does anything once disposed (a link
@@ -1887,6 +1970,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       strayLogged = false;
       selection = { conn: 0, mimes: [] }; // wland_init: a fresh compositor
       ownSelection = null;
+      dragAct = 0;
       bridge = null; // (its relay's FEATURE frames decide again)
       noBridgeLogged = false;
       gpuWarned = false;
@@ -1961,6 +2045,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     for (const rd of selectionReads.values()) { clearTimeout(rd.timer); rd.resolve(null); }
     selectionReads.clear();
     ownSelection = null;
+    dragAct = 0;
     gen++;
     stall = false;
     inbox.length = 0;
@@ -2092,7 +2177,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     close: call((conn, surface) => ex.wland_close(conn, surface)),
     dragMotion: call((conn, surface, time, x, y) =>
       ex.wland_drag_motion(conn, surface, time >>> 0, fixed(x), fixed(y)), true),
-    dragDrop: call(() => ex.wland_drag_drop(), true),
+    dragDrop: call((later?: boolean) => ex.wland_drag_drop(later ? 1 : 0), true),
     dragCancel: call(() => ex.wland_drag_cancel(), true),
 
     // clipboard
@@ -2111,44 +2196,38 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
         run(ex.wland_set_selection, 0, 0);
         return true;
       }
-      // packed entries (wasm.zig wland_set_selection): { u32 mime_len, mime,
-      // u32 data_len | 0xffffffff (the previous entry's data again), data }
-      const groups = new Map<string | Uint8Array, string[]>();
-      for (const [mime, value] of Object.entries(data)) {
-        if (typeof value !== 'string' && !(value instanceof Uint8Array)) return false;
-        const list = groups.get(value);
-        if (list) list.push(mime); else groups.set(value, [mime]);
-      }
-      const parts: Uint8Array[] = [];
-      const own = new Map<string, Uint8Array>();
-      let total = 0;
-      const u32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
-      for (const [value, mimes] of groups) {
-        const bytes = typeof value === 'string' ? enc.encode(value) : value;
-        mimes.forEach((mime, i) => {
-          const m = enc.encode(mime);
-          parts.push(u32(m.length), m);
-          if (i === 0) parts.push(u32(bytes.length), bytes); else parts.push(u32(0xffffffff));
-          own.set(mime, bytes.slice());
-        });
-      }
-      for (const p of parts) total += p.length;
-      if (!total) return false;
-      const ptr = ex.wland_alloc(total);
-      if (!ptr) return false;
-      const mem = new Uint8Array(ex.memory.buffer, ptr, total);
-      let off = 0;
-      for (const p of parts) { mem.set(p, off); off += p.length; }
+      const packed = packEntries(data);
+      if (!packed || !packed.bytes.length) return false;
       // in place before the call: its 'selection' event may be answered
       // with a readSelection
       const prev = ownSelection;
-      ownSelection = own;
+      ownSelection = packed.own;
       let ok = 0;
-      run(() => { ok = ex.wland_set_selection(ptr, total); });
-      ex.wland_free(ptr, total);
+      inWasm(packed.bytes, (ptr, len) => run(() => { ok = ex.wland_set_selection(ptr, len); }));
       if (ok !== 1) ownSelection = prev;
       return ok === 1;
     },
+    dragBegin(mimes, actions = DND_COPY) {
+      if (!live) return false;
+      const b = bridged();
+      if (b !== true) {
+        if (b === false && !noBridgeLogged) { noBridgeLogged = true; log(`dragBegin: ${NO_SELECTION_BRIDGE}; not begun`); }
+        return false;
+      }
+      if (!mimes.length || mimes.some((m) => !m || m.includes('\0'))) return false;
+      let ok = 0;
+      inWasm(enc.encode(mimes.join('\0')), (ptr, len) => run(() => { ok = ex.wland_drag_begin(ptr, len, actions & (DND_COPY | DND_MOVE)); }), true);
+      return ok === 1;
+    },
+    dragData(data) {
+      if (!live) return false;
+      const packed = data == null ? { bytes: EMPTY } : packEntries(data);
+      if (!packed) return false;
+      let ok = 0;
+      inWasm(packed.bytes, (ptr, len) => run(() => { ok = ex.wland_drag_data(ptr, len); }), true);
+      return ok === 1;
+    },
+    dragAction: () => (live ? dragAct : 0),
     readSelection(mime, options) {
       if (!live) return Promise.resolve(null);
       if (bridged() === false) return Promise.reject(new Error(NO_SELECTION_BRIDGE));

@@ -16,6 +16,7 @@ import { createInput, type Input } from './input.ts';
 import { createWindowManager, type WindowManager } from './wm.ts';
 import type { InteractiveEvent, PointerPress } from './wm.ts';
 import { createClipboardBridge, type ClipboardBridge } from './clipboard.ts';
+import { createDndBridge, type DndBridge, type DropFilesHook } from './dnd.ts';
 import { reconnecting } from './link-ws.ts';
 
 export * from './engine.ts';
@@ -23,6 +24,7 @@ export * from './view.ts';
 export * from './input.ts';
 export * from './wm.ts';
 export * from './clipboard.ts';
+export * from './dnd.ts';
 
 export interface WlandOptions {
   /** Windows live in here. A positioned, fixed-size box: its client size is
@@ -100,6 +102,18 @@ export interface WlandOptions {
    *  false: the Wayland clipboard stays inside the desktop (and the copy /
    *  paste chords go to the apps as plain keys). */
   clipboard?: boolean;
+  /** Bridge HTML drag-and-drop into the desktop (lib/dnd.ts): text, HTML,
+   *  a link or files dragged from the page, another tab or the OS onto a
+   *  window are dropped into that app as a Wayland drag (text/plain as the
+   *  UTF-8 types, text/html, text/uri-list; ≤ 4 MiB each). Files: with
+   *  `files` (DropFilesHook) you put them where the apps can read them and
+   *  return their file:// URIs, dropped as text/uri-list; without, a file
+   *  ≤ 4 MiB is dropped as its content under its own type (the first of
+   *  each type). `filesTimeout`: how long an app waits for them (ms,
+   *  default 30000). Drops on the desktop never reach the page (no
+   *  navigation to a dropped link or file). Default true; false: drags
+   *  over the desktop are left to the page. */
+  dnd?: boolean | { files?: DropFilesHook; filesTimeout?: number };
   /** Every engine event (after the view, input and window manager saw it),
    *  plus the view's and window manager's log lines as 'log' events. A
    *  commit's `pixels` may no longer be readable here (the view presented
@@ -236,6 +250,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
   // set before the link starts: events only flow after engine.start()
   let engine: Engine | undefined, input: Input | undefined, wm: WindowManager | undefined;
   let clip: ClipboardBridge | null = null;
+  let dnd: DndBridge | null = null;
   let output: OutputWatch | undefined;
   let raf = 0; // the frame loop's pending request; 0 = not running
   let disposed = false;
@@ -246,6 +261,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
     cancelAnimationFrame(raf);
     output?.();
     wm?.dispose();
+    dnd?.dispose();
     clip?.dispose();
     input?.dispose();
     view.dispose();
@@ -277,6 +293,7 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
         each(input!.handle, ev);
         each(wm!.handle, ev);
         if (clip) each(clip.handle, ev);
+        if (dnd) each(dnd.handle, ev);
         each(onEvent, ev);
         // one frame loop for the engine's life (a stream link may open again)
         if (ev.type === 'open' && !raf && !disposed) raf = requestAnimationFrame(frame);
@@ -289,6 +306,10 @@ export async function createWland(options: WlandOptions): Promise<Wland> {
       browserFullscreen: options.browserFullscreen, shortcuts: options.shortcuts, interactive: options.interactive,
       // window positions are the embedder's to tell when its frames place them
       positions: !options.mount });
+    if (options.dnd !== false) {
+      const o = typeof options.dnd === 'object' && options.dnd ? options.dnd : {};
+      dnd = createDndBridge({ engine, view, input, container, log, files: o.files, filesTimeout: o.filesTimeout });
+    }
     output = watchOutput(engine, container, scale);
   } catch (e) {
     teardown();

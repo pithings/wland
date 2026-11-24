@@ -27,15 +27,17 @@
 
 import {
   createEngine, createStreamLink, createWsLink, inRegion, readSelectionText, setSelectionText, stackOrder,
-  ROLE_DND_ICON, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
+  DND_COPY, ROLE_DND_ICON, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
   type CommitEvent, type Engine, type Event, type GpuRef, type GpuSource, type HandleSource, type Link, type Role,
   type StreamSource,
 } from './engine.ts';
 import { swizzleRect } from './present.ts';
+import { dropPlan, finishDrop, type DropFilesHook, type DropPlan } from './dnd.ts';
 
 export type * from './engine.ts';
+export { dropData, dropPlan, dropTypes, uriList, type DropFilesHook } from './dnd.ts';
 export {
-  NO_SELECTION_BRIDGE, readSelectionText, setSelectionText, TEXT_MIMES,
+  NO_SELECTION_BRIDGE, readSelectionText, setSelectionText, TEXT_MIMES, DND_COPY, DND_MOVE,
   EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT, EDGE_TOP,
   ROLE_CURSOR, ROLE_DND_ICON, ROLE_NONE, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
 } from './engine.ts';
@@ -91,6 +93,11 @@ export interface HeadlessOptions {
   shortcuts?: boolean;
   /** Screenshot background, RGBA 0..255. Default opaque black. */
   background?: [number, number, number, number];
+  /** dragIn's dropped files, as createWland's `dnd` has it: `files` places
+   *  them (DropFilesHook: their file:// URIs back, dropped as
+   *  text/uri-list); `filesTimeout` (ms, default 30000) bounds how long an
+   *  app waits for them. */
+  dnd?: { files?: DropFilesHook; filesTimeout?: number };
   /** Every engine event, after the scene took it and BEFORE the window
    *  policy calls back into the engine: a commit's `pixels` is still
    *  readable here. A throwing consumer is reported asynchronously. */
@@ -365,8 +372,34 @@ export interface Headless {
    *  never hit, nor a surface where the point is outside its input region
    *  (the point falls through to what is below). */
   surfaceAt(x: number, y: number): SurfaceHit | null;
-  /** End a drag in progress (as Escape does). */
+  /** End a drag in progress (as Escape does): an app's, or dragIn's. */
   cancelDrag(): void;
+  /** Drag data from outside the desktop onto it, as a page's HTML drag is
+   *  (lib/dnd.ts: the same types and calls). `data` by browser type:
+   *  'text/plain' (offered as TEXT_MIMES), 'text/html', 'text/uri-list';
+   *  others are left out. `actions`: what it allows, DND_COPY (default) |
+   *  DND_MOVE. It enters at (x, y); pointerMove moves it (no button is
+   *  held), drop() drops it, cancelDrag() or Escape cancels it. The app
+   *  under it sees the types only until the drop. The pointer is the
+   *  drag's meanwhile (the app it was over gets a leave). What that app
+   *  would do with a drop: engine.dragAction() ('drag-action' events; its
+   *  answers arrive asynchronously). False: not begun — a drag or grab is
+   *  on, nothing offerable, or the relay can't bridge it (engine.dragBegin;
+   *  engine.selectionBridged() not true). */
+  /** `files`: dropped files, as a page's drop of files (DndBridgeOptions
+   *  .files): with HeadlessOptions.dnd.files they are offered as
+   *  text/uri-list and the hook places them at the drop; without, each
+   *  file type as itself, the first file of each type within 4 MiB its
+   *  content. A drop's files are handed over after the drop (the app's
+   *  read waits). */
+  dragIn(x: number, y: number, data: Record<string, string>, options?: { actions?: number; files?: readonly File[] }): boolean;
+  /** Drop the dragIn drag where the pointer is: its data goes to the app
+   *  under it if that app takes it (engine.dragAction() not 0), else it is
+   *  cancelled (so is one with nothing to hand over: no text, no file that
+   *  fits). Resolves once the data was handed over (files: read, or the
+   *  hook answered — or HeadlessOptions.dnd.filesTimeout passed): true,
+   *  dropped into an app; false, cancelled. */
+  drop(): Promise<boolean>;
   /** The pointer image the client under the pointer set (a shape, a cursor
    *  surface, or hidden), or null: the default pointer (no client set one
    *  since the pointer entered its surface). Leaving resets it. */
@@ -506,6 +539,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   const onEvent = options.onEvent || (() => {});
   const onWindowsChange = options.onWindowsChange || (() => {});
   const focusOnMap = options.focusOnMap !== false;
+  const dndOpts = options.dnd || {};
   const background = options.background || [0, 0, 0, 255];
   const output = { width: options.width ?? 1280, height: options.height ?? 720, scale: options.scale ?? 1 };
   const each = (fn: () => void) => {
@@ -536,6 +570,9 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   let pressSeq = 0;
   let grab: Grab | null = null;
   let dnd: { conn: number; icon: number } | null = null;
+  // dragIn's drag (the embedder's own: no app began it)
+  let pageDrag: { plan: DropPlan; data: Record<string, string>; files: File[] } | null = null;
+  let pageDrags = 0; // begun so far (a drop's late data checks it)
   let cursor: HeadlessCursor | null = null; // the pointer image (CursorEvent)
   const autoLock = options.autoLock !== false;
   let lock: HeadlessPointerLock | null = null; // the pointer lock an app wants (PointerLockEvent)
@@ -767,7 +804,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       case 'close':
         // every conn got its 'disconnect' first; the next open is a fresh
         // compositor with no session state
-        hover = pressed = grab = dnd = cursor = lock = mousePress = emulated = null;
+        hover = pressed = grab = dnd = pageDrag = cursor = lock = mousePress = emulated = null;
         held.clear();
         fingers.clear();
         break;
@@ -1037,7 +1074,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   // enter/leave when the surface under the pointer changes (pointerover /
   // pointerout on a page), motion while it stays
   function track(motion: boolean, rel?: { dx: number; dy: number }) {
-    if (pointerGrab() || dnd || pressed || (lock && lock.locked)) return;
+    if (pointerGrab() || dnd || pageDrag || pressed || (lock && lock.locked)) return;
     const hit = surfaceAt(pointer.x, pointer.y);
     const t = hit && { key: keyOf(hit.conn, hit.surface), conn: hit.conn, surface: hit.surface };
     if (t && hover && t.key === hover.key) {
@@ -1094,6 +1131,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   function keyDown(k: Key) {
     const code = evdev(k);
     if (dnd && code === KEY_ESC) { engine.dragCancel(); return; }
+    if (pageDrag && code === KEY_ESC) { cancelPageDrag(); return; }
     if (lock && lock.locked && code === KEY_ESC) { escHeld = true; breakLock(); return; }
     // the window bindings (wm.ts): Alt and no other modifier
     const win = shortcuts && (code === KEY_F9 || code === KEY_F10 || code === KEY_F11) &&
@@ -1138,7 +1176,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       return;
     }
     pointer = { x, y };
-    if (dnd) dragTarget();
+    if (dnd || pageDrag) dragTarget();
     else if (pointerGrab()) grabMove(x, y);
     else if (pressed) {
       // the implicit grab: motion stays with the pressed surface, in its
@@ -1171,7 +1209,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
 
   function pointerDown(b?: Button) {
     const code = button(b);
-    if (pointerGrab() || dnd) { held.add(code); return; }
+    if (pointerGrab() || dnd || pageDrag) { held.add(code); return; }
     track(false); // the scene may have changed under a still pointer
     const t = pressed || hover;
     dismissPopups(t?.key);
@@ -1189,6 +1227,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   function pointerUp(b?: Button) {
     const code = button(b);
     held.delete(code);
+    if (pageDrag) return; // (no button is the drag's: drop() ends it)
     if (dnd) {
       // final position, then the drop; the release belongs to the drag
       dragTarget();
@@ -1212,6 +1251,51 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       pressed = null;
       track(false);
     }
+  }
+
+  // --- dragIn: a page's HTML drag (lib/dnd.ts), scripted ----------------
+  function dragIn(x: number, y: number, data: Record<string, string>, options?: { actions?: number; files?: readonly File[] }): boolean {
+    if (dnd || pageDrag || grab || emulated !== null) return false;
+    const files = [...(options?.files ?? [])];
+    const plan = dropPlan(files.length ? [...Object.keys(data), 'Files'] : Object.keys(data), files.map((f) => f.type), !!dndOpts.files);
+    // files are copied, never moved (lib/dnd.ts)
+    const actions = (options?.actions ?? DND_COPY) & (plan.files === 'none' ? 3 : DND_COPY);
+    if (!plan.wayland.length || !actions || !engine.dragBegin(plan.wayland, actions)) return false;
+    pageDrags++;
+    // the pointer is the drag's: the app under it gets its leave (a page's
+    // pointerless input grab), fingers are held off
+    if (hover) engine.pointerLeave(hover.conn);
+    hover = pressed = null;
+    cancelFingers();
+    // (by type as dropTypes names them: lower case)
+    pageDrag = { plan, files, data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k.toLowerCase(), v])) };
+    pointer = { x, y };
+    dragTarget();
+    return true;
+  }
+  function cancelPageDrag() {
+    if (!pageDrag) return;
+    pageDrag = null;
+    engine.dragCancel();
+    track(false);
+  }
+  function drop(): Promise<boolean> {
+    const d = pageDrag;
+    if (!d) return Promise.resolve(false);
+    pageDrag = null;
+    dragTarget(); // where it falls
+    if (!engine.dragAction()) {
+      engine.dragCancel();
+      track(false);
+      return Promise.resolve(false);
+    }
+    const seq = pageDrags;
+    const done = finishDrop(engine, d.plan, (t) => d.data[t] ?? '', d.files, {
+      hook: dndOpts.files, timeoutMs: dndOpts.filesTimeout, stale: () => pageDrags !== seq,
+      log: (line) => { if (!disposed) each(() => onEvent({ type: 'log', line })); },
+    });
+    track(false); // the pointer goes back to whatever is under it
+    return done;
   }
 
   // --- touch: a finger as its client's touch point when it has a wl_touch,
@@ -1238,7 +1322,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
 
   function touchDown(id: number, x: number, y: number) {
     if (fingers.has(id) || emulated === id || grab?.finger === id) throw new Error(`headless: finger ${id} is down already`);
-    if (pointerGrab() || dnd) return; // held off, like the pointer
+    if (pointerGrab() || dnd || pageDrag) return; // held off, like the pointer
     const hit = surfaceAt(x, y);
     if (!hit || !engine.touchBound(hit.conn)) {
       // the browser's emulation: the finger is the pointer, one at a time
@@ -1558,7 +1642,10 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     surfaceAt,
     cancelDrag() {
       if (dnd) engine.dragCancel();
+      cancelPageDrag();
     },
+    dragIn,
+    drop,
     cursor: () => (cursor ? { ...cursor } : null),
     pointerLock: () => (lock ? { ...lock } : null),
     grantLock,
@@ -1588,7 +1675,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       popups.clear();
       regions.clear();
       fingers.clear();
-      active = hover = pressed = grab = dnd = lock = mousePress = emulated = null;
+      active = hover = pressed = grab = dnd = pageDrag = lock = mousePress = emulated = null;
     },
   };
 }

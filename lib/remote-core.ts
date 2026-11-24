@@ -87,7 +87,7 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_popup_dismiss: [22, 'uu'],
   wland_request_resize: [23, 'uuiiu'],
   wland_drag_motion: [24, 'uuuii'],
-  wland_drag_drop: [25, ''],
+  wland_drag_drop: [25, 'u'],
   wland_drag_cancel: [26, ''],
   wland_close: [29, 'uu'],
   wland_set_bounds: [30, 'iiii'],
@@ -101,6 +101,7 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_touch_cancel: [38, 'u'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
+const OP_DRAG_BEGIN = 39, OP_DRAG_DATA = 40;
 
 /** A CALL (or EVENT) frame: `kinds` spells the arguments (u u32, i i32,
  *  d f64, b bytes = u32 len + bytes), little-endian, unpadded. Numbers
@@ -178,6 +179,7 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
   let locks = options.locks & 3;
   let selection: { conn: number; mimes: string[] } = { conn: 0, mimes: [] };
   const dec = new TextDecoder();
+  const enc = new TextEncoder();
 
   // a fixed region for wland_surface_place (3 × i32) and
   // wland_window_geometry (4 × i32), 4-aligned, like the core's statics
@@ -278,6 +280,7 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
         return env.js_acked(conn, surface, serial, w, h);
       }
       case 19: { const conn = a.u32(), bound = a.u32(); return env.js_touch_bound(conn, bound); }
+      case 20: return env.js_drag_action(a.u32());
       default: return; // an op this viewer does not know: skipped
     }
   }
@@ -384,6 +387,23 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
       const b = len ? mem(ptr, len).slice() : new Uint8Array(0);
       if (len && !wellFormed(b)) return 0;
       call(OP_SET_SELECTION, 'b', b);
+      return 1;
+    },
+    // the embedder's own drag: no synchronous result either — a well-formed
+    // type list is begun (the relay refuses one during an app's drag,
+    // which a page in an HTML drag never has), payloads are taken
+    wland_drag_begin: (ptr, len, actions) => {
+      const mimes = mem(ptr, len).slice();
+      const list = len ? dec.decode(mimes).split('\0') : [];
+      if (!list.length || new Set(list).size > MAX_MIMES || list.some((m) => !m || enc.encode(m).length > MAX_MIME)) return 0;
+      if (!(actions & 3)) return 0;
+      call(OP_DRAG_BEGIN, 'bu', mimes, actions);
+      return 1;
+    },
+    wland_drag_data: (ptr, len) => {
+      const b = len ? mem(ptr, len).slice() : new Uint8Array(0);
+      if (len && !wellFormed(b)) return 0;
+      call(OP_DRAG_DATA, 'b', b);
       return 1;
     },
     // asked only when an app's selection offers it (the answer is an

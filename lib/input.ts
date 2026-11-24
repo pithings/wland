@@ -135,8 +135,11 @@ export interface PointerGrab {
    *  pointer is left as it is (no leave at the start, no enter at the end,
    *  a mouse beside goes on reaching the apps). */
   readonly touch: boolean;
-  /** Let go; idempotent. */
-  end(): void;
+  /** Let go; idempotent. `at`: where the pointer is now (client px) — the
+   *  surface entered at the end is the one there; for a pointerless grab
+   *  (pointerId -1) the page may have seen no pointer event since it began
+   *  (an HTML drag: lib/dnd.ts). */
+  end(at?: { x: number; y: number }): void;
 }
 
 export interface Input {
@@ -659,7 +662,10 @@ export function createInput(options: InputOptions): Input {
       pointerId,
       touch,
       get active() { return g.active; },
-      end: () => endGrab(g, 'end'),
+      end: (at) => {
+        if (g.active && at) { g.x = at.x; g.y = at.y; }
+        endGrab(g, 'end');
+      },
     };
     if (!g.active) return handle; // released already: nothing to hold
     if (touch) {
