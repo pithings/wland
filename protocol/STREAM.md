@@ -307,16 +307,22 @@ only ever exists server-side; the token names it across the hop:
   reads EOF. Every token the server hands out is answered one way or the
   other.
 - browser→server, `byte_len` = 0 and aux longer than the token: the offer is
-  the browser's own selection (the embedder's, e.g. the page clipboard: the
-  compositor holds the bytes), from a browser that does not use own_pipe.
-  aux = token ++ the bytes, on every receive; the server writes them into
-  the fd parked under the token, then closes it, exactly like an
-  own_pipe's (below: one writer, capped, 5 s). The server never parses the
-  bytes. wlandr accepts it; the reference browser never sends it (it uses
-  own_pipe, and offers apps a selection of its own only on a link whose
-  server sent FEATURE selection_cache — a server without it, wlandr 0.1.0,
-  rejects this form, "pipe fdmsg with bad aux len", and keeps the fd
-  parked: the receiving app would block in `read`).
+  the browser's own (the compositor holds the bytes): its selection, from a
+  browser that does not use own_pipe, or its own drag (an HTML drag from
+  the page — no app is the source). aux = token ++ the bytes, on every
+  receive; the server writes them into the fd parked under the token, then
+  closes it, exactly like an own_pipe's (below: one writer, capped, 5 s).
+  The server never parses the bytes. wlandr accepts it. The reference
+  browser sends it for its own drag's receives only (a drop is read once,
+  so nothing is kept server-side; its clipboard uses own_pipe), and only to
+  a server that sent FEATURE selection_cache — a server without it, wlandr
+  0.1.0, rejects this form, "pipe fdmsg with bad aux len", and keeps the fd
+  parked: the receiving app would block in `read`. A receive on the
+  browser's drag before the page has the bytes (a page reads a drag's data
+  only at its drop; dropped files later still, after the drop: CALL 25's
+  `later`) is held by the browser and answered when they come, or with an
+  empty answer (EOF) when the drag leaves that app or ends without them:
+  every token is still answered.
 
 fd_kind=pipe_read (5) lets the browser read the clipboard selection itself
 (the page clipboard bridge), both directions, never a wire message the app
@@ -821,11 +827,12 @@ it: its "GPU" buffers are wl_shm ones).
 it reads selections for it (FDMSG pipe_read) and keeps a copy of each
 payload of the browser's own clipboard selection it is sent, serving
 receives from it (FDMSG own_pipe, above), so each payload's bytes cross
-once per link. Bytes: none (any are ignored). wlandr sends it on every
+once per link; and it writes a pipe with bytes (the browser's own drag).
+Bytes: none (any are ignored). wlandr sends it on every
 link, after the dmabuf frames. Without it (a server that predates it:
 wlandr 0.1.0) the browser sends neither pipe_read nor own_pipe nor a pipe
-with bytes, and offers apps no selection of its own — an app could not
-paste it (the server would park its pipe and never write it). The
+with bytes, and offers apps no selection or drag of its own — an app could not
+paste or drop it (the server would park its pipe and never write it). The
 reference browser: `Engine.selectionBridged()` false, `readSelection`
 rejects at once, `setSelection` sets nothing, the page bridge is inert on
 that link (one log line; copy/paste chords are plain keys). Apps' own
@@ -1121,7 +1128,11 @@ the serial its own call produced without a reply (absent: 0); a relay
 before EVENTs 17–18 tells neither configures nor acks; a relay before
 CALL 33 places popups without constraint adjustment; a relay before CALLs
 34–38 / EVENT 19 advertises no touch and says no app has a wl_touch, so a
-viewer sends fingers as the pointer.
+viewer sends fingers as the pointer; a relay before CALLs 39–40 / EVENT 20
+skips drag_begin and drag_data, so the drag CALLs that follow find no drag
+and change nothing (the viewer's dragAction() stays 0, its page shows no
+drop and cancels); one before drag_drop's `later` word drops with no
+bytes to come, so a drop's files (sent by a later drag_data) read empty.
 
 ### 0x0f CALL — an embedder call, viewer→relay only (session)
 
@@ -1158,7 +1169,7 @@ u8  args[len]
 | 22 | popup_dismiss | u32 conn, u32 surface |
 | 23 | request_resize | u32 conn, u32 surface, i32 w, i32 h, u32 cause |
 | 24 | drag_motion | u32 conn, u32 surface, u32 time_ms, i32 x_fixed, i32 y_fixed |
-| 25 | drag_drop | — |
+| 25 | drag_drop | u32 later (1: the viewer's own drag's bytes come after the drop — drag_data then; the app's reads wait for them. 0 or absent: in already, or none) |
 | 26 | drag_cancel | — |
 | 27 | set_selection | bytes packed (as wland_set_selection takes it; len 0 clears) |
 | 28 | read_selection | bytes mime, u32 read_id, u32 max_bytes |
@@ -1172,6 +1183,8 @@ u8  args[len]
 | 36 | touch_up | u32 conn, u32 time_ms, i32 id |
 | 37 | touch_frame | u32 conn (the touch CALLs since the last one happened together: wl_touch.frame) |
 | 38 | touch_cancel | u32 conn (every point of the conn ends without its up: wl_touch.cancel) |
+| 39 | drag_begin | bytes mimes (NUL-separated, 1…32 distinct, each ≤ 256 bytes), u32 actions (1 copy \| 2 move) — the viewer's own drag (an HTML drag over its page): offered to the app under it like an app's drag, driven by drag_motion and drag_drop / drag_cancel; refused (logged, nothing begins) during an app's drag or malformed |
+| 40 | drag_data | bytes packed (set_selection's packing; len 0: none) — the viewer's drag's bytes, once, before drag_drop: receives held for them are answered |
 
 **init is the attach.** A viewer sends it once, first, when it has seen
 FEATURE session (followed by its set_gpu_source / desktop_size /
@@ -1253,6 +1266,7 @@ u8  args[len]
 | 17 | configure | u32 conn, u32 surface, u32 serial, i32 w, i32 h, u32 states, u32 cause (every xdg_toplevel configure the compositor sends: its xdg_surface serial, the size asked — 0 = the client decides —, the states as the app was told them: 1 maximized, 2 fullscreen, 4 activated, 8 suspended, the tiled edges << 4 (1 top, 2 bottom, 4 left, 8 right); cause = the token of the CALL that made it, 0 = none) |
 | 18 | acked | u32 conn, u32 surface, u32 serial, i32 w, i32 h (a commit applied the configure `serial` the app acked since its last commit; w×h is what it asked; before that commit's pixel frames) |
 | 19 | touch_bound | u32 conn, u32 bound (1: the app made its first wl_touch, the touch CALLs reach it; 0: it released its last — touch CALLs for it are ignored; not sent at the conn's close) |
+| 20 | drag_action | u32 action (what the app under the viewer's drag would do with a drop now: 1 copy, 2 move, 0 nothing — no app there, not accepted, no common action; sent on changes, 0 when the drag ends; not replayed: a drag ends with its viewer) |
 
 EVENTs keep the order the compositor made them in, relative to each other
 and to the pixel frames, CONN_OPEN/CONN_CLOSE and SURFACE frames around

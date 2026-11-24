@@ -752,6 +752,8 @@ pub const CallOp = enum(u16) {
     touch_up = 36,
     touch_frame = 37,
     touch_cancel = 38,
+    drag_begin = 39,
+    drag_data = 40,
     _,
 };
 
@@ -776,6 +778,7 @@ pub const EventOp = enum(u16) {
     configure = 17,
     acked = 18,
     touch_bound = 19,
+    drag_action = 20,
     _,
 };
 

@@ -669,8 +669,63 @@ const Placed = struct { x: i32, y: i32, w: i32, h: i32 };
 
 /// The selection: which conn's wl_data_source currently owns the clipboard.
 /// conn 0 (no relay conn has it) = the embedder's own selection
-/// (setOwnSelection), `source` then its generation (`own_gen`).
-const Selection = struct { conn: u32, source: u32 };
+/// (setOwnSelection), `source` then its generation (`own_gen`). Also what
+/// an offer proxies (Conn.offers): `dnd` marks an offer of the embedder's
+/// own drag (beginOwnDrag; conn 0, `source` = its generation).
+const Selection = struct { conn: u32, source: u32, dnd: bool = false };
+
+/// The embedder's own drag (beginOwnDrag: an HTML drag from the page): the
+/// types it offers and the source actions, from its start; the payloads
+/// only once the embedder has them (setOwnDragData — a page's drop event
+/// is the first time it can read them). A receive on one of its offers
+/// before that is held (`held`) and answered when they come, or read EOF
+/// when its offer stops being the drag's target or the drag ends without
+/// them. Kept past the drop (receives come after it) until the next own
+/// drag, the drop target's `finish`, or its conn closing.
+const OwnDrag = struct {
+    gen: u32,
+    /// owned, offered in this order
+    mimes: std.ArrayList([]u8) = .empty,
+    /// dnd_action_copy / dnd_action_move bits
+    actions: u32,
+    /// the payloads (null: not given yet); an empty one = none at all
+    data: ?OwnSelection = null,
+    held: std.ArrayList(HeldReceive) = .empty,
+    /// the conn the drop went to (0: not dropped)
+    dropped_conn: u32 = 0,
+    /// the drop went with its bytes still to come (dragDropBytes(true)):
+    /// receives on the drop's offers (`drop_offers`) wait for them
+    awaiting: bool = false,
+    drop_offers: [max_seat_objects]u32 = undefined,
+    drop_offer_n: u8 = 0,
+    /// the action the embedder was last told (drag_action_fn)
+    told: u32 = 0,
+
+    const HeldReceive = struct { conn: u32, offer: u32, token: u32, mime: []u8 };
+
+    fn deinit(self: *OwnDrag, gpa: std.mem.Allocator) void {
+        for (self.mimes.items) |m| gpa.free(m);
+        self.mimes.deinit(gpa);
+        if (self.data) |*d| d.deinit(gpa);
+        for (self.held.items) |h| gpa.free(h.mime);
+        self.held.deinit(gpa);
+    }
+
+    fn offers(self: *const OwnDrag, mime: []const u8) bool {
+        for (self.mimes.items) |m| if (std.mem.eql(u8, m, mime)) return true;
+        return false;
+    }
+
+    /// `offer` of `conn` was one the drop went to, and its bytes are still
+    /// to come: a receive on it waits
+    fn awaitsOn(self: *const OwnDrag, conn: u32, offer: u32) bool {
+        return self.awaiting and self.data == null and conn == self.dropped_conn and offer != 0 and
+            std.mem.indexOfScalar(u32, self.drop_offers[0..self.drop_offer_n], offer) != null;
+    }
+};
+/// Most receives an own drag holds while its payloads are not known (one
+/// per offered type of each data device, comfortably); one more reads EOF.
+pub const own_drag_max_held = 64;
 
 /// The embedder's own clipboard selection (setOwnSelection): data the core
 /// holds; the relay writes it into a receiver's pipe from its copy (FDMSG
@@ -777,7 +832,8 @@ const SeatObjects = struct {
 /// selection offers, so the server's receive/pipe interception carries dnd
 /// transfers with no server change.
 const Drag = struct {
-    /// conn that requested start_drag (the origin surface's owner)
+    /// conn that requested start_drag (the origin surface's owner); 0 for
+    /// the embedder's own drag (`own`)
     source_conn: u32,
     /// wl_data_source id; 0 = client-internal drag (null source): only the
     /// source client's own surfaces are entered, and nothing transfers
@@ -794,6 +850,14 @@ const Drag = struct {
     focus_offer_n: u8 = 0,
     /// last wl_data_offer.accept named a mime (a drop without this cancels)
     accepted: bool = false,
+    /// The embedder's own drag (beginOwnDrag; Compositor.own_drag holds its
+    /// types and payloads): no source client to tell anything, no origin or
+    /// icon surface, no drag-start/drag-end for the embedder (it began it).
+    own: bool = false,
+    /// own drags: the target's set_actions came (`action` is what was
+    /// negotiated, 0 = none), since its enter
+    negotiated: bool = false,
+    action: u32 = 0,
 
     fn isFocusOffer(d: *const Drag, offer_id: u32) bool {
         return offer_id != 0 and std.mem.indexOfScalar(u32, d.focus_offers[0..d.focus_offer_n], offer_id) != null;
@@ -805,6 +869,8 @@ const Drag = struct {
         d.focus_surface = 0;
         d.focus_offer_n = 0;
         d.accepted = false;
+        d.negotiated = false;
+        d.action = 0;
     }
 };
 
@@ -1124,6 +1190,16 @@ pub const Compositor = struct {
     selection_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void = null,
     /// in-flight dnd session, if any (normal pointer delivery is suppressed)
     drag: ?Drag = null,
+    /// The embedder's own drag's types and payloads (beginOwnDrag): while
+    /// `drag.own` and after its drop (see OwnDrag).
+    own_drag: ?OwnDrag = null,
+    /// Generation of the last own drag (never 0).
+    own_drag_gen: u32 = 0,
+    /// What the target of the embedder's own drag would do with a drop
+    /// now changed: `action` dnd_action_copy / dnd_action_move, 0 = nothing
+    /// (no target, not accepted, no common action) — a page's dropEffect.
+    /// Told on changes only, and 0 when the drag ends.
+    drag_action_fn: ?*const fn (ctx: ?*anyopaque, action: u32) void = null,
     /// wl_output scale advertised to clients (browser devicePixelRatio,
     /// rounded to an integer). Set before any conn binds wl_output.
     output_scale: i32 = 1,
@@ -1223,6 +1299,7 @@ pub const Compositor = struct {
         self.conns.deinit(self.gpa);
         if (self.dmabuf) |d| self.gpa.free(d.table);
         if (self.own_selection) |*own| own.deinit(self.gpa);
+        if (self.own_drag) |*own| own.deinit(self.gpa);
     }
 
     /// The relay takes dmabufs (FEATURE linux_dmabuf, before any conn):
@@ -1351,12 +1428,19 @@ pub const Compositor = struct {
             }
         }
         if (self.drag) |*drag| {
-            if (drag.source_conn == conn_id) {
+            if (!drag.own and drag.source_conn == conn_id) {
                 drag.source_id = 0; // conn (and its source) already gone
                 self.dragCancel();
             } else if (drag.focus_conn == conn_id) {
                 drag.clearFocus();
             }
+        }
+        // the embedder's drag: the conn's held receives read EOF (the relay
+        // parks their fds by token, not by conn); a drop it took is over
+        if (self.own_drag) |*own| {
+            if (own.dropped_conn == conn_id) {
+                self.dropOwnDrag();
+            } else self.settleOwnDrag();
         }
         self.logf("conn {d} closed", .{conn_id});
     }
@@ -1963,7 +2047,7 @@ pub const Compositor = struct {
             } else if (std.mem.eql(u8, msg.name, "set_actions")) {
                 self.dragOfferActions(conn_id, header.object_id, args[0].uint, args[1].uint);
             } else if (std.mem.eql(u8, msg.name, "finish")) {
-                self.dragFinish(conn, header.object_id);
+                self.dragFinish(conn_id, conn, header.object_id);
             }
         } else if (std.mem.eql(u8, iface.name, "zwp_primary_selection_device_manager_v1")) {
             // M13, mirror of wl_data_device_manager. destroy is a generic
@@ -2275,6 +2359,7 @@ pub const Compositor = struct {
                 if (self.drag) |*drag| {
                     if (conn_id == drag.focus_conn and header.object_id == drag.focus_surface) {
                         drag.clearFocus();
+                        if (drag.own) self.settleOwnDrag();
                     }
                     if (conn_id == drag.source_conn and header.object_id == drag.icon_surface) {
                         drag.icon_surface = 0;
@@ -3924,6 +4009,24 @@ pub const Compositor = struct {
             self.notifySelection();
             return;
         }
+        const own = try self.parseOwnEntries(entries);
+        if (self.selection) |old| {
+            if (old.conn != 0) self.sendEvent(old.conn, old.source, "wl_data_source", "cancelled", &.{});
+        }
+        self.dropOwnSelection();
+        self.own_selection = own;
+        self.own_gen +%= 1;
+        if (self.own_gen == 0) self.own_gen = 1;
+        self.selection = .{ .conn = 0, .source = self.own_gen };
+        self.broadcastSelection();
+        self.notifySelection();
+    }
+
+    /// setOwnSelection's packed entries (also setOwnDragData's) as owned
+    /// payloads: repeated { u32 mime_len, mime, u32 data_len, data },
+    /// little-endian, data_len 0xffffffff = the previous entry's data again;
+    /// the first entry of a mime wins. Empty: none.
+    fn parseOwnEntries(self: *Compositor, entries: []const u8) !OwnSelection {
         var own: OwnSelection = .{};
         errdefer own.deinit(self.gpa);
         var total: usize = 0;
@@ -3963,16 +4066,7 @@ pub const Compositor = struct {
                 return err;
             };
         }
-        if (self.selection) |old| {
-            if (old.conn != 0) self.sendEvent(old.conn, old.source, "wl_data_source", "cancelled", &.{});
-        }
-        self.dropOwnSelection();
-        self.own_selection = own;
-        self.own_gen +%= 1;
-        if (self.own_gen == 0) self.own_gen = 1;
-        self.selection = .{ .conn = 0, .source = self.own_gen };
-        self.broadcastSelection();
-        self.notifySelection();
+        return own;
     }
 
     /// Read the current clipboard selection as `mime` for the embedder:
@@ -4091,7 +4185,10 @@ pub const Compositor = struct {
         // no source offers a longer one (addSourceMime), and it would be
         // echoed in the source's send event
         if (mime.len > max_mime_len) return self.dropPipe(conn_id, token);
-        if (offer.conn == 0 and !is_primary) return self.serveOwn(conn_id, offer.source, mime, token);
+        if (offer.conn == 0 and !is_primary) {
+            if (offer.dnd) return self.serveOwnDrag(conn_id, header.object_id, offer.source, mime, token);
+            return self.serveOwn(conn_id, offer.source, mime, token);
+        }
         // an offer outlives its source (the receiver may hold it past a
         // selection change): a receive on it reads EOF, it is not routed to
         // whatever the source's id names by now
@@ -4247,14 +4344,172 @@ pub const Compositor = struct {
         if (self.interactive_fn) |f| f(self.ctx, conn_id, origin_id, 4, icon_id);
     }
 
+    /// The embedder's own drag (an HTML drag entering the page): a dnd
+    /// session with no source client, driven like any (dragMotion /
+    /// dragDrop / dragCancel) — no held press needed, no client asked.
+    /// `mimes`: the types it offers, NUL-separated (1…own_selection_max_mimes,
+    /// each 1…max_mime_len bytes); `actions`: dnd_action_copy /
+    /// dnd_action_move bits it allows (others are dropped; none left is
+    /// refused). The payloads come later (setOwnDragData), before the drop.
+    /// Only on a link whose relay can write the embedder's bytes into an
+    /// app's pipe (selection_bridge: error.Unsupported otherwise, nothing
+    /// is offered); error.Busy during another drag. The embedder is not sent
+    /// drag-start/drag-end for it; drag_action_fn tells it what the target
+    /// would do with a drop.
+    pub fn beginOwnDrag(self: *Compositor, mimes: []const u8, actions: u32) !void {
+        if (!self.selection_bridge) return error.Unsupported;
+        if (self.drag != null) return error.Busy;
+        const acts = actions & (dnd_action_copy | dnd_action_move);
+        if (acts == 0 or mimes.len == 0) return error.BadDrag;
+        var list: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (list.items) |m| self.gpa.free(m);
+            list.deinit(self.gpa);
+        }
+        var it = std.mem.splitScalar(u8, mimes, 0);
+        while (it.next()) |m| {
+            if (m.len == 0 or m.len > max_mime_len) return error.BadDrag;
+            const dup = for (list.items) |have| {
+                if (std.mem.eql(u8, have, m)) break true;
+            } else false;
+            if (dup) continue;
+            if (list.items.len == own_selection_max_mimes) return error.BadDrag;
+            const copy = try self.gpa.dupe(u8, m);
+            list.append(self.gpa, copy) catch |err| {
+                self.gpa.free(copy);
+                return err;
+            };
+        }
+        self.dropOwnDrag(); // the last one's receives are over
+        self.own_drag_gen +%= 1;
+        if (self.own_drag_gen == 0) self.own_drag_gen = 1;
+        self.own_drag = .{ .gen = self.own_drag_gen, .mimes = list, .actions = acts };
+        self.drag = .{ .source_conn = 0, .source_id = 0, .origin_surface = 0, .icon_surface = 0, .own = true };
+    }
+
+    /// The payloads of the embedder's own drag (setOwnSelection's packed
+    /// entries; empty: it has none — every receive reads EOF), once: before
+    /// its drop, or after a drop whose bytes were to come
+    /// (dragDropBytes(true): a page's files, read or uploaded once dropped).
+    /// Held receives are answered now. error.NoDrag: no own drag (or it
+    /// ended, or dropped without awaiting them); error.AlreadySet: given
+    /// before.
+    pub fn setOwnDragData(self: *Compositor, entries: []const u8) !void {
+        const own = &(self.own_drag orelse return error.NoDrag);
+        const active = if (self.drag) |d| d.own else false;
+        if (!active and !own.awaiting) return error.NoDrag;
+        if (own.data != null) return error.AlreadySet;
+        own.data = try self.parseOwnEntries(entries);
+        self.answerHeld();
+    }
+
+    /// Every held receive answered from the payloads (they are known now).
+    fn answerHeld(self: *Compositor) void {
+        const own = &(self.own_drag orelse return);
+        const held = own.held;
+        own.held = .empty;
+        defer {
+            for (held.items) |h| self.gpa.free(h.mime);
+            var l = held;
+            l.deinit(self.gpa);
+        }
+        for (held.items) |h| self.writeOwnDrag(h.conn, h.mime, h.token);
+    }
+
+    /// A receive on an offer of the embedder's own drag (generation `gen`):
+    /// from its payloads when they are known; held while they are not and
+    /// the offer is the drag's current target; else EOF (a stale offer, a
+    /// type it does not offer, a target it left, the drag over without them).
+    fn serveOwnDrag(self: *Compositor, conn_id: u32, offer_id: u32, gen: u32, mime: []const u8, token: u32) void {
+        const own = &(self.own_drag orelse return self.dropPipe(conn_id, token));
+        if (own.gen != gen or !own.offers(mime)) return self.dropPipe(conn_id, token);
+        if (own.data != null) return self.writeOwnDrag(conn_id, mime, token);
+        const on_target = if (self.drag) |d| d.own and d.focus_conn == conn_id and d.isFocusOffer(offer_id) else false;
+        if (!on_target and !own.awaitsOn(conn_id, offer_id)) return self.dropPipe(conn_id, token);
+        if (own.held.items.len >= own_drag_max_held) return self.dropPipe(conn_id, token);
+        const m = self.gpa.dupe(u8, mime) catch return self.dropPipe(conn_id, token);
+        own.held.append(self.gpa, .{ .conn = conn_id, .offer = offer_id, .token = token, .mime = m }) catch {
+            self.gpa.free(m);
+            return self.dropPipe(conn_id, token);
+        };
+    }
+
+    /// Answer a receive with the own drag's payload for `mime` (FDMSG pipe,
+    /// no wire message, aux = token ++ the bytes: the relay writes them into
+    /// the parked fd on its writer thread, as an own selection's, and
+    /// closes it), or EOF when it has none of that type. Each receive
+    /// carries its bytes (a drop is read once, not like a clipboard).
+    fn writeOwnDrag(self: *Compositor, conn_id: u32, mime: []const u8, token: u32) void {
+        const own = &(self.own_drag orelse return self.dropPipe(conn_id, token));
+        const data = &(own.data orelse return self.dropPipe(conn_id, token));
+        const bytes = data.data(mime) orelse return self.dropPipe(conn_id, token);
+        if (bytes.len == 0) return self.dropPipe(conn_id, token);
+        const fdmsg_fn = self.fdmsg_fn orelse return;
+        const aux = self.gpa.alloc(u8, 4 + bytes.len) catch return self.dropPipe(conn_id, token);
+        defer self.gpa.free(aux);
+        std.mem.writeInt(u32, aux[0..4], token, .little);
+        @memcpy(aux[4..], bytes);
+        fdmsg_fn(self.ctx, conn_id, @intFromEnum(stream.FdMsgKind.pipe), &.{}, aux);
+    }
+
+    /// After the own drag's target changed (or the drag ended): held
+    /// receives of offers that are no longer its target read EOF, and the
+    /// embedder hears of a changed drop action.
+    fn settleOwnDrag(self: *Compositor) void {
+        const own = &(self.own_drag orelse return);
+        const drag: ?Drag = if (self.drag) |d| (if (d.own) d else null) else null;
+        var i: usize = 0;
+        while (i < own.held.items.len) {
+            const h = own.held.items[i];
+            const live = (if (drag) |d| d.focus_conn == h.conn and d.isFocusOffer(h.offer) else false) or
+                own.awaitsOn(h.conn, h.offer);
+            if (live) {
+                i += 1;
+                continue;
+            }
+            _ = own.held.orderedRemove(i);
+            self.gpa.free(h.mime);
+            self.dropPipe(h.conn, h.token);
+        }
+        const effect = self.ownDragEffect();
+        if (effect != own.told) {
+            own.told = effect;
+            if (self.drag_action_fn) |f| f(self.ctx, effect);
+        }
+    }
+
+    /// What the own drag's target would do with a drop now: its negotiated
+    /// action (set_actions, v3), or the drag's preferred one if it accepted
+    /// without negotiating (a v1/v2 target); 0 without a target or accept.
+    fn ownDragEffect(self: *Compositor) u32 {
+        const own = self.own_drag orelse return 0;
+        const drag = self.drag orelse return 0;
+        if (!drag.own or drag.focus_surface == 0 or !drag.accepted) return 0;
+        if (drag.negotiated) return drag.action;
+        return if (own.actions & dnd_action_copy != 0) dnd_action_copy else own.actions & dnd_action_move;
+    }
+
+    /// The own drag is over for good: held receives read EOF, the embedder
+    /// is told 0 if it was told an action, the payloads go.
+    fn dropOwnDrag(self: *Compositor) void {
+        const own = &(self.own_drag orelse return);
+        for (own.held.items) |h| self.dropPipe(h.conn, h.token);
+        if (own.told != 0) {
+            if (self.drag_action_fn) |f| f(self.ctx, 0);
+        }
+        own.deinit(self.gpa);
+        self.own_drag = null;
+    }
+
     /// Embedder: the pointer is over (target_conn, target_surface) at x,y —
     /// 0,0 for "over nothing". Sends enter/leave/motion + fresh offers.
     pub fn dragMotion(self: *Compositor, target_conn_id: u32, target_surface_id: u32, time_ms: u32, x_fixed: i32, y_fixed: i32) void {
         const drag = if (self.drag) |*d| d else return;
+        defer if (drag.own) self.settleOwnDrag();
         var conn_id = target_conn_id;
         var surface_id = target_surface_id;
         // null-source drags are client-internal: other clients never see them
-        if (drag.source_id == 0 and conn_id != drag.source_conn) {
+        if (!drag.own and drag.source_id == 0 and conn_id != drag.source_conn) {
             conn_id = 0;
             surface_id = 0;
         }
@@ -4282,7 +4537,13 @@ pub const Compositor = struct {
         if (conn.data_devices.len == 0 or conn.surfaces.get(surface_id) == null) return;
         var mimes: []const []u8 = &.{};
         var actions: u32 = 0;
-        if (drag.source_id != 0) {
+        var sel: Selection = .{ .conn = drag.source_conn, .source = drag.source_id };
+        if (drag.own) {
+            const own = &(self.own_drag orelse return);
+            mimes = own.mimes.items;
+            actions = own.actions;
+            sel = .{ .conn = 0, .source = own.gen, .dnd = true };
+        } else if (drag.source_id != 0) {
             const src_conn = self.conns.get(drag.source_conn) orelse return;
             mimes = (src_conn.source_mimes.get(drag.source_id) orelse return).items;
             actions = src_conn.source_actions.get(drag.source_id) orelse 0;
@@ -4291,17 +4552,21 @@ pub const Compositor = struct {
         drag.focus_surface = surface_id;
         drag.focus_offer_n = 0;
         drag.accepted = false;
+        drag.negotiated = false;
+        drag.action = 0;
         // one enter serial for every data device of the target (wlroots:
         // each gets the enter, with an offer of its own)
         const serial = nextSerial(conn);
         for (conn.data_devices.slice()) |dev| {
             var offer_id: u32 = 0;
-            if (drag.source_id != 0) {
+            if (drag.source_id != 0 or drag.own) {
                 // fresh offer per enter, same recipe as offerSelection: intro
                 // → offer(mime)* → source_actions (v3); registered in
                 // conn.offers so the server's receive interception routes
-                // transfers to the source (out of memory: an enter with none)
-                if (self.newOffer(conn, dev.version, .{ .conn = drag.source_conn, .source = drag.source_id }, false)) |id| {
+                // transfers to the source — or, for the embedder's own drag,
+                // the core answers them (serveOwnDrag) (out of memory: an
+                // enter with none)
+                if (self.newOffer(conn, dev.version, sel, false)) |id| {
                     offer_id = id;
                     self.sendEvent(conn_id, dev.id, "wl_data_device", "data_offer", &.{.{ .new_id = id }});
                     for (mimes) |mime| {
@@ -4323,14 +4588,49 @@ pub const Compositor = struct {
     /// Embedder: button released. A drop lands only on an accepting target;
     /// anything else is a cancel. Transfer + finish route through Conn.offers
     /// afterwards — the session itself ends here either way.
+    /// The embedder's own drag lands only where the target accepted and
+    /// would act (ownDragEffect: what the page's dropEffect showed); its
+    /// payloads must be in by now (setOwnDragData) — none given is none at
+    /// all: held and later receives read EOF, never block. (dragDropBytes:
+    /// the bytes may come after.)
     pub fn dragDrop(self: *Compositor) void {
+        self.dragDropBytes(false);
+    }
+
+    /// dragDrop; `later` (the embedder's own drag only): its payloads come
+    /// after the drop (setOwnDragData) — the drop target's receives on the
+    /// drop's offers wait for them meanwhile. The embedder must give them
+    /// (empty for none) or its receives wait until the next own drag, the
+    /// target's conn closing, or the link going.
+    pub fn dragDropBytes(self: *Compositor, later: bool) void {
         const drag = self.drag orelse return;
-        if (drag.focus_surface == 0 or (drag.source_id != 0 and !drag.accepted)) {
+        if (drag.focus_surface == 0 or (drag.source_id != 0 and !drag.accepted) or
+            (drag.own and self.ownDragEffect() == 0))
+        {
             self.dragCancel();
             return;
         }
+        if (drag.own) {
+            const own = &self.own_drag.?;
+            own.dropped_conn = drag.focus_conn;
+            own.drop_offers = drag.focus_offers;
+            own.drop_offer_n = drag.focus_offer_n;
+            if (own.data == null) {
+                if (later) {
+                    own.awaiting = true;
+                } else {
+                    own.data = .{};
+                    self.answerHeld();
+                }
+            }
+        }
         if (self.conns.get(drag.focus_conn)) |conn| {
             self.seatEvent(drag.focus_conn, &conn.data_devices, "wl_data_device", "drop", &.{}, 1);
+        }
+        if (drag.own) {
+            self.endDrag();
+            self.settleOwnDrag(); // (told 0: the drag is over)
+            return;
         }
         if (drag.source_id != 0) {
             if (self.conns.get(drag.source_conn)) |src_conn| {
@@ -4346,6 +4646,12 @@ pub const Compositor = struct {
     pub fn dragCancel(self: *Compositor) void {
         const drag = if (self.drag) |*d| d else return;
         self.dragLeaveFocus(drag);
+        if (drag.own) {
+            // no source to tell; its receives read EOF, its payloads go
+            self.endDrag();
+            self.dropOwnDrag();
+            return;
+        }
         if (drag.source_id != 0) {
             if (self.conns.get(drag.source_conn)) |_| {
                 self.sendEvent(drag.source_conn, drag.source_id, "wl_data_source", "cancelled", &.{});
@@ -4369,6 +4675,7 @@ pub const Compositor = struct {
     fn endDrag(self: *Compositor) void {
         const drag = self.drag orelse return;
         self.drag = null;
+        if (drag.own) return; // the embedder began it: nothing to revert or tell
         if (drag.icon_surface != 0) {
             if (self.conns.get(drag.source_conn)) |conn| {
                 if (conn.surfaces.getPtr(drag.icon_surface)) |icon| {
@@ -4385,11 +4692,12 @@ pub const Compositor = struct {
     /// Target accepted (or revoked, mime == null) the drag offer.
     fn dragAccept(self: *Compositor, conn_id: u32, offer_id: u32, mime: ?[]const u8) void {
         const drag = if (self.drag) |*d| d else return;
-        if (conn_id != drag.focus_conn or !drag.isFocusOffer(offer_id) or drag.source_id == 0) return;
+        if (conn_id != drag.focus_conn or !drag.isFocusOffer(offer_id) or (drag.source_id == 0 and !drag.own)) return;
         // no source offers a mime over max_mime_len: such an accept names
         // none of the offer's types — a revoke (and `target` echoes it)
         const m: ?[]const u8 = if (mime) |s| (if (s.len > max_mime_len) null else s) else null;
         drag.accepted = m != null;
+        if (drag.own) return self.settleOwnDrag();
         if (self.conns.get(drag.source_conn)) |_| {
             self.sendEvent(drag.source_conn, drag.source_id, "wl_data_source", "target", &.{.{ .string = m }});
         }
@@ -4399,7 +4707,22 @@ pub const Compositor = struct {
     /// to both ends (v3 flow; GTK will not complete a drop without it).
     fn dragOfferActions(self: *Compositor, conn_id: u32, offer_id: u32, actions: u32, preferred: u32) void {
         const drag = if (self.drag) |*d| d else return;
-        if (conn_id != drag.focus_conn or !drag.isFocusOffer(offer_id) or drag.source_id == 0) return;
+        if (conn_id != drag.focus_conn or !drag.isFocusOffer(offer_id) or (drag.source_id == 0 and !drag.own)) return;
+        if (drag.own) {
+            const both = actions & self.own_drag.?.actions;
+            const chosen: u32 = if (preferred & both != 0 and @popCount(preferred) == 1)
+                preferred
+            else if (both & dnd_action_copy != 0)
+                dnd_action_copy
+            else if (both & dnd_action_move != 0)
+                dnd_action_move
+            else
+                0;
+            drag.negotiated = true;
+            drag.action = chosen;
+            self.sendEvent(conn_id, offer_id, "wl_data_offer", "action", &.{.{ .uint = chosen }});
+            return self.settleOwnDrag();
+        }
         const src_conn = self.conns.get(drag.source_conn) orelse return;
         const both = actions & (src_conn.source_actions.get(drag.source_id) orelse 0);
         const chosen: u32 = if (preferred & both != 0)
@@ -4418,8 +4741,16 @@ pub const Compositor = struct {
 
     /// Target's wl_data_offer.finish after a completed transfer. Routed via
     /// the offers map, not drag state — the session is long gone by now.
-    fn dragFinish(self: *Compositor, conn: *Conn, offer_id: u32) void {
+    fn dragFinish(self: *Compositor, conn_id: u32, conn: *Conn, offer_id: u32) void {
         const offer = conn.offers.get(offer_id) orelse return;
+        if (offer.dnd) {
+            // the embedder's drop is read: its payloads can go (another
+            // receive on it now reads EOF)
+            if (self.own_drag) |own| {
+                if (own.gen == offer.source and own.dropped_conn == conn_id) self.dropOwnDrag();
+            }
+            return;
+        }
         const src_conn = self.conns.get(offer.conn) orelse return;
         if (objVersion(src_conn, offer.source) >= 3) {
             self.sendEvent(offer.conn, offer.source, "wl_data_source", "dnd_finished", &.{});
@@ -5706,6 +6037,15 @@ const TestSink = struct {
     touch_conn: u32 = 0,
     touch_bound: ?bool = null,
     touch_bound_calls: u32 = 0,
+    // drag_action_fn: last action + count
+    drag_action: u32 = 0xffffffff,
+    drag_action_calls: u32 = 0,
+
+    fn dragAction(ctx: ?*anyopaque, action: u32) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        self.drag_action = action;
+        self.drag_action_calls += 1;
+    }
 
     fn touchBound(ctx: ?*anyopaque, conn_id: u32, bound: bool) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx.?));
@@ -12003,6 +12343,362 @@ test "dnd: a target with two wl_data_devices — each gets its own offer and the
     comp.onPipeReceive(2, wire.encodeMessage(&buf, e1[1], 1, &.{ .{ .string = "text/plain" }, .fd }), 5);
     try std.testing.expectEqual(@as(u32, 1), sink.fdmsg_conn);
     try std.testing.expectEqual(@as(u32, 5), sink.fdmsg_token);
+}
+
+/// An own-drag test rig: conns 1 and 2 (dndConnSetup), the relay's
+/// selection_cache, the callbacks the own drag uses.
+fn ownDragSetup(sink: *TestSink) !Compositor {
+    var comp = testSetup(sink);
+    errdefer comp.deinit();
+    comp.interactive_fn = TestSink.interactive;
+    comp.fdmsg_fn = TestSink.fdmsg;
+    comp.drag_action_fn = TestSink.dragAction;
+    try dndConnSetup(&comp, 1);
+    try dndConnSetup(&comp, 2);
+    return comp;
+}
+
+const OwnDragT = struct {
+    const dd = protocol.find("wl_data_device").?;
+    const off = protocol.find("wl_data_offer").?;
+
+    /// the offer of conn 2's enter on data device `dev` (0: none seen)
+    fn enterOffer(sk: *const TestSink, dev: u32) !u32 {
+        return enterOffer2(sk, 2, dev);
+    }
+    fn enterOffer2(sk: *const TestSink, conn: u32, dev: u32) !u32 {
+        var vals: [wire.max_args]wire.Value = undefined;
+        for (sk.events.items) |e| {
+            if (e.conn_id != conn or e.object_id != dev or e.opcode != dd.eventIndex("enter").?) continue;
+            return (try wire.decodeArgs(e.bytes[wire.header_size..e.len], &.{ .uint, .object, .fixed, .fixed, .object }, &vals))[4].object;
+        }
+        return 0;
+    }
+    fn count(sk: *const TestSink, conn: u32, obj: u32, opcode: u16) usize {
+        var n: usize = 0;
+        for (sk.events.items) |e| {
+            if (e.conn_id == conn and e.object_id == obj and e.opcode == opcode) n += 1;
+        }
+        return n;
+    }
+    fn receive(comp: *Compositor, offer: u32, mime: []const u8, token: u32) void {
+        var buf: [128]u8 = undefined;
+        comp.onPipeReceive(2, wire.encodeMessage(&buf, offer, 1, &.{ .{ .string = mime }, .fd }), token);
+    }
+    /// the last fdmsg was EOF for `token` (pipe, no wire message, the token alone)
+    fn expectEof(sk: *const TestSink, token: u32) !void {
+        try std.testing.expectEqual(@as(u32, 3), sk.fdmsg_kind);
+        try std.testing.expectEqual(@as(usize, 0), sk.fdmsg_len);
+        try std.testing.expectEqual(@as(usize, 4), sk.fdmsg_aux_len);
+        try std.testing.expectEqual(token, sk.fdmsg_token);
+    }
+    /// the last fdmsg wrote `bytes` into `token`'s pipe (pipe, no wire
+    /// message, aux = token ++ bytes)
+    fn expectWrite(sk: *const TestSink, conn: u32, token: u32, bytes: []const u8) !void {
+        try std.testing.expectEqual(@as(u32, 3), sk.fdmsg_kind);
+        try std.testing.expectEqual(conn, sk.fdmsg_conn);
+        try std.testing.expectEqual(@as(usize, 0), sk.fdmsg_len);
+        try std.testing.expectEqual(4 + bytes.len, sk.fdmsg_aux_len);
+        try std.testing.expectEqual(token, std.mem.readInt(u32, sk.fdmsg_aux[0..4], .little));
+        try std.testing.expectEqualStrings(bytes, sk.fdmsg_aux[4..][0..bytes.len]);
+    }
+};
+
+test "own drag: begun by the embedder (no press, no client source) — offers its types to the target, receives held until the payloads come, actions negotiated without a source, the drop, receives after it, finish frees it" {
+    var sink: TestSink = undefined;
+    var comp = try ownDragSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    const T = OwnDragT;
+    var buf: [128]u8 = undefined;
+
+    // no FEATURE selection_cache: refused, nothing offered (a receive could not be served)
+    try std.testing.expectError(error.Unsupported, comp.beginOwnDrag("text/plain", dnd_action_copy));
+    try std.testing.expect(comp.drag == null);
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+    try std.testing.expectError(error.BadDrag, comp.beginOwnDrag("", dnd_action_copy));
+    try std.testing.expectError(error.BadDrag, comp.beginOwnDrag("text/plain", 4)); // ask only
+    try std.testing.expectError(error.BadDrag, comp.beginOwnDrag("text/plain\x00\x00x", dnd_action_copy));
+    try std.testing.expect(comp.drag == null and comp.own_drag == null);
+
+    try comp.beginOwnDrag("text/plain;charset=utf-8\x00text/plain\x00text/html\x00text/plain", dnd_action_copy | dnd_action_move);
+    try std.testing.expect(comp.drag != null and comp.drag.?.own);
+    try std.testing.expectEqual(@as(usize, 3), comp.own_drag.?.mimes.items.len); // the repeat once
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_calls); // no drag-start: the embedder began it
+    try std.testing.expectError(error.Busy, comp.beginOwnDrag("text/plain", dnd_action_copy));
+
+    // the pointer is the drag's meanwhile
+    sink.events.clearRetainingCapacity();
+    comp.pointerEnter(2, 7, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+
+    // over conn 2: data_offer, offer ×3, source_actions, enter
+    comp.dragMotion(2, 7, 1000, 2560, 5120);
+    try std.testing.expectEqual(@as(usize, 6), sink.events.items.len);
+    const offer = try T.enterOffer(&sink, 11);
+    try std.testing.expect(offer >= objects.server_id_base);
+    try std.testing.expectEqual(@as(usize, 3), T.count(&sink, 2, offer, T.off.eventIndex("offer").?));
+    var vals: [wire.max_args]wire.Value = undefined;
+    const sa = sink.events.items[4];
+    try std.testing.expectEqual(T.off.eventIndex("source_actions").?, sa.opcode);
+    try std.testing.expectEqual(dnd_action_copy | dnd_action_move, (try wire.decodeArgs(sa.bytes[wire.header_size..sa.len], &.{.uint}, &vals))[0].uint);
+    try std.testing.expectEqual(@as(u32, 0), sink.drag_action_calls); // nothing accepted yet
+
+    // a receive before the payloads: held (nothing goes to the relay)
+    const calls = sink.fdmsg_calls;
+    T.receive(&comp, offer, "text/plain", 41);
+    try std.testing.expectEqual(calls, sink.fdmsg_calls);
+    try std.testing.expectEqual(@as(usize, 1), comp.own_drag.?.held.items.len);
+    // a type it does not offer: EOF at once
+    T.receive(&comp, offer, "image/png", 42);
+    try T.expectEof(&sink, 42);
+
+    // accept: the drag's own preference (copy) until the target negotiates;
+    // set_actions picks its preferred (move) — action to the offer, no source to tell
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(2, wire.encodeMessage(&buf, offer, 0, &.{ .{ .uint = 1 }, .{ .string = "text/plain" } }));
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    try std.testing.expectEqual(dnd_action_copy, sink.drag_action);
+    try comp.onWire(2, wire.encodeMessage(&buf, offer, 4, &.{ .{ .uint = dnd_action_copy | dnd_action_move }, .{ .uint = dnd_action_move } }));
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try std.testing.expectEqual(T.off.eventIndex("action").?, sink.events.items[0].opcode);
+    try std.testing.expectEqual(dnd_action_move, sink.drag_action);
+    try std.testing.expectEqual(@as(u32, 2), sink.drag_action_calls);
+    comp.dragMotion(2, 7, 1100, 2600, 5200); // a motion changes nothing told
+    try std.testing.expectEqual(@as(u32, 2), sink.drag_action_calls);
+
+    // the payloads: the held receive is answered (its bytes into its pipe)
+    var pack: [256]u8 = undefined;
+    try comp.setOwnDragData(packOwnSelection(&pack, &.{ .{ "text/plain", "hello" }, .{ "text/plain;charset=utf-8", null }, .{ "text/html", "<b>hi</b>" } }));
+    try T.expectWrite(&sink, 2, 41, "hello");
+    try std.testing.expectEqual(@as(usize, 0), comp.own_drag.?.held.items.len);
+    try std.testing.expectError(error.AlreadySet, comp.setOwnDragData(""));
+
+    // the drop: to the target, the session ends (no drag-end), the action told 0
+    sink.events.clearRetainingCapacity();
+    comp.dragDrop();
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 11, T.dd.eventIndex("drop").?));
+    try std.testing.expect(comp.drag == null);
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_calls);
+    try std.testing.expectEqual(@as(u32, 0), sink.drag_action);
+    // receives after it: from the payloads (aliases share one)
+    T.receive(&comp, offer, "text/html", 43);
+    try T.expectWrite(&sink, 2, 43, "<b>hi</b>");
+    T.receive(&comp, offer, "text/plain;charset=utf-8", 44);
+    try T.expectWrite(&sink, 2, 44, "hello");
+    try std.testing.expectError(error.NoDrag, comp.setOwnDragData(""));
+
+    // finish: read, the payloads go; a later receive reads EOF
+    try comp.onWire(2, wire.encodeMessage(&buf, offer, 3, &.{}));
+    try std.testing.expect(comp.own_drag == null);
+    T.receive(&comp, offer, "text/plain", 45);
+    try T.expectEof(&sink, 45);
+
+    // the pointer is the apps' again
+    sink.events.clearRetainingCapacity();
+    comp.pointerEnter(2, 7, 0, 0);
+    try std.testing.expect(sink.events.items.len > 0);
+}
+
+test "own drag: held receives read EOF when the target is left, at a cancel and at a drop without payloads; two data devices each get an offer; an unaccepted drop, or one with no common action, cancels" {
+    var sink: TestSink = undefined;
+    var comp = try ownDragSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+    const T = OwnDragT;
+    var buf: [128]u8 = undefined;
+    // conn 2's second seat (30) and data device (31) on it, Firefox-style
+    try comp.onWire(2, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 5, .id = 30 } } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, 6, 1, &.{ .{ .new_id = 31 }, .{ .object = 30 } }));
+
+    try comp.beginOwnDrag("text/uri-list", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 0, 256, 256);
+    const o1 = try T.enterOffer(&sink, 11);
+    const o2 = try T.enterOffer(&sink, 31);
+    try std.testing.expect(o1 != 0 and o2 != 0 and o1 != o2);
+    T.receive(&comp, o1, "text/uri-list", 1);
+    T.receive(&comp, o2, "text/uri-list", 2);
+    try std.testing.expectEqual(@as(usize, 2), comp.own_drag.?.held.items.len);
+
+    // off the target: leave on both devices, both held receives read EOF
+    const calls = sink.fdmsg_calls;
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(0, 0, 10, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 11, T.dd.eventIndex("leave").?));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 31, T.dd.eventIndex("leave").?));
+    try std.testing.expectEqual(calls + 2, sink.fdmsg_calls);
+    try T.expectEof(&sink, 2);
+    try std.testing.expectEqual(@as(usize, 0), comp.own_drag.?.held.items.len);
+    // a receive on a left offer now: EOF at once
+    T.receive(&comp, o1, "text/uri-list", 3);
+    try T.expectEof(&sink, 3);
+
+    // back over it: fresh offers; a held receive reads EOF at the cancel
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 20, 256, 256);
+    const o3 = try T.enterOffer(&sink, 11);
+    T.receive(&comp, o3, "text/uri-list", 4);
+    try comp.onWire(2, wire.encodeMessage(&buf, o3, 0, &.{ .{ .uint = 1 }, .{ .string = "text/uri-list" } }));
+    try std.testing.expectEqual(dnd_action_copy, sink.drag_action);
+    sink.events.clearRetainingCapacity();
+    comp.dragCancel();
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 11, T.dd.eventIndex("leave").?));
+    try T.expectEof(&sink, 4);
+    try std.testing.expect(comp.drag == null and comp.own_drag == null);
+    try std.testing.expectEqual(@as(u32, 0), sink.drag_action);
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_calls);
+
+    // dropped with no payloads given: the held receive and later ones read EOF
+    try comp.beginOwnDrag("text/uri-list", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 30, 256, 256);
+    const o4 = try T.enterOffer(&sink, 31);
+    T.receive(&comp, o4, "text/uri-list", 5);
+    try comp.onWire(2, wire.encodeMessage(&buf, o4, 0, &.{ .{ .uint = 1 }, .{ .string = "text/uri-list" } }));
+    try comp.onWire(2, wire.encodeMessage(&buf, o4, 4, &.{ .{ .uint = dnd_action_copy }, .{ .uint = dnd_action_copy } }));
+    sink.events.clearRetainingCapacity();
+    comp.dragDrop();
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 11, T.dd.eventIndex("drop").?));
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 31, T.dd.eventIndex("drop").?));
+    try T.expectEof(&sink, 5);
+    T.receive(&comp, o4, "text/uri-list", 6);
+    try T.expectEof(&sink, 6);
+
+    // not accepted: the drop is a cancel (a leave, no drop)
+    try comp.beginOwnDrag("text/plain", dnd_action_copy);
+    comp.dragMotion(2, 7, 40, 256, 256);
+    sink.events.clearRetainingCapacity();
+    comp.dragDrop();
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 11, T.dd.eventIndex("leave").?));
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 2, 11, T.dd.eventIndex("drop").?));
+    try std.testing.expect(comp.drag == null and comp.own_drag == null);
+
+    // accepted, but the target takes only copy of a move-only drag: action 0, the drop cancels
+    try comp.beginOwnDrag("text/plain", dnd_action_move);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 50, 256, 256);
+    const o5 = try T.enterOffer(&sink, 11);
+    try comp.onWire(2, wire.encodeMessage(&buf, o5, 0, &.{ .{ .uint = 1 }, .{ .string = "text/plain" } }));
+    try std.testing.expectEqual(dnd_action_move, sink.drag_action);
+    try comp.onWire(2, wire.encodeMessage(&buf, o5, 4, &.{ .{ .uint = dnd_action_copy }, .{ .uint = dnd_action_copy } }));
+    try std.testing.expectEqual(@as(u32, 0), sink.drag_action);
+    sink.events.clearRetainingCapacity();
+    comp.dragDrop();
+    try std.testing.expectEqual(@as(usize, 0), T.count(&sink, 2, 11, T.dd.eventIndex("drop").?));
+    try std.testing.expect(comp.drag == null);
+}
+
+test "own drag: a drop whose bytes come after it (a page's files) — the drop target's receives on the drop's offers wait, before and after the drop, and are answered when the bytes come; a next own drag or the target's conn closing reads them EOF" {
+    var sink: TestSink = undefined;
+    var comp = try ownDragSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+    const T = OwnDragT;
+    var buf: [128]u8 = undefined;
+    var pack: [128]u8 = undefined;
+
+    try comp.beginOwnDrag("text/uri-list", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 0, 256, 256);
+    const o = try T.enterOffer(&sink, 11);
+    T.receive(&comp, o, "text/uri-list", 20); // before the drop: held
+    try comp.onWire(2, wire.encodeMessage(&buf, o, 0, &.{ .{ .uint = 1 }, .{ .string = "text/uri-list" } }));
+    const calls = sink.fdmsg_calls;
+    sink.events.clearRetainingCapacity();
+    comp.dragDropBytes(true);
+    try std.testing.expectEqual(@as(usize, 1), T.count(&sink, 2, 11, T.dd.eventIndex("drop").?));
+    try std.testing.expect(comp.drag == null);
+    try std.testing.expectEqual(calls, sink.fdmsg_calls); // still waiting
+    T.receive(&comp, o, "text/uri-list", 21); // after the drop, on the drop's offer: waits too
+    try std.testing.expectEqual(calls, sink.fdmsg_calls);
+    try std.testing.expectEqual(@as(usize, 2), comp.own_drag.?.held.items.len);
+    T.receive(&comp, o + 1, "text/uri-list", 22); // not an offer of the drop: EOF
+    try T.expectEof(&sink, 22);
+    // the bytes: both answered
+    try comp.setOwnDragData(packOwnSelection(&pack, &.{.{ "text/uri-list", "file:///tmp/a.png\r\n" }}));
+    try std.testing.expectEqual(calls + 3, sink.fdmsg_calls);
+    try T.expectWrite(&sink, 2, 21, "file:///tmp/a.png\r\n");
+    try std.testing.expectError(error.AlreadySet, comp.setOwnDragData(""));
+
+    // awaiting bytes that never come: the next own drag reads its receive EOF
+    try comp.beginOwnDrag("image/png", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 10, 256, 256);
+    const o2 = try T.enterOffer(&sink, 11);
+    try comp.onWire(2, wire.encodeMessage(&buf, o2, 0, &.{ .{ .uint = 1 }, .{ .string = "image/png" } }));
+    comp.dragDropBytes(true);
+    T.receive(&comp, o2, "image/png", 30);
+    try std.testing.expectEqual(@as(usize, 1), comp.own_drag.?.held.items.len);
+    try comp.beginOwnDrag("text/plain", dnd_action_copy);
+    try T.expectEof(&sink, 30);
+    comp.dragCancel();
+
+    // ... or the target's conn closing
+    try comp.beginOwnDrag("image/png", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 20, 256, 256);
+    const o3 = try T.enterOffer(&sink, 11);
+    try comp.onWire(2, wire.encodeMessage(&buf, o3, 0, &.{ .{ .uint = 1 }, .{ .string = "image/png" } }));
+    comp.dragDropBytes(true);
+    T.receive(&comp, o3, "image/png", 31);
+    comp.connClose(2);
+    try T.expectEof(&sink, 31);
+    try std.testing.expect(comp.own_drag == null);
+
+    // a plain drop (bytes in, or none): nothing more taken after it
+    try comp.beginOwnDrag("text/plain", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(1, 7, 30, 256, 256);
+    const o4 = try T.enterOffer2(&sink, 1, 11);
+    try comp.onWire(1, wire.encodeMessage(&buf, o4, 0, &.{ .{ .uint = 1 }, .{ .string = "text/plain" } }));
+    comp.dragDrop();
+    try std.testing.expectError(error.NoDrag, comp.setOwnDragData(""));
+}
+
+test "own drag: the target's conn closing reads its held receives EOF (the relay parks fds by token); the drop target's closing frees the payloads; an app's start_drag meanwhile is ignored" {
+    var sink: TestSink = undefined;
+    var comp = try ownDragSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.applyFeature(@intFromEnum(stream.FeatureKind.selection_cache), &.{});
+    const T = OwnDragT;
+    var buf: [128]u8 = undefined;
+
+    try comp.beginOwnDrag("text/plain", dnd_action_copy);
+    // an app's start_drag while it lasts: ignored (one drag at a time)
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, 0, &.{.{ .new_id = 12 }}));
+    comp.dragMotion(1, 7, 0, 0, 0);
+    try comp.onWire(1, wire.encodeMessage(&buf, 11, 0, &.{ .{ .object = 12 }, .{ .object = 7 }, .{ .object = 0 }, .{ .uint = comp.conns.get(1).?.serial } }));
+    try std.testing.expect(comp.drag.?.own);
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_calls);
+
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(2, 7, 10, 256, 256);
+    const o = try T.enterOffer(&sink, 11);
+    T.receive(&comp, o, "text/plain", 7);
+    try comp.onWire(2, wire.encodeMessage(&buf, o, 0, &.{ .{ .uint = 1 }, .{ .string = "text/plain" } }));
+    try std.testing.expectEqual(dnd_action_copy, sink.drag_action);
+    comp.connClose(2);
+    try T.expectEof(&sink, 7);
+    try std.testing.expectEqual(@as(u32, 0), sink.drag_action); // no target now
+    try std.testing.expect(comp.drag != null); // the drag goes on (another target may come)
+    comp.dragCancel();
+
+    // a drop on conn 1, then conn 1 goes: the payloads with it
+    try comp.beginOwnDrag("text/plain", dnd_action_copy);
+    sink.events.clearRetainingCapacity();
+    comp.dragMotion(1, 7, 20, 256, 256);
+    const o1 = try T.enterOffer2(&sink, 1, 11);
+    try comp.onWire(1, wire.encodeMessage(&buf, o1, 0, &.{ .{ .uint = 1 }, .{ .string = "text/plain" } }));
+    var pack: [64]u8 = undefined;
+    try comp.setOwnDragData(packOwnSelection(&pack, &.{.{ "text/plain", "x" }}));
+    comp.dragDrop();
+    try std.testing.expect(comp.own_drag != null);
+    comp.connClose(1);
+    try std.testing.expect(comp.own_drag == null);
 }
 
 /// Records the embedder callbacks a replay makes, one line each, in order.

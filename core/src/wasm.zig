@@ -76,6 +76,11 @@ extern "env" fn js_pointer_lock(conn_id: u32, surface_id: u32) void;
 /// one are ignored (JS sends that client the finger as a pointer). Not told
 /// at the conn's close (js_conn_close is).
 extern "env" fn js_touch_bound(conn_id: u32, bound: u32) void;
+/// What the target of the embedder's own drag (wland_drag_begin) would do
+/// with a drop now changed: 1 copy, 2 move, 0 nothing (no target, not
+/// accepted, no common action) — a page's dropEffect. 0 again when the
+/// drag ends.
+extern "env" fn js_drag_action(action: u32) void;
 /// HANDLE_OPEN (STREAM.md 0x08), decoded. kind 1 = kwshm: a = export id,
 /// b = 0, offset = 0. kind 2 = procfd: a = pid, b = fd, offset = file offset
 /// of handle byte 0. size = the handle's length in bytes (< 2^53, exact as
@@ -139,6 +144,7 @@ export fn wland_init(scale: i32, scale_120: i32, decorations: u32) void {
     compositor.input_region_fn = inputRegion;
     compositor.pointer_lock_fn = pointerLock;
     compositor.touch_bound_fn = touchBound;
+    compositor.drag_action_fn = dragAction;
     compositor.selection_fn = selectionEvent;
     compositor.output_scale = std.math.clamp(scale, 1, 4);
     compositor.scale_120 = @max(1, scale_120);
@@ -491,14 +497,44 @@ export fn wland_drag_motion(conn_id: u32, surface_id: u32, time_ms: u32, x_fixed
     flushOut();
 }
 
-export fn wland_drag_drop() void {
-    compositor.dragDrop();
+/// later = 1 (the embedder's own drag): its bytes come after the drop
+/// (wland_drag_data); the app's reads wait for them. 0 (or absent): they
+/// are in already, or there are none.
+export fn wland_drag_drop(later: u32) void {
+    compositor.dragDropBytes(later != 0);
     flushOut();
 }
 
 export fn wland_drag_cancel() void {
     compositor.dragCancel();
     flushOut();
+}
+
+/// The embedder's own drag (an HTML drag entering the page;
+/// Compositor.beginOwnDrag): ptr/len = the mime types it offers,
+/// NUL-separated; actions = 1 copy | 2 move. Driven by wland_drag_motion /
+/// _drop / _cancel like an app's; no js_interactive for it. 1 = begun, 0 =
+/// refused (malformed, another drag on, or the relay can't write the
+/// embedder's bytes: wland_selection_bridged).
+export fn wland_drag_begin(ptr: [*]const u8, len: usize, actions: u32) u32 {
+    defer flushOut();
+    compositor.beginOwnDrag(ptr[0..len], actions) catch |err| {
+        logf("drag_begin: {t}", .{err});
+        return 0;
+    };
+    return 1;
+}
+
+/// Its payloads (wland_set_selection's packed entries; len 0: none), once,
+/// before wland_drag_drop: held receives are answered. 1 = taken, 0 = not
+/// (no own drag on, given already, malformed).
+export fn wland_drag_data(ptr: [*]const u8, len: usize) u32 {
+    defer flushOut();
+    compositor.setOwnDragData(ptr[0..len]) catch |err| {
+        logf("drag_data: {t}", .{err});
+        return 0;
+    };
+    return 1;
 }
 
 /// JS allocates a buffer inside wasm memory, fills it, then calls wland_on_frame.
@@ -889,6 +925,11 @@ fn pointerLock(ctx: ?*anyopaque, conn_id: u32, surface_id: u32) void {
 fn touchBound(ctx: ?*anyopaque, conn_id: u32, bound: bool) void {
     _ = ctx;
     js_touch_bound(conn_id, @intFromBool(bound));
+}
+
+fn dragAction(ctx: ?*anyopaque, action: u32) void {
+    _ = ctx;
+    js_drag_action(action);
 }
 
 fn setTitle(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, title: []const u8) void {

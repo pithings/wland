@@ -165,6 +165,7 @@ pub const Session = struct {
         c.input_region_fn = evInputRegion;
         c.pointer_lock_fn = evPointerLock;
         c.touch_bound_fn = evTouchBound;
+        c.drag_action_fn = evDragAction;
         c.selection_fn = evSelection;
         return self;
     }
@@ -645,6 +646,13 @@ pub const Session = struct {
         self.endEvent(.touch_bound);
     }
 
+    fn evDragAction(ctx: ?*anyopaque, action: u32) void {
+        const self = of(ctx);
+        const w = self.beginEvent() orelse return;
+        w.u32_(action) catch return;
+        self.endEvent(.drag_action);
+    }
+
     fn evSelection(ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void {
         const self = of(ctx);
         const w = self.beginEvent() orelse return;
@@ -917,8 +925,19 @@ pub const Session = struct {
                 c.setTiled(conn_id, surface_id, edges, w, h);
             },
             .drag_motion => c.dragMotion(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
-            .drag_drop => c.dragDrop(),
+            // (a viewer before `later` sends none: 0)
+            .drag_drop => c.dragDropBytes((a.u32_() catch 0) != 0),
             .drag_cancel => c.dragCancel(),
+            // the embedder's own drag (an HTML drag in the viewer's page):
+            // no synchronous result — refused, the drag_motion/_drop/_cancel
+            // that follow find no own drag (an app's drag is never on while
+            // the viewer's page is in an HTML drag)
+            .drag_begin => {
+                const mimes = try a.bytes();
+                const actions = try a.u32_();
+                c.beginOwnDrag(mimes, actions) catch |err| self.logf("drag_begin: {t}", .{err});
+            },
+            .drag_data => c.setOwnDragData(try a.bytes()) catch |err| self.logf("drag_data: {t}", .{err}),
             .set_selection => {
                 const packed_entries = try a.bytes();
                 const before = self.selection_events;

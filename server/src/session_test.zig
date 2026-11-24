@@ -868,6 +868,92 @@ test "session: touch — touch_bound when the app gets a wl_touch, the touch CAL
     try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(1)), b.frames.items[at].parse().event.args);
 }
 
+test "session: the viewer's own drag — drag_begin offers its types to the app under it, the app's receive (a real pipe) waits for drag_data, then the relay writes the bytes; accept is EVENT drag_action; the drop" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    const c = try rig.connect();
+    const w = try openWindow(&rig, c);
+    const conn: u32 = 1;
+    const ddm = try bind(c, w.registry, "wl_data_device_manager", 3);
+    const device = c.newId();
+    try c.send(ddm, comptime op("wl_data_device_manager", .request, "get_data_device"), &.{ .{ .new_id = device }, .{ .object = w.seat } });
+    try rig.roundtrip(c);
+
+    const a = try rig.viewer();
+    try a.init();
+    try rig.synced(a);
+    const mark = a.frames.items.len;
+    const mime = "text/plain;charset=utf-8";
+    try a.call(.drag_begin, &(le(mime.len) ++ mime.* ++ le(1)));
+    try a.call(.drag_motion, &(le(conn) ++ le(w.surface) ++ le(5) ++ leI(2 * 256) ++ leI(1 * 256)));
+    const Ctx = struct { c: *Client, id: u32, opcode: u16, n: usize };
+    const seen = struct {
+        fn pred(x: Ctx) bool {
+            return x.c.count(x.id, x.opcode) >= x.n;
+        }
+    }.pred;
+    const enter = comptime op("wl_data_device", .event, "enter");
+    try rig.until(Ctx{ .c = c, .id = device, .opcode = enter, .n = 1 }, seen);
+    const e = c.last(device, enter).?;
+    try std.testing.expectEqual(w.surface, std.mem.readInt(u32, e.body[4..8], .little));
+    const offer = std.mem.readInt(u32, e.body[16..20], .little);
+    try std.testing.expect(offer >= 0xff000000);
+    try std.testing.expectEqual(@as(usize, 1), c.count(offer, comptime op("wl_data_offer", .event, "offer")));
+
+    // the app reads at once, through a pipe: nothing is written yet
+    var pfd: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&pfd, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(pfd[0]);
+    try c.sendFd(offer, comptime op("wl_data_offer", .request, "receive"), &.{ .{ .string = mime }, .fd }, pfd[1]);
+    _ = linux.close(pfd[1]);
+    try c.send(offer, comptime op("wl_data_offer", .request, "accept"), &.{ .{ .uint = std.mem.readInt(u32, e.body[0..4], .little) }, .{ .string = mime } });
+    try rig.until(a, struct {
+        fn pred(v: *Viewer) bool {
+            return v.findEvent(0, .drag_action) != null;
+        }
+    }.pred);
+    try std.testing.expectEqualSlices(u8, &le(1), a.frames.items[a.findEvent(mark, .drag_action).?].parse().event.args);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(linux.E.AGAIN, linux.errno(linux.read(pfd[0], &buf, buf.len)));
+
+    // the bytes: the relay writes them into the app's pipe and closes it
+    const data = "dropped text";
+    const entry = le(mime.len) ++ mime.* ++ le(data.len) ++ data.*;
+    try a.call(.drag_data, &(le(entry.len) ++ entry));
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    const io = rig.threaded.io();
+    const deadline = Io.Clock.now(.awake, io).toMilliseconds() + timeout_ms;
+    while (true) {
+        if (Io.Clock.now(.awake, io).toMilliseconds() > deadline) return error.Timeout;
+        const rc = linux.read(pfd[0], &buf, buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) break; // EOF: every write end closed
+                try got.appendSlice(gpa, buf[0..rc]);
+            },
+            .AGAIN, .INTR => {
+                var p = [_]linux.pollfd{.{ .fd = pfd[0], .events = linux.POLL.IN, .revents = 0 }};
+                _ = linux.poll(&p, 1, 50);
+            },
+            else => return error.ReadFailed,
+        }
+    }
+    try std.testing.expectEqualStrings(data, got.items);
+
+    // the drop; the action goes back to 0
+    try a.call(.drag_drop, &.{});
+    try rig.until(Ctx{ .c = c, .id = device, .opcode = comptime op("wl_data_device", .event, "drop"), .n = 1 }, seen);
+    try rig.until(a, struct {
+        fn pred(v: *Viewer) bool {
+            const first = v.findEvent(0, .drag_action) orelse return false;
+            return v.findEvent(first + 1, .drag_action) != null;
+        }
+    }.pred);
+}
+
 fn writeAll(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
