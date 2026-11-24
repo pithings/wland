@@ -2569,3 +2569,475 @@ test "own selection: a conn closing ends its transfers; the link dropping ends e
     try awaitInFlight(&loop, 0);
     try std.testing.expect((try drain(fd3, 'x')).n < 1 << 20);
 }
+
+// ---------------------------------------------------------------------------
+// External buffers (`--external-buffers`, wland_external_buffer_manager_v1):
+// COMMIT kind external, released on the ACK (STREAM.md "Buffer kind 3").
+// ---------------------------------------------------------------------------
+
+const fourcc_argb8888: u32 = 0x34325241;
+const ext_id1: u64 = 0x1122_3344_0000_0001;
+const ext_id2: u64 = 0x1122_3344_0000_0002;
+const external_on: harness.Options = .{ .external_buffers = true, .external_source = true };
+
+fn extManager(c: *Client, w: Window) !u32 {
+    return bind(c, w.registry, "wland_external_buffer_manager_v1", 1);
+}
+
+fn extBuffer(c: *Client, mgr: u32, id: u64, width: i32, height: i32, format: u32, flags: u32) !u32 {
+    const buffer = c.newId();
+    try c.send(mgr, comptime op("wland_external_buffer_manager_v1", .request, "create_buffer"), &.{
+        .{ .new_id = buffer }, .{ .uint = @truncate(id >> 32) }, .{ .uint = @truncate(id) },
+        .{ .int = width },     .{ .int = height },                .{ .uint = format },
+        .{ .uint = flags },
+    });
+    return buffer;
+}
+
+/// The engine's copy of a surface is `width`×`height` of what its stand-in
+/// resolver makes of external buffer `id` (harness `externalPixel`).
+fn expectExternal(loop: *Loop, conn_id: u32, surface: u32, id: u64, width: u32, height: u32) !void {
+    const px = loop.engine.pixels(conn_id, surface) orelse return error.NoPixels;
+    try std.testing.expectEqual(width, px.width);
+    try std.testing.expectEqual(height, px.height);
+    const want = harness.Engine.externalPixel(id);
+    for (0..width * height) |i| try std.testing.expectEqualSlices(u8, &want, px.bytes[i * 4 ..][0..4]);
+}
+
+/// The FEATURE kinds the link opened with, in order (they all precede the
+/// first CONN_OPEN, which is checked to follow them).
+fn featuresFirst(loop: *Loop, out: []u32) ![]u32 {
+    var n: usize = 0;
+    for (loop.engine.frames.items) |f| {
+        if (f.type != .feature) {
+            try std.testing.expectEqual(stream.FrameType.conn_open, f.type);
+            break;
+        }
+        out[n] = f.parse().feature.feature;
+        n += 1;
+    }
+    try std.testing.expectEqual(n, loop.engine.count(.feature));
+    return out[0..n];
+}
+
+fn waitConnClose(loop: *Loop, before: usize) !void {
+    const Ctx = struct { e: *harness.Engine, n: usize };
+    try loop.until(Ctx{ .e = &loop.engine, .n = before }, struct {
+        fn pred(x: Ctx) bool {
+            return x.e.count(.conn_close) > x.n;
+        }
+    }.pred);
+}
+
+test "external: FEATURE external_buffer after the dmabuf frames and selection_cache, before any CONN_OPEN, only with the flag; the global needs it AND an embedder that resolves them" {
+    const F = stream.FeatureKind;
+    const Case = struct { flag: bool, source: bool, dmabuf: bool = false };
+    for ([_]Case{
+        .{ .flag = false, .source = false },
+        .{ .flag = false, .source = true },
+        .{ .flag = true, .source = false },
+        .{ .flag = true, .source = true },
+        .{ .flag = true, .source = true, .dmabuf = true },
+        .{ .flag = false, .source = true, .dmabuf = true },
+    }) |case| {
+        var loop: Loop = undefined;
+        try loop.start(std.testing.allocator, .{ .external_buffers = case.flag, .external_source = case.source, .dmabuf = if (case.dmabuf) readback else null });
+        defer loop.stop();
+        const c = try loop.connect();
+        const w = try openWindow(&loop, c);
+
+        var kinds_buf: [8]u32 = undefined;
+        const kinds = try featuresFirst(&loop, &kinds_buf);
+        var want: [4]u32 = undefined;
+        var n: usize = 0;
+        if (case.dmabuf) {
+            want[n] = @intFromEnum(F.linux_dmabuf);
+            n += 1;
+        }
+        want[n] = @intFromEnum(F.selection_cache);
+        n += 1;
+        if (case.flag) {
+            want[n] = @intFromEnum(F.external_buffer);
+            n += 1;
+            // no bytes
+            try std.testing.expectEqual(@as(usize, 0), loop.engine.last(.feature).?.parse().feature.bytes.len);
+        }
+        try std.testing.expectEqualSlices(u32, want[0..n], kinds);
+        try std.testing.expectEqual(case.flag and case.source, c.globalName(w.registry, "wland_external_buffer_manager_v1") != null);
+        try std.testing.expectEqual(case.dmabuf, c.globalName(w.registry, "zwp_linux_dmabuf_v1") != null);
+    }
+}
+
+test "external: create → attach → damage → commit is a COMMIT kind external after its WIRE, nothing else; release after the ACK, once per busy period; no damage, no COMMIT (released at once); two buffers alternating keep the client's rects" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, external_on); // --buffers copy: the ACK path still runs
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const mgr = try extManager(c, w);
+    const b1 = try extBuffer(c, mgr, ext_id1, 8, 6, fourcc_argb8888, 0);
+    const b2 = try extBuffer(c, mgr, ext_id2, 8, 6, dmabuf.fourcc_xbgr8888, stream.ExternalRef.flag_y_invert);
+    try loop.roundtrip(c);
+
+    const from = loop.engine.frames.items.len;
+    try attach(c, w.surface, b1);
+    try damageAll(c, w.surface, 8, 6);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), framesSince(&loop, from, .commit));
+    try std.testing.expectEqual(@as(usize, 0), framesSince(&loop, from, .buffer) + framesSince(&loop, from, .buffer_lz) + framesSince(&loop, from, .handle_open));
+    const frames = loop.engine.frames.items;
+    var ci: usize = from;
+    while (frames[ci].type != .commit) ci += 1;
+    try std.testing.expectEqual(stream.FrameType.wire, frames[ci - 1].type); // the commit request's
+    try std.testing.expectEqual(@as(u32, @intFromEnum(stream.BufferKind.external)), frames[ci].parse().commit.kind);
+    const seen = loop.engine.external_commits.items[0];
+    try std.testing.expectEqual(@as(u32, 1), seen.serial);
+    try std.testing.expectEqual(conn1, seen.conn_id);
+    try std.testing.expectEqual(w.surface, seen.surface_id);
+    try std.testing.expectEqual(stream.ExternalRef{ .id = ext_id1, .width = 8, .height = 6, .format = fourcc_argb8888, .flags = 0 }, seen.ref);
+    try std.testing.expectEqual(@as(u32, 1), seen.n_rects);
+    try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 8, .h = 6 }, seen.first_rect);
+    try expectExternal(&loop, conn1, w.surface, ext_id1, 8, 6);
+
+    // withheld until the ACK; then exactly one
+    try std.testing.expectEqual(@as(usize, 0), c.count(b1, release_ev));
+    try loop.engine.ack(conn1, 1);
+    try waitReleases(&loop, c, b1, 1);
+
+    // damage without attach: a COMMIT that owes nothing; neither: nothing
+    try damage(c, w.surface, 1, 1, 2, 1);
+    try commit(c, w.surface);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.external_commits.items.len);
+    try std.testing.expectEqual(stream.Rect{ .x = 1, .y = 1, .w = 2, .h = 1 }, loop.engine.external_commits.items[1].first_rect);
+    try loop.engine.ack(conn1, 2);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), c.count(b1, release_ev));
+
+    // attach without damage: nothing new to show, no COMMIT, released at once
+    try attach(c, w.surface, b1);
+    try commit(c, w.surface);
+    try waitReleases(&loop, c, b1, 2);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.external_commits.items.len);
+
+    // the two in turn, partial damage: the client's rects (one kind, one
+    // size: no forced full rect), each released after its own ACK
+    try attach(c, w.surface, b2);
+    try damage(c, w.surface, 2, 2, 3, 3);
+    try commit(c, w.surface); // serial 3
+    try attach(c, w.surface, b1);
+    try damage(c, w.surface, 0, 0, 1, 1);
+    try commit(c, w.surface); // serial 4
+    try loop.settle(c);
+    const ext = loop.engine.external_commits.items;
+    try std.testing.expectEqual(@as(usize, 4), ext.len);
+    try std.testing.expectEqual(@as(u32, 3), ext[2].serial);
+    try std.testing.expectEqual(stream.ExternalRef{ .id = ext_id2, .width = 8, .height = 6, .format = dmabuf.fourcc_xbgr8888, .flags = 1 }, ext[2].ref);
+    try std.testing.expectEqual(stream.Rect{ .x = 2, .y = 2, .w = 3, .h = 3 }, ext[2].first_rect);
+    try std.testing.expectEqual(@as(u32, 4), ext[3].serial);
+    try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 1, .h = 1 }, ext[3].first_rect);
+    try std.testing.expectEqual(@as(usize, 0), c.count(b2, release_ev));
+    try loop.engine.ack(conn1, 4);
+    try waitReleases(&loop, c, b1, 3);
+    try std.testing.expectEqual(@as(usize, 0), c.count(b2, release_ev));
+    try loop.engine.ack(conn1, 3);
+    try waitReleases(&loop, c, b2, 1);
+
+    // re-attached and committed again before the first ACK: one release
+    // for the busy period, after the last ACK
+    try attach(c, w.surface, b2);
+    try damageAll(c, w.surface, 8, 6);
+    try commit(c, w.surface); // 5
+    try attach(c, w.surface, b2);
+    try damageAll(c, w.surface, 8, 6);
+    try commit(c, w.surface); // 6
+    try loop.settle(c);
+    try loop.engine.ack(conn1, 5);
+    try loop.engine.ack(conn1, 99); // a stray serial: ignored
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), c.count(b2, release_ev));
+    try loop.engine.ack(conn1, 6);
+    try waitReleases(&loop, c, b2, 2);
+    try loop.engine.ack(conn1, 6); // a duplicate: ignored
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), c.count(b2, release_ev));
+    try std.testing.expectEqual(@as(usize, 3), c.count(b1, release_ev));
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "external: wl_buffer.destroy before the ACK — no release ever, the ACK is harmless, the surface names nothing; the id may be made again" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, external_on);
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const mgr = try extManager(c, w);
+    const b1 = try extBuffer(c, mgr, ext_id1, 4, 4, fourcc_argb8888, 0);
+    try attach(c, w.surface, b1);
+    try damageAll(c, w.surface, 4, 4);
+    try commit(c, w.surface); // serial 1
+    try c.send(b1, comptime op("wl_buffer", .request, "destroy"), &.{});
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), loop.engine.external_commits.items.len);
+    try loop.engine.ack(conn1, 1);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 0), c.count(b1, release_ev));
+
+    // a commit naming no buffer any more: nothing shown, nothing released
+    try damageAll(c, w.surface, 4, 4);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), loop.engine.external_commits.items.len);
+
+    // the same content id in a new buffer is a buffer like any
+    const b2 = try extBuffer(c, mgr, ext_id1, 4, 4, fourcc_argb8888, 0);
+    try attach(c, w.surface, b2);
+    try damage(c, w.surface, 1, 1, 1, 1);
+    try commit(c, w.surface); // serial 2
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(u32, 2), loop.engine.external_commits.items[1].serial);
+    try loop.engine.ack(conn1, 2);
+    try waitReleases(&loop, c, b2, 1);
+    try std.testing.expectEqual(@as(usize, 0), c.count(b1, release_ev));
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "external: conn close with COMMITs in flight holds nothing; late ACKs ignored; the next app is served on its own serials" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, external_on);
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const mgr = try extManager(c, w);
+    const b1 = try extBuffer(c, mgr, ext_id1, 4, 4, fourcc_argb8888, 0);
+    const b2 = try extBuffer(c, mgr, ext_id2, 4, 4, fourcc_argb8888, 0);
+    for ([_]u32{ b1, b2 }) |b| {
+        try attach(c, w.surface, b);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface);
+    }
+    try c.send(b1, comptime op("wl_buffer", .request, "destroy"), &.{});
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.external_commits.items.len);
+
+    const closes = loop.engine.count(.conn_close);
+    c.close();
+    try waitConnClose(&loop, closes);
+    try loop.engine.ack(conn1, 1);
+    try loop.engine.ack(conn1, 2);
+
+    loop.engine.auto_ack = true;
+    const c2 = try loop.connect();
+    const w2 = try openWindow(&loop, c2);
+    const mgr2 = try extManager(c2, w2);
+    const b3 = try extBuffer(c2, mgr2, ext_id1, 4, 4, fourcc_argb8888, 0);
+    try attach(c2, w2.surface, b3);
+    try damageAll(c2, w2.surface, 4, 4);
+    try commit(c2, w2.surface);
+    try waitReleases(&loop, c2, b3, 1);
+    const seen = loop.engine.external_commits.items[2];
+    try std.testing.expectEqual(@as(u32, 2), seen.conn_id);
+    try std.testing.expectEqual(@as(u32, 1), seen.serial);
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+    // (the testing allocator checks the closed conn left nothing behind)
+}
+
+test "external ⇄ wl_shm on one surface at the same size: each switch of kind ships the whole buffer, the engine shows the new content (copy, procfd, kwshm)" {
+    const dev: i32 = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
+    defer _ = linux.close(dev);
+    for ([_]@import("buffers.zig").Backend{ .copy, .procfd, .{ .kwshm = dev } }) |backend| {
+        var opts = external_on;
+        opts.backend = backend;
+        var loop: Loop = undefined;
+        try loop.start(std.testing.allocator, opts);
+        defer loop.stop();
+        const c = try loop.connect(); // auto-ACK
+        const w = try openWindow(&loop, c);
+        const mgr = try extManager(c, w);
+        var px: [4 * 4 * 4]u8 = undefined;
+        for (&px, 0..) |*b, i| b.* = @truncate(0x80 + i);
+        var shm_fd: i32 = -1;
+        defer _ = linux.close(shm_fd);
+        const sb = try shmBuffer(c, w, &px, 4, 4, &shm_fd);
+        const eb = try extBuffer(c, mgr, ext_id1, 4, 4, dmabuf.fourcc_xrgb8888, 0);
+
+        const Step = struct { buffer: u32, rect: [4]i32, ext: bool };
+        const steps = [_]Step{
+            .{ .buffer = sb, .rect = .{ 0, 0, 4, 4 }, .ext = false },
+            // shm → external, one pixel damaged: the engine gets all of it
+            .{ .buffer = eb, .rect = .{ 1, 1, 1, 1 }, .ext = true },
+            // external → shm, partial: the copy backend's shadow is stale,
+            // a presenter's texture was blanked: all of it again
+            .{ .buffer = sb, .rect = .{ 2, 2, 1, 1 }, .ext = false },
+            .{ .buffer = eb, .rect = .{ 0, 0, 1, 1 }, .ext = true },
+            .{ .buffer = sb, .rect = .{ 0, 0, 4, 4 }, .ext = false },
+        };
+        for (steps) |st| {
+            const commits_before = loop.engine.commits.items.len;
+            const ext_before = loop.engine.external_commits.items.len;
+            const from = loop.engine.frames.items.len;
+            try attach(c, w.surface, st.buffer);
+            try damage(c, w.surface, st.rect[0], st.rect[1], st.rect[2], st.rect[3]);
+            try commit(c, w.surface);
+            try loop.settle(c);
+            if (st.ext) {
+                try std.testing.expectEqual(ext_before + 1, loop.engine.external_commits.items.len);
+                try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 4, .h = 4 }, loop.engine.external_commits.items[ext_before].first_rect);
+                try expectExternal(&loop, conn1, w.surface, ext_id1, 4, 4);
+            } else {
+                if (backend == .copy) {
+                    try std.testing.expectEqual(@as(usize, 1), bufferFramesSince(&loop, from));
+                } else {
+                    try std.testing.expectEqual(commits_before + 1, loop.engine.commits.items.len);
+                    try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 0, .w = 4, .h = 4 }, loop.engine.commits.items[commits_before].first_rect);
+                }
+                try expectRgb(&loop, conn1, w.surface, &px, 0, 4, 4, 16);
+            }
+        }
+        // external again and again: the client's damage alone
+        const ext_before = loop.engine.external_commits.items.len;
+        try attach(c, w.surface, eb);
+        try damageAll(c, w.surface, 4, 4);
+        try commit(c, w.surface);
+        try damage(c, w.surface, 3, 0, 1, 2);
+        try commit(c, w.surface);
+        try loop.settle(c);
+        try std.testing.expectEqual(ext_before + 2, loop.engine.external_commits.items.len);
+        try std.testing.expectEqual(stream.Rect{ .x = 3, .y = 0, .w = 1, .h = 2 }, loop.engine.external_commits.items[ext_before + 1].first_rect);
+        try waitReleases(&loop, c, eb, 3); // one per attach (the last commit had none)
+        try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+        if (backend != .copy) try expectHandlesBalanced(&loop);
+    }
+}
+
+test "external beside handle buffers (procfd): shm by handle, external by id on one conn, one serial space, ACKs in any order" {
+    var opts = external_on;
+    opts.backend = .procfd;
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, opts);
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    const mgr = try extManager(c, w);
+    const es = c.newId();
+    try c.send(w.compositor, comptime op("wl_compositor", .request, "create_surface"), &.{.{ .new_id = es }});
+    var shm_px: [4 * 4 * 4]u8 = undefined;
+    @memset(&shm_px, 0x33);
+    var shm_fd: i32 = -1;
+    defer _ = linux.close(shm_fd);
+    const sb = try shmBuffer(c, w, &shm_px, 4, 4, &shm_fd);
+    const eb = try extBuffer(c, mgr, ext_id2, 2, 2, fourcc_argb8888, 0);
+
+    try attach(c, w.surface, sb);
+    try damageAll(c, w.surface, 4, 4);
+    try commit(c, w.surface); // serial 1: shm
+    try attach(c, es, eb);
+    try damageAll(c, es, 2, 2);
+    try commit(c, es); // serial 2: external
+    try attach(c, w.surface, sb);
+    try damageAll(c, w.surface, 4, 4);
+    try commit(c, w.surface); // serial 3: shm again
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.commits.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.engine.external_commits.items.len);
+    try std.testing.expectEqual(@as(u32, 1), loop.engine.commits.items[0].serial);
+    try std.testing.expectEqual(@as(u32, 2), loop.engine.external_commits.items[0].serial);
+    try std.testing.expectEqual(@as(u32, 3), loop.engine.commits.items[1].serial);
+    try expectExternal(&loop, conn1, es, ext_id2, 2, 2);
+
+    try loop.engine.ack(conn1, 2);
+    try waitReleases(&loop, c, eb, 1);
+    try std.testing.expectEqual(@as(usize, 0), c.count(sb, release_ev));
+    try loop.engine.ack(conn1, 3);
+    try loop.engine.ack(conn1, 1);
+    try waitReleases(&loop, c, sb, 1);
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), c.count(eb, release_ev));
+    try expectHandlesBalanced(&loop);
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "external beside virtgpu on one conn and one surface: FEATURE order, one serial space, one kind of content (no full rect between them), ACKs in any order" {
+    var gpu: Gpu = undefined;
+    gpu.init();
+    defer gpu.deinit();
+    var opts = external_on;
+    opts.dmabuf = gpu.config(); // --buffers copy --dmabuf virtgpu --external-buffers
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, opts);
+    defer loop.stop();
+    loop.engine.auto_ack = false;
+    loop.engine.gpu = &gpu.fake;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+
+    const F = stream.FeatureKind;
+    var kinds_buf: [8]u32 = undefined;
+    try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(F.dmabuf_kind), @intFromEnum(F.linux_dmabuf), @intFromEnum(F.selection_cache), @intFromEnum(F.external_buffer) }, try featuresFirst(&loop, &kinds_buf));
+
+    const dm = try bind(c, w.registry, "zwp_linux_dmabuf_v1", 4);
+    const mgr = try extManager(c, w);
+    var gmem: [4 * 4 * 4]u8 = undefined;
+    const gfd = try patternMemfd("wland-ext-vg", &gmem);
+    defer _ = linux.close(gfd);
+    const gb = try dmabufImmedFlags(c, try dmabufParamsMod(c, dm, gfd, 0, 16, dmabuf.mod_invalid), 4, 4, dmabuf.fourcc_xrgb8888, 0);
+    const eb = try extBuffer(c, mgr, ext_id1, 4, 4, dmabuf.fourcc_xrgb8888, 0);
+
+    try attach(c, w.surface, gb);
+    try damageAll(c, w.surface, 4, 4);
+    try commit(c, w.surface); // serial 1: virtgpu, first: full
+    try attach(c, w.surface, eb);
+    try damage(c, w.surface, 1, 1, 2, 2);
+    try commit(c, w.surface); // serial 2: external, the client's rect
+    try attach(c, w.surface, gb);
+    try damage(c, w.surface, 0, 3, 4, 1);
+    try commit(c, w.surface); // serial 3: virtgpu, the client's rect
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 2), loop.engine.gpu_commits.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.engine.external_commits.items.len);
+    try std.testing.expectEqual(@as(u32, 1), loop.engine.gpu_commits.items[0].serial);
+    try std.testing.expectEqual(@as(u32, 2), loop.engine.external_commits.items[0].serial);
+    try std.testing.expectEqual(@as(u32, 3), loop.engine.gpu_commits.items[1].serial);
+    try std.testing.expectEqual(stream.Rect{ .x = 1, .y = 1, .w = 2, .h = 2 }, loop.engine.external_commits.items[0].first_rect);
+    try std.testing.expectEqual(stream.Rect{ .x = 0, .y = 3, .w = 4, .h = 1 }, loop.engine.gpu_commits.items[1].first_rect);
+
+    try loop.engine.ack(conn1, 2);
+    try waitReleases(&loop, c, eb, 1);
+    try std.testing.expectEqual(@as(usize, 0), c.count(gb, release_ev));
+    try loop.engine.ack(conn1, 3);
+    try loop.engine.ack(conn1, 1);
+    try waitReleases(&loop, c, gb, 1); // one busy period across serials 1 and 3: one release
+    try loop.settle(c);
+    try std.testing.expectEqual(@as(usize, 1), c.count(eb, release_ev));
+    try std.testing.expectEqual(@as(usize, 1), gpu.fake.live()); // gb lives; eb held nothing
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}
+
+test "external: a relay without --external-buffers tracks nothing, even in front of a compositor that offers the global anyway" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .external_source = true }); // the flag is off
+    defer loop.stop();
+    // a confused engine that offers it without the relay's FEATURE
+    loop.engine.comp.external_relay = true;
+    const c = try loop.connect();
+    const w = try openWindow(&loop, c);
+    var kinds_buf: [8]u32 = undefined;
+    try std.testing.expectEqualSlices(u32, &.{@intFromEnum(stream.FeatureKind.selection_cache)}, try featuresFirst(&loop, &kinds_buf));
+    const mgr = try extManager(c, w);
+    const b = try extBuffer(c, mgr, ext_id1, 4, 4, fourcc_argb8888, 0);
+    try attach(c, w.surface, b);
+    try damageAll(c, w.surface, 4, 4);
+    try commit(c, w.surface);
+    try loop.settle(c);
+    // untracked: never presented, never released (as an untracked wl_shm buffer)
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.count(.commit));
+    try std.testing.expectEqual(@as(usize, 0), c.count(b, release_ev));
+    try std.testing.expectEqual(@as(usize, 0), loop.engine.errors);
+}

@@ -181,6 +181,11 @@ pub const FeatureKind = enum(u32) {
     /// EVENT and SURFACE out). Bytes: `u64 session_id` (random per relay
     /// run).
     session = 4,
+    /// The relay tracks wland_external_buffer_manager_v1 buffers (wlandr
+    /// `--external-buffers`) and names them in COMMITs of kind external.
+    /// The compositor advertises the global only with this AND an embedder
+    /// that resolves external buffers. Bytes: none (any are ignored).
+    external_buffer = 5,
 };
 
 /// FEATURE bytes of kind dmabuf_kind: `u32 buffer_kind` (BufferKind, the
@@ -334,6 +339,68 @@ pub const BufferKind = enum(u32) {
     /// pixels anywhere on the link; the engine's embedder resolves the
     /// resource id. wlandr `--dmabuf virtgpu` emits it.
     virtgpu = 2,
+    /// Content only the embedder knows, named by an opaque id the client
+    /// gave (wland_external_buffer_manager_v1.create_buffer): `ExternalRef`.
+    /// wlandr `--external-buffers` emits it.
+    external = 3,
+};
+
+/// Buffer reference of kind external: `len` bytes, then possibly more
+/// (fields are only ever appended; ref_len ≥ len). All of it is the
+/// client's claim from create_buffer; `check` is what the compositor (at
+/// the request), the relay (when it tracks the buffer) and the engine (at
+/// the COMMIT) each hold it to.
+pub const ExternalRef = struct {
+    /// opaque: the client and the embedder agree on it out of band
+    id: u64,
+    /// the wl_buffer's size, buffer px
+    width: u32,
+    height: u32,
+    /// DRM fourcc: one of `formats`
+    format: u32,
+    /// wland_external_buffer_manager_v1 flags: 1 y_invert
+    flags: u32,
+
+    pub const len = 24;
+    /// Neither side over this (as virtgpu's cap: a GL texture's usual
+    /// limit); nothing else bounds what a client claims.
+    pub const max_side = 16384;
+    pub const flag_y_invert = 1;
+    pub const known_flags = flag_y_invert;
+    /// ARGB8888, XRGB8888, ABGR8888, XBGR8888
+    pub const formats = [_]u32{ 0x34325241, 0x34325258, 0x34324241, 0x34324258 };
+
+    pub const Error = error{ BadFormat, BadDimensions, BadFlags };
+
+    /// create_buffer's rules, checked in its error order (format,
+    /// dimensions, flags). width/height as the wire's ints.
+    pub fn checkArgs(width: i32, height: i32, format: u32, flags: u32) Error!void {
+        if (std.mem.indexOfScalar(u32, &formats, format) == null) return error.BadFormat;
+        if (width < 1 or height < 1 or width > max_side or height > max_side) return error.BadDimensions;
+        if (flags & ~@as(u32, known_flags) != 0) return error.BadFlags;
+    }
+
+    pub fn check(self: ExternalRef) Error!void {
+        if (self.width > max_side or self.height > max_side) return error.BadDimensions;
+        return checkArgs(@intCast(self.width), @intCast(self.height), self.format, self.flags);
+    }
+
+    pub fn encode(self: ExternalRef, out: *[len]u8) void {
+        std.mem.writeInt(u64, out[0..8], self.id, .little);
+        inline for (.{ self.width, self.height, self.format, self.flags }, 0..) |v, i|
+            std.mem.writeInt(u32, out[8 + i * 4 ..][0..4], v, .little);
+    }
+
+    pub fn decode(bytes: []const u8) error{BadLength}!ExternalRef {
+        if (bytes.len < len) return error.BadLength;
+        return .{
+            .id = std.mem.readInt(u64, bytes[0..8], .little),
+            .width = std.mem.readInt(u32, bytes[8..12], .little),
+            .height = std.mem.readInt(u32, bytes[12..16], .little),
+            .format = std.mem.readInt(u32, bytes[16..20], .little),
+            .flags = std.mem.readInt(u32, bytes[20..24], .little),
+        };
+    }
 };
 
 /// Buffer reference of kind virtgpu: `len` bytes, then possibly more —
@@ -469,6 +536,20 @@ pub const CommitFrame = struct {
         if (self.kind != @intFromEnum(BufferKind.virtgpu)) return error.BadKind;
         const ref = try VirtgpuRef.decode(self.ref);
         if (ref.resource == 0 or ref.width == 0 or ref.height == 0) return error.BadGeometry;
+        try self.checkRects(ref.width, ref.height);
+        return ref;
+    }
+
+    pub const ExternalError = error{ BadKind, BadLength, BadGeometry } || ExternalRef.Error;
+
+    /// Decode and validate a kind-external notice: a ref of ≥ 24 bytes
+    /// that passes `ExternalRef.check` (format, sides within 1..16384,
+    /// flags), n_rects ≥ 1, every rect non-empty and inside the buffer.
+    /// Any id is valid.
+    pub fn external(self: *const CommitFrame) ExternalError!ExternalRef {
+        if (self.kind != @intFromEnum(BufferKind.external)) return error.BadKind;
+        const ref = try ExternalRef.decode(self.ref);
+        try ref.check();
         try self.checkRects(ref.width, ref.height);
         return ref;
     }
@@ -1103,6 +1184,17 @@ pub fn encodeVirtgpuCommit(out: []u8, conn_id: u32, surface_id: u32, serial: u32
     return encodeCommit(out, conn_id, surface_id, serial, .virtgpu, &ref_bytes, rects);
 }
 
+pub fn externalCommitLen(n_rects: usize) usize {
+    return commit_header_len + ExternalRef.len + n_rects * 16;
+}
+
+/// Write a kind-external COMMIT into `out` (≥ externalCommitLen); returns it.
+pub fn encodeExternalCommit(out: []u8, conn_id: u32, surface_id: u32, serial: u32, ref: ExternalRef, rects: anytype) []u8 {
+    var ref_bytes: [ExternalRef.len]u8 = undefined;
+    ref.encode(&ref_bytes);
+    return encodeCommit(out, conn_id, surface_id, serial, .external, &ref_bytes, rects);
+}
+
 fn encodeCommit(out: []u8, conn_id: u32, surface_id: u32, serial: u32, kind: BufferKind, ref: []const u8, rects: anytype) []u8 {
     const total = commit_header_len + ref.len + rects.len * 16;
     std.debug.assert(out.len >= total);
@@ -1185,6 +1277,10 @@ pub const Batch = struct {
 
     pub fn virtgpuCommit(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, surface_id: u32, serial: u32, ref: VirtgpuRef, rects: anytype) !void {
         _ = encodeVirtgpuCommit(try self.frame(gpa, virtgpuCommitLen(rects.len)), conn_id, surface_id, serial, ref, rects);
+    }
+
+    pub fn externalCommit(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, surface_id: u32, serial: u32, ref: ExternalRef, rects: anytype) !void {
+        _ = encodeExternalCommit(try self.frame(gpa, externalCommitLen(rects.len)), conn_id, surface_id, serial, ref, rects);
     }
 
     pub fn ack(self: *Batch, gpa: std.mem.Allocator, conn_id: u32, serial: u32) !void {
@@ -1586,6 +1682,57 @@ test "virtgpu commit roundtrip, validation, a longer ref from a later relay" {
     @memset(long[61..65], 0xab);
     writeRect(long[65..81], 0, 0, 1, 1);
     try std.testing.expectEqual(ref, try (try parse(&long)).commit.virtgpu());
+}
+
+test "external commit roundtrip, validation, a longer ref from a later relay" {
+    const ref: ExternalRef = .{ .id = 0xdead_beef_0000_0007, .width = 64, .height = 32, .format = 0x34325241, .flags = 1 };
+    const rects = [_]Rect{ .{ .x = 0, .y = 0, .w = 64, .h = 32 }, .{ .x = 3, .y = 4, .w = 5, .h = 6 } };
+    var buf: [25 + 24 + 32]u8 = undefined;
+    const f = encodeExternalCommit(&buf, 3, 9, 11, ref, &rects);
+    try std.testing.expectEqual(externalCommitLen(2), f.len);
+    const c = (try parse(f)).commit;
+    try std.testing.expectEqual(@as(u32, 3), c.kind);
+    try std.testing.expectEqual(ref, try c.external());
+    try std.testing.expectError(error.BadKind, c.virtgpu());
+    try std.testing.expectError(error.BadKind, c.shm());
+    try std.testing.expectEqual(rects[1], c.rectAt(1));
+
+    // a rect past the edge
+    var bad = buf;
+    writeRect(bad[25 + 24 + 16 ..][0..16], 60, 0, 5, 1);
+    try std.testing.expectError(error.BadGeometry, (try parse(&bad)).commit.external());
+
+    // the client's claims: format, sides, flags (create_buffer's error order)
+    const Case = struct { ref: ExternalRef, err: ExternalRef.Error };
+    for ([_]Case{
+        .{ .ref = .{ .id = 1, .width = 64, .height = 32, .format = 0x36314752, .flags = 0 }, .err = error.BadFormat }, // RGB565
+        .{ .ref = .{ .id = 1, .width = 0, .height = 32, .format = 0x34325258, .flags = 0 }, .err = error.BadDimensions },
+        .{ .ref = .{ .id = 1, .width = 64, .height = 16385, .format = 0x34325258, .flags = 0 }, .err = error.BadDimensions },
+        .{ .ref = .{ .id = 1, .width = 0xffff_ffff, .height = 1, .format = 0x34325258, .flags = 0 }, .err = error.BadDimensions },
+        .{ .ref = .{ .id = 1, .width = 64, .height = 32, .format = 0x34325258, .flags = 2 }, .err = error.BadFlags },
+    }) |case| {
+        try std.testing.expectError(case.err, case.ref.check());
+        var rb: [ExternalRef.len]u8 = undefined;
+        case.ref.encode(&rb);
+        var cb: [25 + 24 + 16]u8 = undefined;
+        try std.testing.expectError(case.err, (try parse(encodeCommit(&cb, 3, 9, 12, .external, &rb, rects[1..2]))).commit.external());
+    }
+    try (ExternalRef{ .id = 0, .width = 16384, .height = 16384, .format = 0x34324258, .flags = 0 }).check();
+    try std.testing.expectError(error.BadDimensions, ExternalRef.checkArgs(-1, 4, 0x34325258, 0));
+
+    // ref_len 28: four bytes a later version appended; still decodes
+    var long: [25 + 28 + 16]u8 = undefined;
+    writeCommitHeader(long[0..25], .{ .conn_id = 3, .surface_id = 9, .serial = 13, .n_rects = 1, .kind = 3, .ref_len = 28 });
+    ref.encode(long[25..][0..24]);
+    @memset(long[49..53], 0xab);
+    writeRect(long[53..69], 0, 0, 1, 1);
+    try std.testing.expectEqual(ref, try (try parse(&long)).commit.external());
+    // ...and a short one does not
+    var short: [25 + 20 + 16]u8 = undefined;
+    writeCommitHeader(short[0..25], .{ .conn_id = 3, .surface_id = 9, .serial = 14, .n_rects = 1, .kind = 3, .ref_len = 20 });
+    @memset(short[25..45], 0);
+    writeRect(short[45..61], 0, 0, 1, 1);
+    try std.testing.expectError(error.BadLength, (try parse(&short)).commit.external());
 }
 
 test "hostile lengths are Truncated, never wrapped" {

@@ -28,16 +28,16 @@ const Session = @import("session.zig").Session;
 
 // The usage text matches the build: a -Dhttp=false relay has no HTTP options.
 const usage_synopsis = if (build_options.http)
-    \\usage: wlandr [--port N] [--host ADDR] [--web-root DIR] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--profile MODE]
+    \\usage: wlandr [--port N] [--host ADDR] [--web-root DIR] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--profile MODE] [--external-buffers]
     \\                 serve the browser compositor (HTTP + /ws)
-    \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE]
+    \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE] [--external-buffers]
     \\                 serve one engine over a byte stream, no HTTP
     \\       wlandr --version
     \\                 print the version and this build's features (below), exit 0
     \\
     \\
 else
-    \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE]
+    \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE] [--external-buffers]
     \\                 serve one engine over a byte stream (this build has no HTTP server: --link is required)
     \\       wlandr --version
     \\                 print the version and this build's features (below), exit 0
@@ -90,12 +90,16 @@ const usage_link =
     \\  --no-fence-wait  with --dmabuf virtgpu: send each COMMIT without first waiting (up to 100 ms)
     \\                   for the dmabuf's implicit write fences — for a device that delivers GPU work
     \\                   to the page ahead of the link's COMMIT on its own (unkernel: one channel)
+    \\  --external-buffers  offer wland_external_buffer_manager_v1 (default: off, not advertised):
+    \\                   wl_buffers named by an opaque id the page resolves to an image (COMMIT kind
+    \\                   external, released on the page's ACK; no fd, no pixels). Advertised only by
+    \\                   a page that resolves them; any --buffers and --dmabuf mode
     \\  --profile MODE   who runs the compositor (default passthrough):
     \\                   passthrough  the engine (the page's wasm core); apps go when its link does
     \\                   session      this relay: apps outlive links, the engine is a viewer that
     \\                                is sent the scene and sends input (one at a time, the newest
     \\                                takes over). Needs --buffers copy and --dmabuf off or readback;
-    \\                                not with --link-on-demand
+    \\                                not with --link-on-demand or --external-buffers
     ++ (if (build_options.session) "\n" else "\n                                (left out of this build: -Dsession=false)\n") ++
     \\  --xwayland MODE  X11 apps through xwayland-satellite, started with the first X client:
     \\
@@ -124,7 +128,7 @@ const usage_tail =
     \\--version prints `wlandr VERSION`, then `features:` and space-separated tokens, one per thing
     \\this build supports (tokens are only ever added): http, link:fd, link:unix, link:vsock,
     \\buffers:MODE and dmabuf:MODE per mode above, no-fence-wait, selection_cache, xwayland,
-    \\link-on-demand, profile:session.
+    \\link-on-demand, profile:session, external-buffers.
     \\
 ;
 const usage = usage_synopsis ++ usage_display ++ usage_http ++ usage_link ++ usage_xwayland_default ++ usage_tail;
@@ -141,9 +145,9 @@ const features = blk: {
     for (@typeInfo(std.meta.Tag(dmabuf.Backend)).@"enum".fields) |m| f = f ++ " dmabuf:" ++ m.name;
     // --no-fence-wait; STREAM FEATURE selection_cache (the clipboard
     // bridge); --xwayland; --link-on-demand (with --link-timeout);
-    // --profile session
-    // (-Dsession=false builds lack the last)
-    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand" ++ (if (build_options.session) " profile:session" else "");
+    // --profile session (-Dsession=false builds lack it);
+    // --external-buffers
+    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand" ++ (if (build_options.session) " profile:session" else "") ++ " external-buffers";
 };
 const version_text = "wlandr " ++ build_options.version ++ "\nfeatures: " ++ features ++ "\n";
 
@@ -194,6 +198,8 @@ const Options = struct {
     link_timeout_given: bool = false,
     /// --profile: who runs the compositor
     profile: Profile = .passthrough,
+    /// --external-buffers: track wland_external_buffer_manager_v1 buffers
+    external_buffers: bool = false,
     http_address: Io.net.IpAddress = undefined,
 };
 
@@ -255,6 +261,8 @@ fn parseArgs(args: anytype, out: anytype) !Options {
             o.fence_wait = false;
         } else if (std.mem.eql(u8, arg, "--link-on-demand")) {
             o.on_demand = true;
+        } else if (std.mem.eql(u8, arg, "--external-buffers")) {
+            o.external_buffers = true;
         } else if (std.mem.eql(u8, arg, "--link-timeout")) {
             const ms = args.next() orelse return error.MissingLinkTimeoutValue;
             o.link_timeout_ms = std.fmt.parseInt(u32, ms, 10) catch 0;
@@ -328,6 +336,12 @@ fn parseArgs(args: anytype, out: anytype) !Options {
             // here), so nothing would ever ask for the dial
             out.print("--profile session does not take --link-on-demand: apps never wait for a link there\n\n" ++ usage, .{});
             return error.SessionNotOnDemand;
+        }
+        if (o.external_buffers) {
+            // the session host keeps a copy of every surface's pixels for
+            // the next viewer; an external buffer has none to keep
+            out.print("--profile session does not take --external-buffers (a session keeps pixels; an external buffer has none)\n\n" ++ usage, .{});
+            return error.SessionNoExternalBuffers;
         }
     }
     if (!o.fence_wait and (o.dmabuf == null or o.dmabuf.?.tag != .virtgpu)) {
@@ -417,7 +431,7 @@ pub fn main(init: std.process.Init) !void {
 
     // the relay lives as long as the process; threads keep its address
     const relay = try gpa.create(relay_mod.Relay);
-    relay.* = .{ .io = io, .gpa = gpa, .backend = backend, .dmabuf = dmabuf_config };
+    relay.* = .{ .io = io, .gpa = gpa, .backend = backend, .dmabuf = dmabuf_config, .external = opts.external_buffers };
     if (opts.on_demand) relay.on_demand = .{ .link_text = link_text };
     var wayland = try relay_mod.listenWayland(io, socket_path);
     // session: the compositor runs here, on the relay's one lifelong link,
@@ -438,6 +452,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (dmabuf_config) |cfg| logDmabuf(cfg);
+    if (opts.external_buffers) std.log.info("external buffers: on (wland_external_buffer_manager_v1, offered by a page that resolves them; COMMIT kind external)", .{});
 
     // bind everything before announcing: lib/index.ts (the npm CLI) waits
     // for the "wayland socket:" line as its ready signal
@@ -914,11 +929,21 @@ test "arguments are validated whole, whatever their order, before anything is op
         try std.testing.expectError(error.SessionNeedsCopy, tryArgs(&.{ "--profile", "session", "--link", "vsock:2:1", "--buffers", "kwshm" }));
         try std.testing.expectError(error.SessionNeedsReadback, tryArgs(&.{ "--profile", "session", "--link", "fd:3", "--dmabuf", "virtgpu" }));
         try std.testing.expectError(error.SessionNotOnDemand, tryArgs(&.{ "--profile", "session", "--link", "unix:/x", "--link-on-demand" }));
+        try std.testing.expectError(error.SessionNoExternalBuffers, tryArgs(&.{ "--profile", "session", "--link", "fd:3", "--external-buffers" }));
+        try std.testing.expectError(error.SessionNoExternalBuffers, tryArgs(&.{ "--external-buffers", "--profile", "session", "--link", "fd:3", "--dmabuf", "readback" }));
         if (build_options.http) try std.testing.expectEqual(Profile.session, (try tryArgs(&.{ "--profile", "session", "--port", "0" })).profile);
     } else {
         // -Dsession=false: the flag is known, the profile is not there
         try std.testing.expectError(error.SessionNotBuilt, tryArgs(&.{ "--link", "fd:3", "--profile", "session" }));
     }
+    // --external-buffers: off by default, beside any --buffers and --dmabuf mode
+    try std.testing.expect(!(try tryArgs(&.{ "--link", "fd:3" })).external_buffers);
+    try std.testing.expect((try tryArgs(&.{ "--link", "fd:3", "--external-buffers" })).external_buffers);
+    try std.testing.expect((try tryArgs(&.{ "--external-buffers", "--link", "fd:3", "--buffers", "copy", "--dmabuf", "readback" })).external_buffers);
+    try std.testing.expect((try tryArgs(&.{ "--link", "vsock:2:1023", "--buffers", "kwshm", "--dmabuf", "virtgpu", "--external-buffers", "--no-fence-wait" })).external_buffers);
+    try std.testing.expect((try tryArgs(&.{ "--link-on-demand", "--link", "unix:/run/l", "--buffers", "procfd", "--external-buffers" })).external_buffers);
+    try std.testing.expect((try tryArgs(&.{ "--link", "fd:3", "--profile", "passthrough", "--external-buffers" })).external_buffers);
+    if (build_options.http) try std.testing.expect((try tryArgs(&.{ "--external-buffers", "--port", "0" })).external_buffers);
     const o = try tryArgs(&.{ "--link", "vsock:2:1023", "--buffers", "kwshm", "--dmabuf", "virtgpu:/dev/dri/renderD129" });
     try std.testing.expectEqual(buffers.Kind.kwshm, o.buffer_mode);
     try std.testing.expectEqual(std.meta.Tag(dmabuf.Backend).virtgpu, o.dmabuf.?.tag);
@@ -943,7 +968,8 @@ test "the usage text matches the build" {
     try std.testing.expectEqual(build_options.http, has("--host ADDR"));
     try std.testing.expectEqual(build_options.http, has("--web-root DIR"));
     // the synopsis names every mode flag
-    try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE]"));
+    try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE] [--external-buffers]"));
+    try std.testing.expect(has("--external-buffers  offer wland_external_buffer_manager_v1"));
     try std.testing.expect(has("--profile MODE   who runs the compositor"));
     try std.testing.expect(has("--link-timeout MS  with --link-on-demand"));
     // the refusal line embedders match is the one documented
@@ -969,7 +995,7 @@ test "--version: the build's version, then one token per feature of this build" 
         }
     }.f;
     try std.testing.expectEqual(build_options.http, has(line, "http"));
-    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand" }) |t|
+    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand", "external-buffers" }) |t|
         try std.testing.expect(has(line, t));
     try std.testing.expectEqual(build_options.session, has(line, "profile:session"));
     try std.testing.expect(std.mem.indexOf(u8, line, "@fake") == null); // test-only, never offered

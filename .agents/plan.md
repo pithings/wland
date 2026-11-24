@@ -319,6 +319,38 @@ wayland app ──unix socket──► relay ──link (WS | stream)──► e
     (the relay logs the first buffer of each kind and every refusal).
   - Open: that first run (unkernel's handoff); real-GPU verification of
     readback.
+- **External buffers** (unkernel's ask, 2026-11-24: guest Vulkan frames
+  live only on the page as GPUTextures; the wl_shm round trip cost 9-13 ms
+  a frame), done: `wland_external_buffer_manager_v1` (our own protocol,
+  `protocol/wland-external-buffer-v1.xml`) makes a wl_buffer from a u64 id,
+  size, DRM fourcc and y_invert — no fd, no pixels. Not a dmabuf_kind:
+  linux-dmabuf needs plane fds and one relay has one dmabuf kind, and
+  virtgpu must work beside it. Core: the global and its protocol errors,
+  offered only with FEATURE 5 external_buffer AND an embedder that
+  resolves (`wland_set_gpu_source` mask bit 1), bind refused otherwise —
+  its presence is the client's capability signal. Relay:
+  `wlandr --external-buffers` (any `--buffers`/`--dmabuf`; not session;
+  `features:` token), buffers tracked from `create_buffer`, COMMIT kind 3
+  (`ExternalRef`, 24 bytes) on the conn's serials and ACK ledger, release
+  after the ACK. Lib: `GpuSource.resolveExternal(ref: ExternalRef, …)` on
+  the same `gpu` option (`resolve` now optional; each method's presence is
+  what is offered), commit events carry `external`, `Engine.externalBuffers()`,
+  headless too. Reviewed before coding by a second agent (size cap, the
+  bind gate, the ACK path under copy, id lifetime, no `GpuRef` union).
+  Checked: core tests (gating matrix, errors), relay harness (ledger,
+  destroy before ACK, conn close in flight, beside procfd/kwshm/virtgpu,
+  kind switches), engine/headless/core-abi/session unit tests, headless-e2e
+  with the `external` fixture on `--dmabuf virtgpu:@fake
+  --external-buffers` (promise and sync resolves, a GPU client beside it,
+  a resolver-less page → wl_shm). unkernel's first run (2026-11-24, its
+  Vulkan ICD, software WebGPU, these builds before the commit): vkcube
+  end to end — every present an external commit, a synchronous resolver
+  (GPUTexture blitted into a WebGPU OffscreenCanvas,
+  `transferToImageBitmap`, ~0.1 ms a frame), right pixels in the browser
+  view and headless, the gating as specified (older relay, no flag, weston
+  nested in the guest → wl_shm), external ⇄ wl_shm switches. Not checked
+  anywhere: pre-multiplied alpha end to end, a real GPU, a headed browser;
+  run-poc has no external mode.
 - **Embedder asks from unkernel (2026-11-21), lib side**, done:
   `HandleSource.readv` (all spans of a COMMIT in one call, one promise:
   one worker round trip per commit, damaged spans only) and
@@ -602,6 +634,11 @@ Any of them is fair game to lift.
   page that accepts and only then fails to load the compositor shows up as
   a link drop, its apps dropped. A `--dmabuf` node missing at a dial means
   that link never offers linux-dmabuf (FEATURE is first on a link).
+- External buffers (`--external-buffers`): ids are not scoped by client
+  (any client that binds the global can name any id; the embedder's
+  business), the relay keeps nothing alive for an id, a pending
+  `resolveExternal` promise stalls the whole link with no timeout, not on
+  session links, X11 clients never use it.
 - GPU clients only with a `--dmabuf` backend: readback (copy mode; LINEAR
   ARGB/XRGB8888; no y_invert; v1/v2 binders get no formats) or virtgpu (a
   virtio-gpu node only; [AX]RGB/[AX]BGR8888, implicit or LINEAR, one

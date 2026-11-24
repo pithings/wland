@@ -482,6 +482,54 @@ test('FEATURE dmabuf_kind (virtgpu) before linux_dmabuf: offered only by an engi
   assert.equal(readback.refused, 0);
 });
 
+test('EngineOptions.gpu\'s resolvers set what the compositor offers: resolve → linux-dmabuf before a virtgpu relay, resolveExternal → wland_external_buffer_manager_v1 with FEATURE external_buffer; externalBuffers() null until known, then true/false, again on every link', async () => {
+  const table = new Uint8Array([...u32s(0xe280, 0), ...u32s(0x34325258, 0, 0, 0)]);
+  const linuxDmabuf = frame(0x0c, u32s(1, table.length), table);
+  const dmabufKind = frame(0x0c, u32s(2, 4, 2));
+  const external = frame(0x0c, u32s(5, 0));
+  const shapes = {
+    none: undefined,
+    resolve: { resolve: () => null },
+    resolveExternal: { resolveExternal: () => null },
+    both: { resolve: () => null, resolveExternal: () => null },
+  };
+  for (const [name, gpu] of Object.entries(shapes)) {
+    const hasExt = name === 'resolveExternal' || name === 'both';
+    const hasVirt = name === 'resolve' || name === 'both';
+    const link = scriptedLink();
+    const errors: string[] = [];
+    const engine = await createEngine({ wasm, link, gpu, onEvent: (ev) => { if (ev.type === 'error') errors.push(ev.detail); } });
+    assert.equal(engine.externalBuffers(), null, `${name}: no link`);
+    engine.start();
+    const states: (boolean | null)[] = [];
+    const offered: { ext: boolean; dmabuf: boolean }[] = [];
+    // three links: FEATURE external_buffer (alone first, then an app), the
+    // same again (a reconnect), then a relay without it
+    for (const features of [[dmabufKind, linuxDmabuf, external], [dmabufKind, linuxDmabuf, external], [dmabufKind, linuxDmabuf]]) {
+      link.sent.length = 0;
+      link.cb!.onOpen();
+      states.push(engine.externalBuffers());
+      link.cb!.onMessage(pack(...features));
+      states.push(engine.externalBuffers());
+      link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, msg(1, 1, 2))));
+      states.push(engine.externalBuffers());
+      const g = globals(link.sent, 2);
+      assert.ok(g.wl_compositor && g.wl_shm, `${name}: the rest is there`);
+      if (g.wland_external_buffer_manager_v1) assert.equal(g.wland_external_buffer_manager_v1.version, 1);
+      offered.push({ ext: !!g.wland_external_buffer_manager_v1, dmabuf: !!g.zwp_linux_dmabuf_v1 });
+      link.cb!.onClose({ takenOver: false });
+    }
+    assert.equal(engine.externalBuffers(), null, `${name}: closed`);
+    const settled = hasExt ? [null, true, true] : [null, null, false];
+    assert.deepEqual(states, [...settled, ...settled, null, null, false], name);
+    assert.deepEqual(offered, [
+      { ext: hasExt, dmabuf: hasVirt }, { ext: hasExt, dmabuf: hasVirt }, { ext: false, dmabuf: hasVirt },
+    ], name);
+    assert.deepEqual(errors, []);
+    engine.dispose();
+  }
+});
+
 // every wayland event the engine sent to `conn`: [object, opcode, ...arg words]
 function wireEvents(sent: Uint8Array[], conn: number): number[][] {
   const out: number[][] = [];

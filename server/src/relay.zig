@@ -24,7 +24,7 @@
 //! ledger, surfaces, the backend's handles — belongs to its app thread alone
 //! and is never locked (virtgpu's GEM-handle counts are relay-wide and lock
 //! inside virtgpu.Importer). The engine's ACKs (handle backends, virtgpu
-//! dmabufs) arrive on the link thread, which does not touch that state: it appends the serial to the
+//! dmabufs, external buffers) arrive on the link thread, which does not touch that state: it appends the serial to the
 //! conn's AppLink queue (`ack_mutex`, held only for the append/swap) and
 //! signals the conn's eventfd; the app thread, polling the app socket and
 //! that eventfd, takes the queue and settles the ACKs itself. So every
@@ -61,6 +61,12 @@ pub const Relay = struct {
     /// once their link is attached (serveApp), never before.
     /// readback needs `backend == .copy` (main.zig checks).
     dmabuf: ?dmabuf.Config = null,
+    /// `--external-buffers`: the relay tracks wland_external_buffer_manager_v1
+    /// buffers and names each commit of one in a COMMIT of kind external
+    /// (FEATURE external_buffer, first on every link, lets the compositor
+    /// offer the global — only if its embedder resolves such ids). Any
+    /// buffer and dmabuf backend; fixed for the relay's life.
+    external: bool = false,
     /// Handle backends: handle ids are never reused within a run (≥ 1).
     next_handle_id: std.atomic.Value(u32) = .init(1),
     /// `--link-on-demand` (main.zig): the link is dialed for waiting apps.
@@ -237,8 +243,8 @@ const AppLink = struct {
     refs: u32 = 1,
     /// ACK serials the link thread hands to this conn's app thread (see the
     /// file comment). `ack_fd` is an eventfd the app thread polls beside the
-    /// app socket; -1 when this relay sends no COMMIT (copy buffers and no
-    /// virtgpu dmabufs): nothing is ever ACKed.
+    /// app socket; -1 when this relay sends no COMMIT (copy buffers, no
+    /// virtgpu dmabufs, no external buffers): nothing is ever ACKed.
     ack_mutex: Io.Mutex = .init,
     acks: std.ArrayList(u32) = .empty,
     ack_fd: i32 = -1,
@@ -329,11 +335,13 @@ pub fn serveLink(relay: *Relay, link: *Link) void {
     // CONN_OPEN): the engine's compositor offers dmabuf from it
     {
         // the dmabuf backend's (if any), then selection_cache: own-selection
-        // payloads cross once (FDMSG own_pipe)
-        var out: [dmabuf.Config.max_features_len + stream.feature_header_len]u8 = undefined;
-        const n = if (relay.dmabuf) |cfg| cfg.featureFrames(out[0..dmabuf.Config.max_features_len]).len else 0;
-        const cache = stream.encodeFeature(out[n..], .selection_cache, &.{});
-        link.send(out[0 .. n + cache.len]) catch {}; // a dead link fails its recv below
+        // payloads cross once (FDMSG own_pipe), then external_buffer
+        // (--external-buffers; no bytes)
+        var out: [dmabuf.Config.max_features_len + 2 * stream.feature_header_len]u8 = undefined;
+        var n = if (relay.dmabuf) |cfg| cfg.featureFrames(out[0..dmabuf.Config.max_features_len]).len else 0;
+        n += stream.encodeFeature(out[n..], .selection_cache, &.{}).len;
+        if (relay.external) n += stream.encodeFeature(out[n..], .external_buffer, &.{}).len;
+        link.send(out[0..n]) catch {}; // a dead link fails its recv below
     }
     relay.mutex.lockUncancelable(io);
     while (relay.link) |old| {
@@ -422,8 +430,8 @@ const AppConn = struct {
     /// DMABUF_CREATED names the server wl_buffer id (adoptCreated).
     dmabuf_creates: std.AutoHashMapUnmanaged(u32, *dmabuf.Buffer) = .empty,
     surfaces: std.AutoHashMapUnmanaged(u32, SurfaceState) = .empty,
-    /// COMMIT notices not yet ACKed (handle backends, dmabuf virtgpu; a
-    /// handful at most, so a list).
+    /// COMMIT notices not yet ACKed (handle backends, dmabuf virtgpu,
+    /// external buffers; a handful at most, so a list).
     pending: std.ArrayList(Pending) = .empty,
     /// The next COMMIT's serial: 1, 2, 3, … (never 0), one space for every
     /// COMMIT of this conn whatever its kind (STREAM.md).
@@ -498,6 +506,7 @@ const AppConn = struct {
                 d.deinit(self.relay.gpa);
                 self.relay.gpa.destroy(d);
             },
+            .external => {}, // an id: nothing held
         }
     }
 
@@ -511,7 +520,7 @@ const AppConn = struct {
         // forgets the conn's COMMITs with it)
         for (self.pending.items) |p| switch (p.hold) {
             .gem => |g| g.importer.unref(g.handle),
-            .backend => {},
+            .backend, .none => {},
         };
         self.pending.deinit(gpa);
         self.acks_taken.deinit(gpa);
@@ -553,6 +562,10 @@ const Tracked = struct {
         shm: shm.Buffer,
         /// zwp_linux_buffer_params_v1.create/create_immed (owned)
         dmabuf: *dmabuf.Buffer,
+        /// wland_external_buffer_manager_v1.create_buffer (`--external-buffers`):
+        /// the client's id and claims, checked as the compositor checks
+        /// them; no fd, nothing to free
+        external: stream.ExternalRef,
     };
 };
 
@@ -567,6 +580,9 @@ const Pending = struct {
         backend: u32,
         /// dmabuf virtgpu: a reference on the resource's GEM handle
         gem: struct { importer: *virtgpu.Importer, handle: u32 },
+        /// nothing (an external buffer: the relay holds nothing for an id;
+        /// the ACK only settles the release)
+        none,
     },
 };
 
@@ -615,7 +631,8 @@ const SurfaceState = struct {
         none,
         /// BUFFER frames or a COMMIT of kind shm (wl_shm, readback dmabufs)
         pixels,
-        /// a COMMIT of kind virtgpu
+        /// a COMMIT of kind virtgpu or external: an image the embedder
+        /// resolved (one kind: moving between them needs no full rect)
         resource,
     };
 
@@ -654,7 +671,7 @@ pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
     const link = relay.link.?;
     // relay.dmabuf is read only now, with a link attached: an on-demand
     // dial may have set it (see its field)
-    const commits = relay.backend != .copy or if (relay.dmabuf) |cfg| cfg.backend.sendsCommits() else false;
+    const commits = relay.backend != .copy or relay.external or if (relay.dmabuf) |cfg| cfg.backend.sendsCommits() else false;
     if (commits) {
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         if (linux.errno(rc) != .SUCCESS) {
@@ -829,6 +846,7 @@ fn ackCommit(conn: *AppConn, serial: u32) !void {
         switch (p.hold) {
             .backend => |token| try conn.pixels.acked(token, &conn.batch),
             .gem => |g| g.importer.unref(g.handle),
+            .none => {},
         }
         return;
     }
@@ -1027,6 +1045,24 @@ fn handleAppMessage(conn: *AppConn, header: wire.Header, msg_bytes: []const u8) 
                     params.deinit();
                 }
             }
+        } else if (std.mem.eql(u8, iname, "wland_external_buffer_manager_v1") and std.mem.eql(u8, msg.name, "create_buffer")) {
+            // args: buffer, id_hi, id_lo, width, height, format, flags.
+            // Without --external-buffers the compositor never offered the
+            // global (a bind of it is its protocol error): nothing to track.
+            // A buffer breaking create_buffer's rules is the compositor's
+            // protocol error too, and is never tracked either.
+            if (conn.relay.external) track: {
+                stream.ExternalRef.checkArgs(args[3].int, args[4].int, args[5].uint, args[6].uint) catch break :track;
+                const ref: stream.ExternalRef = .{
+                    .id = (@as(u64, args[1].uint) << 32) | args[2].uint,
+                    .width = @intCast(args[3].int),
+                    .height = @intCast(args[4].int),
+                    .format = args[5].uint,
+                    .flags = args[6].uint,
+                };
+                const old = try conn.buffers.fetchPut(gpa, args[0].new_id, .{ .source = .{ .external = ref } });
+                if (old) |kv| try conn.forgetBuffer(kv.key, kv.value); // a live id reused: client bug
+            }
         } else if (std.mem.eql(u8, iname, "wl_buffer") and msg.destructor) {
             if (conn.buffers.fetchRemove(header.object_id)) |kv| try conn.forgetBuffer(kv.key, kv.value);
             // a server id (params.create) is never reused: drop its type too
@@ -1115,8 +1151,9 @@ fn handleAppMessage(conn: *AppConn, header: wire.Header, msg_bytes: []const u8) 
 /// owed; the backend presents the commit (or doesn't), and a COMMIT notice
 /// makes B busy until the engine ACKs it; then `settleRelease` decides.
 /// COMMIT notices come from the buffer backend (handles: shm buffers) or
-/// straight from here (dmabuf virtgpu: a named resource) — one serial
-/// space and one ACK ledger per conn either way.
+/// straight from here (dmabuf virtgpu: a named resource; external buffers:
+/// the client's id) — one serial space and one ACK ledger per conn either
+/// way.
 /// Ordering: everything here runs while the app's `wl_surface.commit` is
 /// handled, after that request's WIRE was appended to the burst; nothing is
 /// deferred or reordered, so a COMMIT reaches the link after the commit
@@ -1134,6 +1171,7 @@ fn finishCommit(conn: *AppConn, surface_id: u32) !void {
     const view: dmabuf.View = switch (tracked.source) {
         .shm => |b| .{ .pixels = b },
         .dmabuf => |d| if (conn.relay.dmabuf) |cfg| d.view(cfg.backend, conn.relay.gpa, conn.conn_id, state.buffer_id) else .unreadable,
+        .external => |ref| .{ .external = ref },
     };
     const dmabuf_buffer: ?*dmabuf.Buffer = if (tracked.source == .dmabuf) tracked.source.dmabuf else null;
 
@@ -1161,8 +1199,12 @@ fn finishCommit(conn: *AppConn, surface_id: u32) !void {
                 break :dims .{ buffer.width, buffer.height };
             },
             .resource => |r| .{ r.ref.width, r.ref.height },
+            .external => |ref| .{ ref.width, ref.height },
         };
-        const kind: SurfaceState.ShownKind = if (view == .resource) .resource else .pixels;
+        const kind: SurfaceState.ShownKind = switch (view) {
+            .resource, .external => .resource,
+            .pixels, .unreadable => .pixels,
+        };
         // a new size or a new kind of content: the engine's copy is gone
         const resized = state.last_w != width or state.last_h != height or state.last_kind != kind;
 
@@ -1225,6 +1267,19 @@ fn finishCommit(conn: *AppConn, surface_id: u32) !void {
                 // pixels away as "unchanged" (a full rect alone is not
                 // enough). Dropped here, not at the switch back: an unshown
                 // commit in between forgets the kind.
+                conn.pixels.surfaceDestroyed(surface_id);
+            },
+            .external => |ref| {
+                // the id goes as the client gave it: no device, no fence —
+                // ordering is the client's and the embedder's (STREAM.md
+                // kind external). Nothing is held until the ACK; it only
+                // settles the release.
+                try conn.batch.externalCommit(conn.relay.gpa, conn.conn_id, surface_id, serial, ref, rects);
+                conn.advanceSerial();
+                tracked.busy += 1;
+                conn.pending.appendAssumeCapacity(.{ .serial = serial, .buffer_id = state.buffer_id, .hold = .none });
+                // as for virtgpu: the engine shows an image the copy
+                // backend's shadow knows nothing of
                 conn.pixels.surfaceDestroyed(surface_id);
             },
         }

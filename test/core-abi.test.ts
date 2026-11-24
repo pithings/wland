@@ -186,3 +186,74 @@ test('wland_set_gpu_source: default on; off, FEATURE dmabuf_kind virtgpu keeps l
   c.ex.wland_init(1, 120);
   assert.equal(advertised(c), true);
 });
+
+// COMMIT kind 3 (external): u64 id, width, height, format, flags (u32s),
+// then any bytes a later relay appends
+const ARGB8888 = 0x34325241, XBGR8888 = 0x34324258;
+const externalCommit = (conn: number, surface: number, serial: number, id: bigint, ref: number[], rects: number[][], extra: number[] = []) =>
+  frame([0x0a], u32(conn, surface, serial, rects.length, 3, 24 + extra.length), u64n(id), u32(...ref), extra,
+    u32(...rects.flat().map((v) => v >>> 0)));
+
+test('wland_commit_notice decodes an external COMMIT (id low/high words, a longer ref too); an invalid one is kind 0', async () => {
+  const { ex, withBytes, calls } = await core();
+  const id = 0x89abcdef01234567n;
+  const f = externalCommit(3, 9, 5, id, [64, 32, XBGR8888, 1], [[0, 0, 64, 32], [1, 2, 3, 4]]);
+  const ptr = withBytes(f, (p: number, n: number) => ex.wland_commit_notice(p, n));
+  assert.ok(ptr);
+  assert.deepEqual([...new Uint32Array(ex.memory.buffer, ptr, 14)],
+    [3, 9, 5, 3, 2, 0x01234567, 0x89abcdef, 64, 32, XBGR8888, 1, 0, 0, 0]);
+  assert.deepEqual([...new Int32Array(ex.memory.buffer, ptr + 56, 8)], [0, 0, 64, 32, 1, 2, 3, 4]);
+
+  const longer = externalCommit(3, 9, 6, 7n, [16384, 1, ARGB8888, 0], [[0, 0, 1, 1]], [7, 7, 7, 7]);
+  const p2 = withBytes(longer, (p: number, n: number) => ex.wland_commit_notice(p, n));
+  assert.deepEqual([...new Uint32Array(ex.memory.buffer, p2, 11)], [3, 9, 6, 3, 1, 7, 0, 16384, 1, ARGB8888, 0]);
+
+  for (const bad of [
+    externalCommit(3, 9, 7, id, [64, 32, 0x3231564e, 0], [[0, 0, 1, 1]]),  // NV12: not a format the manager takes
+    externalCommit(3, 9, 8, id, [0, 32, ARGB8888, 0], [[0, 0, 1, 1]]),     // width 0
+    externalCommit(3, 9, 9, id, [64, 16385, ARGB8888, 0], [[0, 0, 1, 1]]), // height past 16384
+    externalCommit(3, 9, 10, id, [64, 32, ARGB8888, 2], [[0, 0, 1, 1]]),   // unknown flag
+    externalCommit(3, 9, 11, id, [64, 32, ARGB8888, 0], [[60, 0, 5, 1]]),  // rect past the edge
+    externalCommit(3, 9, 12, id, [64, 32, ARGB8888, 0], []),               // no rects
+    frame([0x0a], u32(3, 9, 13, 1, 3, 20), u64n(id), u32(64, 32, ARGB8888), u32(0, 0, 1, 1)), // short ref
+  ]) {
+    const p = withBytes(bad, (q: number, n: number) => ex.wland_commit_notice(q, n));
+    assert.ok(p);
+    assert.deepEqual([...new Uint32Array(ex.memory.buffer, p, 14)].slice(3), Array(11).fill(0));
+  }
+  assert.equal(calls.log.filter((l) => /kind external/.test(l)).length, 7, 'each one logged with why');
+});
+
+test('wland_set_gpu_source is a mask (bit 0 virtgpu, bit 1 external); wland_external_buffers: 2 until the FEATUREs settle, then 1 only with FEATURE external_buffer AND bit 1', async () => {
+  const extFeature = frame([0x0c], u32(5, 0));
+  const app = frame([0x03], u32(5), [0x01], u32(5, 12), u32(1, (12 << 16) | 1, 2));
+  const table = [...u32(0xe280, 0), ...u32(0x34325258, 0, 0, 0)];
+  const dmabuf = frame([0x0c], u32(2, 4, 2), [0x0c], u32(1, table.length), table);
+  // a fresh link: its FEATUREs, then an app's registry; what each step says
+  const link = async (mask: number | null, features: Uint8Array) => {
+    const c = await core();
+    if (mask !== null) c.ex.wland_set_gpu_source(mask);
+    c.ex.wland_init(1, 120);
+    const before = c.ex.wland_external_buffers();
+    if (features.length) c.withBytes(features, (p, n) => c.ex.wland_on_frame(p, n));
+    const featured = c.ex.wland_external_buffers();
+    c.calls.sent.length = 0;
+    c.withBytes(app, (p, n) => c.ex.wland_on_frame(p, n));
+    const text = c.calls.sent.map((b) => new TextDecoder().decode(b)).join('');
+    return {
+      states: [before, featured, c.ex.wland_external_buffers()],
+      external: text.includes('wland_external_buffer_manager_v1'),
+      dmabuf: text.includes('zwp_linux_dmabuf_v1'),
+    };
+  };
+  assert.deepEqual(await link(null, extFeature), { states: [2, 2, 0], external: false, dmabuf: false }, 'never called: no external');
+  assert.deepEqual(await link(2, extFeature), { states: [2, 1, 1], external: true, dmabuf: false });
+  assert.deepEqual(await link(3, extFeature), { states: [2, 1, 1], external: true, dmabuf: false });
+  assert.deepEqual(await link(1, extFeature), { states: [2, 2, 0], external: false, dmabuf: false });
+  assert.deepEqual(await link(2, new Uint8Array(0)), { states: [2, 2, 0], external: false, dmabuf: false }, 'no FEATURE: not offered');
+  // bit 0 alone decides linux-dmabuf in front of a virtgpu relay
+  assert.equal((await link(2, dmabuf)).dmabuf, false);
+  assert.equal((await link(1, dmabuf)).dmabuf, true);
+  assert.equal((await link(3, frame(dmabuf, extFeature))).dmabuf, true);
+  assert.equal((await link(3, frame(dmabuf, extFeature))).external, true);
+});

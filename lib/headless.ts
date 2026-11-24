@@ -28,7 +28,7 @@
 import {
   createEngine, createStreamLink, createWsLink, inRegion, readSelectionText, setSelectionText, stackOrder,
   DND_COPY, ROLE_DND_ICON, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_TOPLEVEL,
-  type CommitEvent, type Engine, type Event, type GpuRef, type GpuSource, type HandleSource, type Link, type Role,
+  type CommitEvent, type Engine, type Event, type ExternalRef, type GpuRef, type GpuSource, type HandleSource, type Link, type Role,
   type StreamSource,
 } from './engine.ts';
 import { swizzleRect } from './present.ts';
@@ -52,12 +52,16 @@ export interface HeadlessOptions {
   /** EngineOptions.buffers, for a relay running a handle backend. */
   buffers?: HandleSource;
   /** EngineOptions.gpu, for a relay that names GPU resources (COMMIT kind
-   *  virtgpu): resolve a GPU buffer to its pixels as an RgbaImage of the
-   *  ref's size (row 0 at the top; a different size is cropped, not scaled), copied
-   *  into the scene during the commit. Without it a GPU surface is laid out
-   *  but stays empty, and in front of `wlandr --dmabuf virtgpu` apps are
-   *  offered no linux-dmabuf (they render in software over wl_shm); either
-   *  way HeadlessSurface.gpu names the buffer. */
+   *  virtgpu: resolve) or external buffers (COMMIT kind external:
+   *  resolveExternal): resolve a buffer to its pixels as an RgbaImage of the
+   *  ref's size (row 0 at the top — honour y_invert there; a different size
+   *  is cropped, not scaled), copied into the scene during the commit.
+   *  Without the resolver for a kind its surfaces are laid out but stay
+   *  empty — and apps aren't offered it in the first place: without
+   *  resolve, in front of `wlandr --dmabuf virtgpu` no linux-dmabuf (they
+   *  render in software over wl_shm); without resolveExternal no
+   *  wland_external_buffer_manager_v1. Either way HeadlessSurface.gpu /
+   *  .external names the buffer. */
   gpu?: GpuSource<RgbaImage>;
   /** EngineOptions.decorations: 'client' (default) or 'server' (toplevels
    *  that ask through xdg-decoration are configured server_side and their
@@ -132,8 +136,11 @@ export interface HeadlessSurface {
    *  (surfaceAt, and so every scripted pointer call) passes over the rest. */
   inputRegion: Int32Array | null;
   /** The GPU buffer (resource) its last commit named; undefined
-   *  when that commit carried pixels. */
+   *  when that commit carried pixels or named an external buffer. */
   gpu?: GpuRef;
+  /** The external buffer its last commit named; undefined when that
+   *  commit carried pixels or named a GPU buffer. */
+  external?: ExternalRef;
 }
 
 /** A mapped toplevel and its placement. Positions are the scene's: the core
@@ -496,7 +503,7 @@ const now = () => performance.now() >>> 0;
 interface Surf {
   key: string; conn: number; surface: number; role: Role; root: number; parent: number; z: number;
   x: number; y: number; width: number; height: number; logicalWidth: number; logicalHeight: number;
-  data: Uint8Array<ArrayBuffer>; commits: number; seq: number; mapped: boolean; gpu?: GpuRef;
+  data: Uint8Array<ArrayBuffer>; commits: number; seq: number; mapped: boolean; gpu?: GpuRef; external?: ExternalRef;
 }
 /** A toplevel's placement: x, y is the top-left of its box, the window
  *  geometry g* (in the toplevel surface's px; gw 0 = not known yet, the box
@@ -649,6 +656,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       s.height = h;
     }
     s.gpu = ev.gpu;
+    s.external = ev.external;
     if (ev.format === 'gpu') return latchImage(s, ev);
     const { damage: d, pixels: src, stride } = ev;
     let off = 0; // 'rgba': the rect's first byte in the packed pixels
@@ -670,7 +678,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     }
   }
 
-  // A GPU commit: the damaged rects of the resolved image (tight RGBA rows
+  // A GPU or external commit: the damaged rects of the resolved image (tight RGBA rows
   // of its own width), cropped to both sizes. No image: nothing changes
   // (and the engine makes the surface's next commit's damage whole).
   function latchImage(s: Surf, ev: CommitEvent) {
@@ -1524,6 +1532,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       width: s.width, height: s.height, logicalWidth: s.logicalWidth, logicalHeight: s.logicalHeight, commits: s.commits,
       inputRegion: regions.get(s.key)?.slice() ?? null,
       ...(s.gpu ? { gpu: s.gpu } : {}),
+      ...(s.external ? { external: s.external } : {}),
     })),
     focused() {
       const win = active && toplevel(active);

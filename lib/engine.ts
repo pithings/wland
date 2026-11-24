@@ -16,8 +16,9 @@
 //   dispatched. Consume it synchronously (paint, upload, or copy); a Worker
 //   adapter copies it and may transfer the copy. No second copy is made on
 //   the same-thread path. The same goes for a GPU commit's `image` (what
-//   EngineOptions.gpu resolved): draw it during dispatch; the ACK that lets
-//   the guest reuse the resource follows the dispatch.
+//   EngineOptions.gpu resolved, for a virtgpu or an external buffer): draw
+//   it during dispatch; the ACK that lets the client reuse the buffer
+//   follows the dispatch.
 // - Events raised while the core is running (role changes, titles, grabs...)
 //   are queued and dispatched as soon as the wasm call returns, so a handler
 //   may call back into the engine without re-entering the core. Order is
@@ -136,15 +137,21 @@ export interface EngineOptions {
    *  HANDLE_OPEN raises an 'error' event and the commits that use the handle
    *  are acknowledged without presenting. */
   buffers?: HandleSource;
-  /** Resolves the GPU resources a relay names instead of shipping pixels
-   *  (COMMIT kind virtgpu: `wlandr --dmabuf virtgpu[:NODE]`); see GpuSource.
-   *  Without it the compositor offers no linux-dmabuf to a relay whose
-   *  dmabufs are GPU resources (its FEATURE dmabuf_kind), so GPU clients
-   *  render in software over wl_shm rather than into windows nothing could
-   *  show. Should such commits arrive anyway (a relay naming wl_shm buffers
-   *  as resources), the first raises an 'error' event; every one is still
-   *  dispatched (format 'gpu', `image` null: the surface is laid out, its
-   *  content not updated) and acknowledged. */
+  /** Resolves the buffers a relay names instead of shipping pixels: GPU
+   *  resources (COMMIT kind virtgpu: `wlandr --dmabuf virtgpu[:NODE]`,
+   *  GpuSource.resolve) and external buffers (COMMIT kind external: `wlandr
+   *  --external-buffers`, GpuSource.resolveExternal); see GpuSource. Each
+   *  method present is a capability the compositor offers apps:
+   *  - Without `resolve` the compositor offers no linux-dmabuf to a relay
+   *    whose dmabufs are GPU resources (its FEATURE dmabuf_kind), so GPU
+   *    clients render in software over wl_shm rather than into windows
+   *    nothing could show.
+   *  - Without `resolveExternal` it offers no
+   *    wland_external_buffer_manager_v1 (Engine.externalBuffers()).
+   *  Should such commits arrive anyway (a relay naming wl_shm buffers as
+   *  resources), the first of each kind on a link raises an 'error' event;
+   *  every one is still dispatched (format 'gpu', `image` null: the surface
+   *  is laid out, its content not updated) and acknowledged. */
   gpu?: GpuSource;
   /** Deliver buffer-source commits as 'rgba' (packed per damage rect, the
    *  layout BUFFER frames carry) instead of 'bgra'/'bgrx' rows: the core's
@@ -282,7 +289,7 @@ export interface HandleRead {
   dst: Uint8Array;
 }
 
-// --- GPU buffers (STREAM.md COMMIT kind virtgpu) ---------------------------
+// --- GPU and external buffers (STREAM.md COMMIT kinds virtgpu, external) ---
 
 /** A GPU buffer the relay named instead of shipping its pixels (STREAM.md
  *  COMMIT, buffer kind virtgpu), decoded by the core: a resource the
@@ -311,41 +318,86 @@ export interface GpuRef {
   modifier: bigint;
 }
 
+/** An external buffer the relay named (STREAM.md COMMIT, buffer kind
+ *  external), decoded by the core: content only the embedder knows, named
+ *  by an opaque id a client gave wland_external_buffer_manager_v1
+ *  (protocol/wland-external-buffer-v1.xml). Every field is the client's
+ *  claim, held to the protocol's rules (the core checked them); whether the
+ *  id names anything, of this size and format, is the resolver's to check. */
+export interface ExternalRef {
+  /** The opaque 64-bit id the client gave create_buffer
+   *  ((id_hi << 32) | id_lo): whatever the client and the embedder agree on
+   *  out of band. Not scoped by conn — any client that binds the global can
+   *  name any id (put an unguessable token in it to keep clients apart) —
+   *  and it names one content object for good: a commit naming it may still
+   *  arrive after the client destroyed the buffer. */
+  id: bigint;
+  /** The wl_buffer's size in buffer px (what the surface shows), each
+   *  1..16384. */
+  width: number;
+  height: number;
+  /** DRM fourcc: 0x34325241 ARGB8888 'AR24', 0x34325258 XRGB8888 'XR24',
+   *  0x34324241 ABGR8888 'AB24' or 0x34324258 XBGR8888 'XB24'. X formats are
+   *  opaque; the others carry premultiplied alpha. */
+  format: number;
+  /** 1 y_invert (row 0 of the content is the bottom); no other bit. */
+  flags: number;
+}
+
 /**
- * The embedder's access to GPU buffers (EngineOptions.gpu): turns a GpuRef
- * into something its consumers draw — for createWland's view a
+ * The embedder's access to the buffers a relay names instead of shipping
+ * their pixels (EngineOptions.gpu): GPU resources (resolve, a GpuRef) and
+ * external buffers (resolveExternal, an ExternalRef). It turns a ref into
+ * something its consumers draw — for createWland's view a
  * CanvasImageSource (an ImageBitmap, OffscreenCanvas, canvas or VideoFrame:
  * WebGL textures can't be shared across contexts, images can), for
  * wland/headless an RgbaImage.
  *
- * - resolve(): while the engine processes the COMMIT naming the resource,
- *   from its own thread, one at a time. Return the resource's CURRENT
- *   content (what the guest rendered before this commit), or null to show
- *   nothing new (the surface keeps its last content, and the surface's
- *   next commit — `damage` here and on the event — is the whole buffer:
- *   the relay can't know this one was missed). Throwing counts as null and
- *   is logged. May return a Promise: the engine then processes no
- *   further link frames until it settles (as with HandleSource), so order
- *   holds; prefer synchronous.
+ * Both resolvers are optional, and which ones are present is what the
+ * compositor offers apps (set before each link's FEATURE frames): resolve —
+ * linux-dmabuf in front of a virtgpu relay; resolveExternal —
+ * wland_external_buffer_manager_v1 in front of a relay with external
+ * buffers. A source with neither is as none. A commit whose resolver is
+ * missing is still dispatched, with `image` null (EngineOptions.gpu); the
+ * other resolver is never asked in its place.
+ *
+ * - resolve() / resolveExternal(): while the engine processes the COMMIT
+ *   naming the buffer, from its own thread, one at a time. Return the
+ *   buffer's CURRENT content (what the client rendered before this commit),
+ *   or null to show nothing new (the surface keeps its last content, and
+ *   the surface's next commit — `damage` here and on the event — is the
+ *   whole buffer: the relay can't know this one was missed). Throwing
+ *   counts as null and is logged. May return a Promise: the engine then
+ *   processes no further link frames until it settles (as with
+ *   HandleSource), so order holds; prefer synchronous.
  * - The result rides the commit event (`image`). Consumers draw it during
  *   that event's dispatch and never keep it; after the dispatch the engine
  *   calls release(image) (if given) and then ACKs the commit, which lets the
  *   relay hand the buffer back to the client — so the page must not read
- *   the resource for this commit after resolve()'s result has been drawn.
- *   Copy-on-commit: nothing samples the resource later.
+ *   the buffer's content for this commit after the result has been drawn.
+ *   Copy-on-commit: nothing samples it later.
  * - Orientation: the image's row 0 is the buffer's top row (flip a GL
  *   framebuffer's bottom-up rows, and honour `flags & 1`, y_invert, here).
  *   Size: width × height of the ref (a different size is scaled to it).
  *   Alpha: drawn as the browser treats the image (an ImageBitmap's alpha is
  *   straight to a 2D canvas); X formats must come out opaque.
+ * - External buffers: the relay knows no device and waits for nothing —
+ *   the client has its content complete at the embedder before it commits,
+ *   or the resolver waits (a promise, which stalls the whole link). An id
+ *   the embedder no longer has resolves to null.
  */
 export interface GpuSource<T = unknown> {
-  resolve(ref: GpuRef, commit: { conn: number; surface: number; damage: Int32Array }): T | null | Promise<T | null>;
-  /** The image resolve() returned has been drawn (its commit's dispatch
-   *  returned): close it (ImageBitmap/VideoFrame) or recycle it. Called for
-   *  every non-null image resolve() produced, also one whose promise
-   *  settled after the link closed or the engine was disposed (its commit
-   *  is never dispatched nor ACKed). */
+  /** A virtgpu resource's content (COMMIT kind virtgpu). */
+  resolve?(ref: GpuRef, commit: { conn: number; surface: number; damage: Int32Array }): T | null | Promise<T | null>;
+  /** An external buffer's content (COMMIT kind external). Its presence is
+   *  the capability: only then is wland_external_buffer_manager_v1 offered
+   *  (Engine.externalBuffers()). */
+  resolveExternal?(ref: ExternalRef, commit: { conn: number; surface: number; damage: Int32Array }): T | null | Promise<T | null>;
+  /** An image resolve() or resolveExternal() returned has been drawn (its
+   *  commit's dispatch returned): close it (ImageBitmap/VideoFrame) or
+   *  recycle it. Called for every non-null image either produced, also one
+   *  whose promise settled after the link closed or the engine was disposed
+   *  (its commit is never dispatched nor ACKed). */
   release?(image: T): void;
 }
 
@@ -602,6 +654,16 @@ export interface Engine {
    *  FEATUREs has arrived; by an app's first CONN_OPEN it is known).
    *  Decided again on every link. */
   selectionBridged(): boolean | null;
+  /** Whether this link offers apps wland_external_buffer_manager_v1 (its
+   *  relay sent FEATURE external_buffer — `wlandr --external-buffers` — and
+   *  EngineOptions.gpu has resolveExternal): true — apps may make external
+   *  buffers, their commits reach resolveExternal; false — not offered (the
+   *  relay doesn't track them, a session link, or no resolveExternal);
+   *  null — not known yet (no link, or none of its frames past the
+   *  FEATUREs has arrived, unless its FEATURE external_buffer already
+   *  said yes; by an app's first CONN_OPEN it is known). Decided again on
+   *  every link. */
+  externalBuffers(): boolean | null;
   /** Make the clipboard selection the embedder's own (the page's
    *  clipboard, say): it replaces an app's selection (that source is
    *  cancelled) and, like any selection, reaches only the keyboard-focused
@@ -677,7 +739,8 @@ export interface SurfaceEvent {
   z?: number;
 }
 
-/** Pixel formats a commit can carry ('gpu': none — see CommitEvent.gpu):
+/** Pixel formats a commit can carry ('gpu': none — the content is
+ *  CommitEvent.image, the buffer CommitEvent.gpu or CommitEvent.external):
  *  - 'rgba': canvas-ready RGBA, packed per damage rect: BUFFER frames (copy
  *    backend), or buffer-source commits with EngineOptions.rgba (swizzled by
  *    the core's `wland_swizzle`). Alpha already forced opaque for xrgb.
@@ -763,13 +826,18 @@ export interface CommitEvent {
    *    need copy only the damage's bounding rows).
    *  - 'gpu': empty; the content is `image`. */
   pixels: Uint8Array;
-  /** format 'gpu': the GPU buffer the relay named (STREAM.md COMMIT kind
-   *  virtgpu). */
+  /** format 'gpu' from a GPU buffer: the resource the relay named
+   *  (STREAM.md COMMIT kind virtgpu). A 'gpu' commit carries exactly one
+   *  of `gpu` and `external`. */
   gpu?: GpuRef;
-  /** format 'gpu': what EngineOptions.gpu resolved `gpu` to, valid only
-   *  during dispatch (draw it, don't keep it); null without a resolver or
-   *  when it found nothing (keep showing the last content; the next
-   *  commit's damage is then the whole buffer). */
+  /** format 'gpu' from an external buffer: the id and claims the relay
+   *  named (STREAM.md COMMIT kind external). */
+  external?: ExternalRef;
+  /** format 'gpu': what EngineOptions.gpu resolved `gpu` (resolve) or
+   *  `external` (resolveExternal) to, valid only during dispatch (draw it,
+   *  don't keep it); null without that resolver or when it found nothing
+   *  (keep showing the last content; the next commit's damage is then the
+   *  whole buffer). */
   image?: unknown;
 }
 
@@ -1095,6 +1163,8 @@ interface PendingCommit {
   width: number; height: number; stride: number; format: number;
   damage: Int32Array; size: number;
 }
+/** The buffer a 'gpu' commit names: exactly one of the two (CommitEvent). */
+type ImageRef = { gpu: GpuRef; external?: undefined } | { external: ExternalRef; gpu?: undefined };
 /** A pending motion: the newest position, the relative parts summed. */
 interface Motion { conn: number; time: number; x: number; y: number; dx: number; dy: number; dxu: number; dyu: number; utime: number }
 
@@ -1104,7 +1174,11 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   if (typeof onEvent !== 'function') throw new Error('createEngine: options.onEvent is required');
   const buffers = options.buffers || null;
   const gpu = options.gpu || null;
-  let gpuWarned = false; // the no-resolver error, once per link
+  // wland_set_gpu_source's mask: bit 0 a virtgpu resolver, bit 1 an
+  // external one (what the compositor may offer apps)
+  const gpuMask = (gpu && typeof gpu.resolve === 'function' ? 1 : 0) |
+    (gpu && typeof gpu.resolveExternal === 'function' ? 2 : 0);
+  let gpuWarned = false, extWarned = false; // the no-resolver errors, once per link each
   // `${conn}:${surface}` of surfaces whose last COMMIT showed nothing new
   // (no image resolved, a failed read, a broken handle) though the relay
   // believes it did: their next COMMIT is presented whole, whatever damage
@@ -1152,6 +1226,9 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   // NO_SELECTION_BRIDGE was logged on it
   let bridge: boolean | null = null;
   let noBridgeLogged = false;
+  // this link offers wland_external_buffer_manager_v1 (wasm.zig
+  // wland_external_buffers, read alongside the bridge until known)
+  let extBuffers: boolean | null = null;
   // the core the engine talks to: the wasm's exports (core/src/wasm.zig),
   // or on a session link the remote core (remote-core.ts: the relay's
   // compositor behind the same shape); `real` is always the wasm's
@@ -1386,8 +1463,11 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       locks: real.wland_keyboard_locks_state(),
     });
     bridge = true; // a session relay bridges the clipboard (its core does)
+    extBuffers = false; // and never offers external buffers
     run(ex.wland_init, output.scale, output.scale120, decorations);
-    run(ex.wland_set_gpu_source, gpu ? 1 : 0);
+    // virtgpu only: the session profile has no external buffers (and a
+    // session relay reads the word as one flag)
+    run(ex.wland_set_gpu_source, gpuMask & 1);
     if (output.width > 0 && output.height > 0) run(ex.wland_desktop_size, output.width, output.height);
     if (bounds.some((v) => v > 0)) run(ex.wland_set_bounds, bounds[0], bounds[1], bounds[2], bounds[3]);
     if (output.suspended) run(ex.wland_set_suspended, 1);
@@ -1416,7 +1496,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   // BUFFER_LZ ('rgba' packed per rect) and COMMIT (read through the buffer
   // source: 'bgra'/'bgrx' strided, or 'rgba' when options.rgba).
   function commit(conn: number, surface: number, width: number, height: number, format: PixelFormat,
-    stride: number, damage: Int32Array, pixels: Uint8Array, extra?: { gpu: GpuRef; image: unknown }) {
+    stride: number, damage: Int32Array, pixels: Uint8Array, extra?: ImageRef & { image: unknown }) {
     // surface sizes make up the window geometry read below
     ex.wland_note_buffer_size(conn, surface, width, height);
     // the commit's WIRE frame was processed first (STREAM.md ordering), so
@@ -1524,16 +1604,25 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     if (!p) { log(`bad COMMIT frame (${len} bytes): not acked`); return; }
     const w = new Uint32Array(ex.memory.buffer, p, NOTICE_WORDS);
     const conn = w[0], surface = w[1], serial = w[2], kind = w[3], n = w[4];
-    if (kind !== 1 && kind !== 2) return missed(conn, surface, serial); // unknown kind / invalid: core logged why
+    if (kind !== 1 && kind !== 2 && kind !== 3) return missed(conn, surface, serial); // unknown kind / invalid: core logged why
     let damage: Int32Array;
-    if (stale.has(`${conn}:${surface}`)) damage = kind === 2 ? Int32Array.of(0, 0, w[6], w[7]) : Int32Array.of(0, 0, w[7], w[8]);
-    else damage = new Int32Array(ex.memory.buffer, p + NOTICE_WORDS * 4, n * 4).slice();
+    if (stale.has(`${conn}:${surface}`)) {
+      // the buffer's size: shm 7, 8; virtgpu 6, 7; external 7, 8
+      damage = kind === 2 ? Int32Array.of(0, 0, w[6], w[7]) : Int32Array.of(0, 0, w[7], w[8]);
+    } else damage = new Int32Array(ex.memory.buffer, p + NOTICE_WORDS * 4, n * 4).slice();
     if (kind === 2) {
       const ref: GpuRef = {
         kind: 'virtgpu', resource: w[5], width: w[6], height: w[7], format: w[8], flags: w[9],
         offset: w[10], stride: w[11], modifier: (BigInt(w[13]) << 32n) | BigInt(w[12]),
       };
-      return gpuCommit(conn, surface, serial, ref, damage);
+      return gpuCommit(conn, surface, serial, { gpu: ref }, damage);
+    }
+    if (kind === 3) {
+      // (Uint32Array words: never negative, so the bigint halves are exact)
+      const ref: ExternalRef = {
+        id: (BigInt(w[6]) << 32n) | BigInt(w[5]), width: w[7], height: w[8], format: w[9], flags: w[10],
+      };
+      return gpuCommit(conn, surface, serial, { external: ref }, damage);
     }
     const handle = w[5], offset = w[6], width = w[7], height = w[8], stride = w[9], format = w[10];
     const h = handles.get(handle);
@@ -1704,23 +1793,33 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     ack(conn, serial);
   }
 
-  // COMMIT kind virtgpu: resolve the resource through options.gpu (a promise
-  // stalls the walk, as a buffer-source read does), dispatch the commit
-  // with the image, release the image, ACK. No resolver: the commit still
-  // goes out (layout, the ref for scripts) with image null.
-  function gpuCommit(conn: number, surface: number, serial: number, ref: GpuRef, damage: Int32Array) {
-    if (!gpu) {
-      if (!gpuWarned) {
-        gpuWarned = true;
-        emit({ type: 'error', detail: 'GPU buffers (COMMIT kind virtgpu) from the relay, but this engine has no gpu source: their surfaces show nothing' });
+  // COMMIT kinds virtgpu and external: resolve the buffer through
+  // options.gpu (resolve / resolveExternal; a promise stalls the walk, as a
+  // buffer-source read does), dispatch the commit with the image, release
+  // the image, ACK. No resolver for the kind: the commit still goes out
+  // (layout, the ref for scripts) with image null — the other resolver is
+  // never asked in its place.
+  function gpuCommit(conn: number, surface: number, serial: number, ref: ImageRef, damage: Int32Array) {
+    const ext = ref.external;
+    if (ext ? !(gpuMask & 2) : !(gpuMask & 1)) {
+      if (ext ? !extWarned : !gpuWarned) {
+        if (ext) extWarned = true;
+        else gpuWarned = true;
+        emit({
+          type: 'error', detail: ext
+            ? 'external buffers (COMMIT kind external) from the relay, but this engine\'s gpu source has no resolveExternal: their surfaces show nothing'
+            : 'GPU buffers (COMMIT kind virtgpu) from the relay, but this engine has no gpu source with resolve: their surfaces show nothing',
+        });
       }
       return gpuPresent(conn, surface, serial, ref, damage, null);
     }
+    const what = ext ? `resolveExternal of id 0x${ext.id.toString(16)}` : `gpu resolve of resource ${ref.gpu!.resource}`;
+    const info = { conn, surface, damage };
     let r: unknown;
     try {
-      r = gpu.resolve(ref, { conn, surface, damage });
+      r = ext ? gpu!.resolveExternal!(ext, info) : gpu!.resolve!(ref.gpu!, info);
     } catch (e) {
-      log(`COMMIT c${conn} serial ${serial}: gpu resolve of resource ${ref.resource} failed (${e})`);
+      log(`COMMIT c${conn} serial ${serial}: ${what} failed (${e})`);
       r = null;
     }
     if (!thenable(r)) return gpuPresent(conn, surface, serial, ref, damage, r ?? null);
@@ -1734,14 +1833,15 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       resume();
     }, (e) => {
       if (g !== gen) return;
-      log(`COMMIT c${conn} serial ${serial}: gpu resolve of resource ${ref.resource} failed (${e})`);
+      log(`COMMIT c${conn} serial ${serial}: ${what} failed (${e})`);
       gpuPresent(conn, surface, serial, ref, damage, null);
       resume();
     });
   }
 
-  function gpuPresent(conn: number, surface: number, serial: number, ref: GpuRef, damage: Int32Array, image: unknown) {
-    commit(conn, surface, ref.width, ref.height, 'gpu', 0, damage, EMPTY, { gpu: ref, image });
+  function gpuPresent(conn: number, surface: number, serial: number, ref: ImageRef, damage: Int32Array, image: unknown) {
+    const { width, height } = ref.external ?? ref.gpu!;
+    commit(conn, surface, width, height, 'gpu', 0, damage, EMPTY, { ...ref, image });
     // the dispatch returned: the image is drawn, the resource no longer read
     if (image !== null) gpuRelease(image);
     ack(conn, serial);
@@ -1826,7 +1926,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     const toCore = (end: number) => {
       const p = toWasm(bytes, span, end), n = end - span;
       // (the bridge is known before this run's events go out)
-      if (p) run(() => { ex.wland_on_frame(p, n); if (bridge === null) noteBridge(); });
+      if (p) run(() => { ex.wland_on_frame(p, n); if (bridge === null || extBuffers === null) noteFeatures(); });
       span = -1;
     };
     while (off < total) {
@@ -1973,13 +2073,16 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       dragAct = 0;
       bridge = null; // (its relay's FEATURE frames decide again)
       noBridgeLogged = false;
-      gpuWarned = false;
+      extBuffers = null; // (likewise)
+      gpuWarned = extWarned = false;
       stale.clear();
       placed.clear();
       touchConns.clear();
-      // no GPU source: a relay whose dmabufs are GPU resources gets no
-      // linux-dmabuf (its FEATURE frames come next), so GPU clients use wl_shm
-      run(ex.wland_set_gpu_source, gpu ? 1 : 0);
+      // what the compositor may offer, before the FEATURE frames that come
+      // next: no virtgpu resolver — a relay whose dmabufs are GPU resources
+      // gets no linux-dmabuf, so GPU clients use wl_shm; no external one —
+      // no wland_external_buffer_manager_v1
+      run(ex.wland_set_gpu_source, gpuMask);
       run(ex.wland_init, output.scale, output.scale120, decorations);
       if (output.width > 0 && output.height > 0) run(ex.wland_desktop_size, output.width, output.height);
       if (bounds.some((v) => v > 0)) run(ex.wland_set_bounds, bounds[0], bounds[1], bounds[2], bounds[3]);
@@ -2024,9 +2127,17 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     },
   };
 
-  function noteBridge() {
-    const s = ex.wland_selection_bridged() >>> 0; // a getter: emits nothing
-    if (s !== 2) bridge = s === 1;
+  // what the link's FEATURE frames settled: the clipboard bridge and the
+  // external-buffer global (getters: they emit nothing)
+  function noteFeatures() {
+    if (bridge === null) {
+      const s = ex.wland_selection_bridged() >>> 0;
+      if (s !== 2) bridge = s === 1;
+    }
+    if (extBuffers === null) {
+      const s = ex.wland_external_buffers() >>> 0;
+      if (s !== 2) extBuffers = s === 1;
+    }
   }
   // (no engine call: safe while a commit's pixels are being read)
   const bridged = (): boolean | null => (live ? bridge : null);
@@ -2183,6 +2294,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
     // clipboard
     selection: () => ({ conn: selection.conn, mimes: [...selection.mimes] }),
     selectionBridged: () => bridged(),
+    externalBuffers: () => (live ? extBuffers : null),
     session: () => (live && session ? { id: session.id } : null),
     setSelection(data) {
       if (!live) return false;

@@ -7,10 +7,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createEngine, createStreamLink, type Link, type PixelFormat } from '../lib/engine.ts';
+import { createEngine, createStreamLink, type ExternalRef, type Link, type PixelFormat } from '../lib/engine.ts';
 import { createShm, createHandleSource } from './support/kwshm.js';
 import { memoryLinks, streamPair } from './support/links.js';
-import { createRelay } from './support/relay.js';
+import { createRelay, fromExternalId } from './support/relay.js';
 import { createClient, XRGB8888, ARGB8888 } from './support/test-client.js';
 
 const wasm = await readFile(new URL('../lib/wland.wasm', import.meta.url));
@@ -142,6 +142,58 @@ test('gpu relay: its links open with FEATURE dmabuf_kind (virtgpu), as wlandr --
     assert.equal(logs.some((l) => /linux-dmabuf not offered/.test(l)), !withGpu, logs.join('\n'));
     assert.ok(!logs.some((l) => /FEATURE \d+: unknown/.test(l)));
     assert.deepEqual(violations, []);
+    engine.dispose();
+  }
+});
+
+test('external relay: its links open with FEATURE external_buffer; with resolveExternal the engine offers the global, every COMMIT (kind external, ids past 2^53) reaches it, is released and ACKed, no violations; without, externalBuffers() is false', async () => {
+  for (const withExt of [false, true]) {
+    const { relay: relayLink, engine: engineLink } = memoryLinks();
+    const violations: string[] = [];
+    const violation = (v: string) => violations.push(v);
+    const shm = createShm();
+    const relay = createRelay({ link: relayLink, shm, violation, external: true });
+    const resolved: bigint[] = [];
+    let lent = 0;
+    const gpu = withExt ? {
+      resolveExternal(ref: ExternalRef) {
+        const at = fromExternalId(ref.id);
+        if (!at || !shm.lookup(at.exportId)) { violation(`resolveExternal: id 0x${ref.id.toString(16)} names no live export`); return null; }
+        resolved.push(ref.id);
+        lent++;
+        return { id: ref.id };
+      },
+      release() { lent--; },
+    } : undefined;
+    const errors: string[] = [];
+    let opened!: () => void;
+    const open = new Promise<void>((r) => { opened = r; });
+    const engine = await createEngine({
+      wasm, link: engineLink, buffers: createHandleSource(shm, { async: false, violation }), gpu,
+      onEvent(ev) { if (ev.type === 'error') errors.push(ev.detail); else if (ev.type === 'open') opened(); },
+    });
+    engine.setOutput(1280, 720);
+    engine.start();
+    await open;
+    const client = createClient({ title: 'x', format: XRGB8888, width: 64, height: 48 });
+    client.start(relay, violation);
+    let t = 0;
+    const clock = setInterval(() => engine.tick((t += 16)), 4);
+    try { await sleep(150); } finally { clearInterval(clock); }
+    await sleep(20);
+    relay.check();
+    assert.equal(engine.externalBuffers(), withExt);
+    assert.deepEqual(violations, []);
+    assert.ok(relay.stats.commits > 3, `commits ${relay.stats.commits}`);
+    assert.equal(relay.stats.acks, relay.stats.commits);
+    if (withExt) {
+      assert.deepEqual(errors, []);
+      assert.equal(resolved.length, relay.stats.commits);
+      assert.ok(resolved.every((id) => id > 2n ** 53n));
+      assert.equal(lent, 0, 'every image released');
+    } else {
+      assert.equal(errors.filter((e) => /resolveExternal/.test(e)).length, 1);
+    }
     engine.dispose();
   }
 });

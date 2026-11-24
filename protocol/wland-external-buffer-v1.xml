@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wland_external_buffer_v1">
+  <copyright>
+    SPDX-FileCopyrightText: 2026 Pooya Parsa &lt;pooya@pi0.io&gt;
+    SPDX-License-Identifier: MPL-2.0
+  </copyright>
+
+  <interface name="wland_external_buffer_manager_v1" version="1">
+    <description summary="wl_buffers that name content the embedder holds">
+      A wland-private global: it makes wl_buffers out of an opaque 64-bit id
+      instead of memory. No file descriptor and no pixels cross the
+      connection; the compositor's embedder (the page hosting wland) turns
+      the id into an image each time a surface commits the buffer. What an
+      id means is agreed between the client and that embedder out of band
+      (e.g. a renderer on the page that the client drives over its own
+      channel).
+
+      The global is advertised only when the embedder said it resolves such
+      ids, so its presence is the capability signal: a client that does not
+      find it must use another buffer type (wl_shm).
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_format" value="0" summary="format is not one the manager takes"/>
+      <entry name="invalid_dimensions" value="1" summary="width or height outside 1..16384"/>
+      <entry name="invalid_flags" value="2" summary="unknown bits in flags"/>
+    </enum>
+
+    <enum name="flags" bitfield="true">
+      <entry name="y_invert" value="1" summary="row 0 of the content is the bottom row"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Buffers created through it are not affected.
+      </description>
+    </request>
+
+    <request name="create_buffer">
+      <description summary="create a wl_buffer naming external content">
+        Create a wl_buffer of the given size whose content the embedder
+        resolves from the id (id_hi is the upper 32 bits, id_lo the lower).
+
+        format is a DRM fourcc and must be one of ARGB8888, XRGB8888,
+        ABGR8888 or XBGR8888 (invalid_format otherwise); X formats are
+        opaque, the others carry pre-multiplied alpha. width and height
+        must each be within 1..16384 (invalid_dimensions). flags may hold
+        y_invert only (invalid_flags).
+
+        The buffer behaves like any wl_buffer. Content is taken at
+        wl_surface.commit (copy on commit): the client must have the
+        content complete at the embedder before it commits, must not change
+        it until wl_buffer.release, and must damage what changed (a commit
+        without damage shows nothing new). An id the embedder cannot
+        resolve shows nothing new either; that is not an error.
+
+        An id must name the same content object for as long as a commit of
+        any buffer made from it may be in flight; as no release follows the
+        destruction of a busy buffer, a client should never give an id to
+        another object.
+      </description>
+      <arg name="buffer" type="new_id" interface="wl_buffer"/>
+      <arg name="id_hi" type="uint"/>
+      <arg name="id_lo" type="uint"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="format" type="uint" summary="DRM fourcc"/>
+      <arg name="flags" type="uint" enum="flags"/>
+    </request>
+  </interface>
+</protocol>

@@ -14,7 +14,10 @@
 // createGpuSource() is a stand-in virgl host for the gpu mode: the relay
 // names a kwshm export as a GPU "resource" (relay.js gpu: true), and
 // resolve() paints its rows into a canvas — what a real page would do from
-// virglrenderer's texture.
+// virglrenderer's texture. Its resolveExternal() does the same for the
+// external mode (relay.js external: true), the export named by the id.
+
+import { fromExternalId } from './relay.js';
 
 const PAGE = 4096;
 
@@ -100,11 +103,12 @@ export function createHandleSource(shm, { async = false, violation, shape = 'rea
 }
 
 /** A GpuSource (wland/engine) over createShm()'s exports: resource id =
- *  export id. resolve() swizzles the export's BGRA/BGRX rows into one
- *  reused canvas (alpha forced for 'XR24') and returns it; the view draws
- *  it during the commit's dispatch. Polices the copy-on-commit rule: a
- *  resolve of a released export, or a release(image) of an image other than
- *  the last one, is a violation. */
+ *  export id; an external id is relay.js externalId(export id, skew).
+ *  resolve() / resolveExternal() swizzle the export's BGRA/BGRX rows into
+ *  one reused canvas (alpha forced for 'XR24') and return it; the view
+ *  draws it during the commit's dispatch. Polices the copy-on-commit rule:
+ *  a resolve of a released export, or a release(image) of an image other
+ *  than the last one, is a violation. */
 export function createGpuSource(shm, { violation }) {
   const stats = { resolves: 0, released: 0 };
   let canvas = null, ctx = null, lent = null;
@@ -113,25 +117,14 @@ export function createGpuSource(shm, { violation }) {
     resolve(ref) {
       const e = shm.lookup(ref.resource);
       if (!e) { violation(`gpu resolve of resource ${ref.resource}: no such export (released before its ACK?)`); return null; }
-      const { width: w, height: h, stride, offset } = ref;
-      if (!canvas || canvas.width !== w || canvas.height !== h) {
-        canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h });
-        ctx = canvas.getContext('2d');
-      }
-      const img = ctx.createImageData(w, h);
-      const opaque = ref.format === 0x34325258;
-      for (let y = 0; y < h; y++) {
-        for (let x = 0, s = offset + y * stride, d = y * w * 4; x < w; x++, s += 4, d += 4) {
-          img.data[d] = e.mem[s + 2];
-          img.data[d + 1] = e.mem[s + 1];
-          img.data[d + 2] = e.mem[s];
-          img.data[d + 3] = opaque ? 255 : e.mem[s + 3];
-        }
-      }
-      ctx.putImageData(img, 0, 0);
-      stats.resolves++;
-      lent = canvas;
-      return canvas;
+      return paint(e, ref.width, ref.height, ref.stride, ref.offset, ref.format);
+    },
+    resolveExternal(ref) {
+      const at = fromExternalId(ref.id);
+      if (!at) { violation(`resolveExternal of id 0x${ref.id.toString(16)}: not one the relay makes`); return null; }
+      const e = shm.lookup(at.exportId);
+      if (!e) { violation(`resolveExternal of export ${at.exportId}: no such export (released before its ACK?)`); return null; }
+      return paint(e, ref.width, ref.height, ref.width * 4, at.skew, ref.format);
     },
     release(image) {
       if (image !== lent) violation('gpu release of an image that was not just lent');
@@ -139,4 +132,25 @@ export function createGpuSource(shm, { violation }) {
       stats.released++;
     },
   };
+
+  function paint(e, w, h, stride, offset, format) {
+    if (!canvas || canvas.width !== w || canvas.height !== h) {
+      canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h });
+      ctx = canvas.getContext('2d');
+    }
+    const img = ctx.createImageData(w, h);
+    const opaque = format === 0x34325258;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0, s = offset + y * stride, d = y * w * 4; x < w; x++, s += 4, d += 4) {
+        img.data[d] = e.mem[s + 2];
+        img.data[d + 1] = e.mem[s + 1];
+        img.data[d + 2] = e.mem[s];
+        img.data[d + 3] = opaque ? 255 : e.mem[s + 3];
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    stats.resolves++;
+    lent = canvas;
+    return canvas;
+  }
 }

@@ -84,6 +84,7 @@ pub const globals = [_]Global{
     // are never set: the page can't tell which kind of display it is on.
     // fd-free at every version.
     .{ .name = 17, .interface = "wp_presentation", .version = 3 },
+    // (18 is wland_external_buffer_manager_v1, below: advertised per link)
 };
 
 /// linux-dmabuf, advertised only when the relay takes dmabufs: it says so
@@ -94,6 +95,17 @@ pub const globals = [_]Global{
 /// (Mesa finds its render node through main_device); v5 adds only the
 /// same-modifier rule, v6 set_sampling_device (fd-free, not offered).
 pub const dmabuf_global: Global = .{ .name = 14, .interface = "zwp_linux_dmabuf_v1", .version = 4 };
+
+/// wland-private: wl_buffers named by an opaque u64 the embedder resolves
+/// at each commit (no fd, no pixels: FD RULE holds trivially). Advertised
+/// only on a link whose relay sent FEATURE external_buffer AND whose
+/// embedder resolves such ids (`external_source`): `externalOffered`.
+pub const external_global: Global = .{ .name = 18, .interface = "wland_external_buffer_manager_v1", .version = 1 };
+
+// wland_external_buffer_manager_v1.error
+const external_err_invalid_format: u32 = 0;
+const external_err_invalid_dimensions: u32 = 1;
+const external_err_invalid_flags: u32 = 2;
 
 // zwp_linux_buffer_params_v1.error
 const dmabuf_err_already_used: u32 = 0;
@@ -1250,6 +1262,13 @@ pub const Compositor = struct {
     /// FEATURE dmabuf_kind named a buffer kind this embedder can't show
     /// (the kind): linux-dmabuf is not offered on this link.
     dmabuf_unshowable: ?u32 = null,
+    /// The embedder resolves external buffer ids to images (COMMIT kind
+    /// external; wasm `wland_set_gpu_source` bit 1). Default false: native
+    /// users (the session relay, harnesses) never offer it by accident.
+    external_source: bool = false,
+    /// The relay tracks external buffers (FEATURE external_buffer, first
+    /// on the link). With `external_source`: `externalOffered`.
+    external_relay: bool = false,
     /// The seat's locked modifiers (wl_keyboard.modifiers `locked`): Caps
     /// Lock (mod_lock) and NumLock (mod_num), one keyboard for every client.
     /// NumLock starts on (a PC's usual state; keypad keys type digits), the
@@ -1352,8 +1371,24 @@ pub const Compositor = struct {
                 // a new link's relay holds nothing yet
                 if (self.own_selection) |*own| own.sent = 0;
             },
+            @intFromEnum(stream.FeatureKind.external_buffer) => {
+                self.external_relay = true;
+                if (self.external_source) {
+                    self.logf("wland_external_buffer_manager_v1 offered", .{});
+                } else {
+                    self.logf("wland_external_buffer_manager_v1 not offered: the relay names external buffers but this embedder resolves none", .{});
+                }
+            },
             else => self.logf("FEATURE {d}: unknown, skipped", .{kind}),
         }
+    }
+
+    /// wland_external_buffer_manager_v1 is advertised (and bindable) on
+    /// this link: the relay tracks such buffers and the embedder resolves
+    /// them. Read at each get_registry and bind, so the two facts may
+    /// arrive in either order (both come before any conn on a link).
+    pub fn externalOffered(self: *const Compositor) bool {
+        return self.external_relay and self.external_source;
     }
 
     fn destroyConn(self: *Compositor, conn: *Conn) void {
@@ -1765,6 +1800,11 @@ pub const Compositor = struct {
                 self.sendError(conn_id, header.object_id, display_err_invalid_object, "zwp_linux_dmabuf_v1 is not advertised");
                 return;
             }
+            if (std.mem.eql(u8, bound.interface, external_global.interface) and !self.externalOffered()) {
+                // the relay would not name its buffers, or nothing on the page resolves them
+                self.sendError(conn_id, header.object_id, display_err_invalid_object, "wland_external_buffer_manager_v1 is not advertised");
+                return;
+            }
             self.onBind(conn_id, conn, bound.interface, bound.version, bound.id);
             return;
         }
@@ -2163,6 +2203,17 @@ pub const Compositor = struct {
                 // default one, sent once (it never changes on this link)
                 self.sendDmabufFeedback(conn_id, args[0].new_id);
             }
+        } else if (std.mem.eql(u8, iface.name, "wland_external_buffer_manager_v1") and std.mem.eql(u8, msg.name, "create_buffer")) {
+            // args: buffer, id_hi, id_lo, width, height, format, flags.
+            // trackNewIds made the wl_buffer (client id, like create_immed);
+            // the core tracks buffers only as objects: what it holds reaches
+            // the embedder in the COMMIT (kind external), sizes through
+            // noteBufferSize. An error is fatal, so the stray object never matters.
+            stream.ExternalRef.checkArgs(args[3].int, args[4].int, args[5].uint, args[6].uint) catch |err| switch (err) {
+                error.BadFormat => return self.sendError(conn_id, header.object_id, external_err_invalid_format, "format is not ARGB8888, XRGB8888, ABGR8888 or XBGR8888"),
+                error.BadDimensions => return self.sendError(conn_id, header.object_id, external_err_invalid_dimensions, "width and height must be within 1..16384"),
+                error.BadFlags => return self.sendError(conn_id, header.object_id, external_err_invalid_flags, "unknown flags"),
+            };
         } else if (std.mem.eql(u8, iface.name, "zwp_linux_buffer_params_v1")) {
             // `add` arrives as FDMSG kind dmabuf: the relay kept the fd
             try self.dmabufParamsRequest(conn_id, conn, header.object_id, msg.name, args);
@@ -3620,6 +3671,7 @@ pub const Compositor = struct {
     fn sendGlobals(self: *Compositor, conn_id: u32, registry_id: u32) void {
         for (globals) |g| self.sendGlobal(conn_id, registry_id, g);
         if (self.dmabuf != null) self.sendGlobal(conn_id, registry_id, dmabuf_global);
+        if (self.externalOffered()) self.sendGlobal(conn_id, registry_id, external_global);
     }
 
     fn sendGlobal(self: *Compositor, conn_id: u32, registry_id: u32, g: Global) void {
@@ -10708,6 +10760,198 @@ test "linux-dmabuf params: plane_idx, plane_set, already_used, incomplete, inval
     sink.events.clearRetainingCapacity();
     try Case.immed(&comp, p, 0, 4, fourcc_xrgb8888);
     try std.testing.expectEqual(@as(?u32, dmabuf_err_invalid_dimensions), lastErrorCode(&sink));
+}
+
+// --- wland_external_buffer_manager_v1 ------------------------------------------
+
+const ExtTest = struct {
+    const mgr = protocol.find("wland_external_buffer_manager_v1").?;
+    const create_op = mgr.requestIndex("create_buffer").?;
+    const mgr_destroy_op = mgr.requestIndex("destroy").?;
+    const buf_destroy_op = protocol.find("wl_buffer").?.requestIndex("destroy").?;
+    const surf = protocol.find("wl_surface").?;
+    const attach_op = surf.requestIndex("attach").?;
+    const damage_op = surf.requestIndex("damage_buffer").?;
+    const commit_op = surf.requestIndex("commit").?;
+    const argb: u32 = 0x34325241;
+
+    /// Whether conn 1's registry (id 2) lists the global.
+    fn advertised(comp: *Compositor, sink: *TestSink) !bool {
+        var buf: [128]u8 = undefined;
+        sink.events.clearRetainingCapacity();
+        try comp.onWire(1, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }}));
+        var vals: [wire.max_args]wire.Value = undefined;
+        var found = false;
+        for (sink.events.items) |ev| {
+            const args = try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .uint, .string, .uint }, &vals);
+            if (std.mem.eql(u8, args[1].string.?, external_global.interface)) {
+                try std.testing.expectEqual(external_global.name, args[0].uint);
+                try std.testing.expectEqual(@as(u32, 1), args[2].uint);
+                found = true;
+            }
+        }
+        try std.testing.expectEqual(globals.len + @intFromBool(found), sink.events.items.len);
+        return found;
+    }
+
+    /// Bind the manager as id 3 (registry 2).
+    fn bind(comp: *Compositor) !void {
+        var buf: [128]u8 = undefined;
+        try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = external_global.name }, .{ .new_id_dynamic = .{ .interface = external_global.interface, .version = 1, .id = 3 } } }));
+    }
+
+    fn create(comp: *Compositor, buffer: u32, id: u64, w: i32, h: i32, format: u32, flags: u32) !void {
+        var buf: [128]u8 = undefined;
+        try comp.onWire(1, wire.encodeMessage(&buf, 3, create_op, &.{
+            .{ .new_id = buffer }, .{ .uint = @truncate(id >> 32) }, .{ .uint = @truncate(id) },
+            .{ .int = w },         .{ .int = h },                     .{ .uint = format },
+            .{ .uint = flags },
+        }));
+    }
+
+    /// A link with the global offered, conn 1 open, registry 2, manager 3.
+    fn setup(comp: *Compositor, sink: *TestSink) !void {
+        comp.external_source = true;
+        comp.applyFeature(@intFromEnum(stream.FeatureKind.external_buffer), &.{});
+        try comp.connOpen(1);
+        try std.testing.expect(try advertised(comp, sink));
+        try bind(comp);
+        try std.testing.expectEqual(@as(?u32, null), lastErrorCode(sink));
+    }
+};
+
+test "external buffers: the global needs FEATURE external_buffer AND an embedder that resolves them, in either order; off by default" {
+    const Case = struct { feature: bool, source: bool, source_first: bool = true };
+    const cases = [_]Case{
+        .{ .feature = false, .source = false },
+        .{ .feature = true, .source = false },
+        .{ .feature = false, .source = true },
+        .{ .feature = true, .source = true },
+        .{ .feature = true, .source = true, .source_first = false }, // the embedder says after the frame
+    };
+    {
+        var sink: TestSink = undefined;
+        var comp = testSetup(&sink);
+        defer comp.deinit();
+        defer sink.events.deinit(sink.gpa);
+        try std.testing.expect(!comp.external_source); // native users never offer it by accident
+        try std.testing.expect(!comp.externalOffered());
+    }
+    for (cases) |c| {
+        var sink: TestSink = undefined;
+        var comp = testSetup(&sink);
+        defer comp.deinit();
+        defer sink.events.deinit(sink.gpa);
+        if (c.source_first) comp.external_source = c.source;
+        if (c.feature) comp.applyFeature(@intFromEnum(stream.FeatureKind.external_buffer), "ignored bytes");
+        if (!c.source_first) comp.external_source = c.source;
+        const on = c.feature and c.source;
+        try std.testing.expectEqual(on, comp.externalOffered());
+        // the FEATURE is one log line either way, not fatal
+        try std.testing.expectEqual(@as(u32, @intFromBool(c.feature)), sink.logs);
+        try comp.connOpen(1);
+        try std.testing.expectEqual(on, try ExtTest.advertised(&comp, &sink));
+        try ExtTest.bind(&comp);
+        if (on) {
+            try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+            try std.testing.expectEqualStrings(external_global.interface, comp.conns.get(1).?.objects.get(3).?.iface.name);
+        } else {
+            // never advertised: binding it anyway is refused, as linux-dmabuf's
+            try std.testing.expectEqual(@as(?u32, display_err_invalid_object), lastErrorCode(&sink));
+        }
+    }
+}
+
+test "external buffers: create_buffer makes the client's wl_buffer; attach, commit and destroy need nothing more; the manager's destroy leaves its buffers" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try ExtTest.setup(&comp, &sink);
+    var buf: [128]u8 = undefined;
+    // the bounds and every known flag pass
+    try ExtTest.create(&comp, 10, 0xdead_beef_0000_0007, 64, 32, ExtTest.argb, 0);
+    try ExtTest.create(&comp, 11, 0, 16384, 1, 0x34324258, stream.ExternalRef.flag_y_invert); // XBGR8888, y_invert
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+    const conn = comp.conns.get(1).?;
+    try std.testing.expectEqualStrings("wl_buffer", conn.objects.get(10).?.iface.name);
+    try std.testing.expectEqualStrings("wl_buffer", conn.objects.get(11).?.iface.name);
+
+    // the manager goes; its buffers stay
+    try comp.onWire(1, wire.encodeMessage(&buf, 3, ExtTest.mgr_destroy_op, &.{}));
+    try std.testing.expect(conn.objects.get(3) == null);
+    try std.testing.expect(conn.objects.get(10) != null);
+
+    // a surface shows it like any buffer (it enters the output)
+    try comp.onWire(1, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 1 }, .{ .new_id_dynamic = .{ .interface = "wl_compositor", .version = 4, .id = 4 } } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 4, 0, &.{.{ .new_id = 6 }}));
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, ExtTest.attach_op, &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, ExtTest.damage_op, &.{ .{ .int = 0 }, .{ .int = 0 }, .{ .int = 64 }, .{ .int = 32 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, ExtTest.commit_op, &.{}));
+    comp.noteBufferSize(1, 6, 64, 32); // what the engine does with the COMMIT's size
+    const s = conn.surfaces.get(6).?;
+    try std.testing.expectEqual(@as(i32, 64), s.log_w);
+    try std.testing.expectEqual(@as(i32, 32), s.log_h);
+
+    // destroy while attached: delete_id, nothing else
+    sink.events.clearRetainingCapacity();
+    try comp.onWire(1, wire.encodeMessage(&buf, 10, ExtTest.buf_destroy_op, &.{}));
+    try std.testing.expect(conn.objects.get(10) == null);
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try std.testing.expectEqual(@as(u16, comptime protocol.find("wl_display").?.eventIndex("delete_id").?), sink.events.items[0].opcode);
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, ExtTest.attach_op, &.{ .{ .object = 0 }, .{ .int = 0 }, .{ .int = 0 } }));
+    try comp.onWire(1, wire.encodeMessage(&buf, 6, ExtTest.commit_op, &.{}));
+    try std.testing.expectEqual(@as(?u32, null), lastErrorCode(&sink));
+}
+
+test "external buffers: create_buffer's protocol errors on the manager, in the XML's order" {
+    const fourcc_nv12: u32 = 0x3231564e;
+    const Case = struct { w: i32, h: i32, format: u32, flags: u32, err: u32 };
+    const cases = [_]Case{
+        .{ .w = 8, .h = 8, .format = fourcc_nv12, .flags = 0, .err = external_err_invalid_format },
+        .{ .w = 8, .h = 8, .format = 0, .flags = 0, .err = external_err_invalid_format }, // a wl_shm code is not a fourcc
+        .{ .w = 0, .h = 8, .format = ExtTest.argb, .flags = 0, .err = external_err_invalid_dimensions },
+        .{ .w = 8, .h = -1, .format = ExtTest.argb, .flags = 0, .err = external_err_invalid_dimensions },
+        .{ .w = 16385, .h = 8, .format = ExtTest.argb, .flags = 0, .err = external_err_invalid_dimensions },
+        .{ .w = 8, .h = 16385, .format = ExtTest.argb, .flags = 0, .err = external_err_invalid_dimensions },
+        .{ .w = 8, .h = 8, .format = ExtTest.argb, .flags = 2, .err = external_err_invalid_flags },
+        .{ .w = 8, .h = 8, .format = ExtTest.argb, .flags = 0x8000_0001, .err = external_err_invalid_flags },
+        // more than one wrong: format first, then dimensions
+        .{ .w = 0, .h = 0, .format = fourcc_nv12, .flags = 4, .err = external_err_invalid_format },
+        .{ .w = 0, .h = 0, .format = ExtTest.argb, .flags = 4, .err = external_err_invalid_dimensions },
+    };
+    for (cases) |c| {
+        var sink: TestSink = undefined;
+        var comp = testSetup(&sink);
+        defer comp.deinit();
+        defer sink.events.deinit(sink.gpa);
+        try ExtTest.setup(&comp, &sink);
+        sink.events.clearRetainingCapacity();
+        try ExtTest.create(&comp, 10, 1, c.w, c.h, c.format, c.flags);
+        try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+        const ev = sink.events.items[0];
+        var vals: [wire.max_args]wire.Value = undefined;
+        const args = try wire.decodeArgs(ev.bytes[wire.header_size..ev.len], &.{ .object, .uint, .string }, &vals);
+        try std.testing.expectEqual(@as(u32, 3), args[0].object); // on the manager
+        try std.testing.expectEqual(c.err, args[1].uint);
+    }
+}
+
+test "external buffers: a new link starts with the global off (the relay's FEATURE and the embedder's word are per link)" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer sink.events.deinit(sink.gpa);
+    try ExtTest.setup(&comp, &sink);
+    // a link that opens again is a fresh compositor (wasm wland_init); its
+    // relay's FEATURE frames decide again, the embedder's flag is re-set
+    comp.deinit();
+    sink.events.deinit(sink.gpa);
+    comp = testSetup(&sink);
+    defer comp.deinit();
+    try std.testing.expect(!comp.external_relay);
+    comp.external_source = true;
+    try comp.connOpen(1);
+    try std.testing.expect(!try ExtTest.advertised(&comp, &sink));
 }
 
 // --- pointer constraints + relative pointer -----------------------------------

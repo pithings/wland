@@ -35,6 +35,10 @@ export type AppRole =
   // a GPU client (linux-dmabuf); the fixture's buffers are memfds, which
   // only the relay's test-only `--dmabuf virtgpu:@fake` takes
   | 'dmabuf'
+  // a client of wland_external_buffer_manager_v1 (buffers the embedder
+  // resolves by id; wl_shm when the global is absent). wland's own
+  // protocol: no real app speaks it, fixture-only
+  | 'external'
   // an SDL2 game: xdg-decoration made before its first commit, no frame of
   // its own (neverball)
   | 'game'
@@ -157,6 +161,8 @@ function real(role: AppRole, args: string[]): AppSpec {
     // container at GTK's first icon, testing.md "Setup")
     case 'browser': return spec('firefox', ['--no-remote', '--new-instance', ...args]);
     case 'dmabuf': return spec('weston-simple-dmabuf-egl', args);
+    // no real app (the phases skip it with WLAND_E2E_APPS=real)
+    case 'external': return spec('wland-external-client', args);
     case 'touch': return spec('weston-simple-touch', args);
     // SDL2 (sdl2-compat here); no libdecor (its GTK plugin aborts in this
     // container), no audio device needed

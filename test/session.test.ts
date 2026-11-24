@@ -6,7 +6,7 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createEngine, type Engine, type Event, type Link, type LinkCallbacks } from '../lib/engine.ts';
+import { createEngine, type Engine, type Event, type GpuSource, type Link, type LinkCallbacks } from '../lib/engine.ts';
 import { installFakeDom } from './fake-dom.ts';
 import { createView } from '../lib/view.ts';
 import { createInput } from '../lib/input.ts';
@@ -84,12 +84,12 @@ function taker(link: ScriptedLink) {
   return () => framesOf(link.sent.splice(0)).map(hex);
 }
 
-async function setup(prepare?: (engine: Engine) => void, decorations?: 'client' | 'server') {
+async function setup(prepare?: (engine: Engine) => void, decorations?: 'client' | 'server', gpu?: GpuSource) {
   const link = scriptedLink();
   const events: any[] = [];
   let engine!: Engine;
   engine = await createEngine({
-    wasm, link, decorations,
+    wasm, link, decorations, gpu,
     onEvent: (ev: Event) => {
       // pixels are a view valid during dispatch only; session() as seen then
       events.push(ev.type === 'commit' ? { ...ev, pixels: ev.pixels.slice() } : ev.type === 'disconnect' ? { ...ev, session: engine.session() } : ev);
@@ -122,6 +122,20 @@ test('FEATURE session: init goes out first, then the attach calls; session() has
     call(16, u32(3)),
   ].map(hex));
   assert.equal(engine.selectionBridged(), true);
+});
+
+test('a session link offers no external buffers: set_gpu_source carries the virtgpu bit only, externalBuffers() is false', async () => {
+  for (const [gpu, bit] of [
+    [{ resolveExternal: () => null }, 0],
+    [{ resolve: () => null, resolveExternal: () => null }, 1],
+  ] as [GpuSource, number][]) {
+    const { link, engine, take } = await setup(undefined, undefined, gpu);
+    assert.equal(engine.externalBuffers(), null);
+    link.cb!.onMessage(msg(feature(5), feature(4, u64(SID))));
+    assert.deepEqual(take().slice(0, 2), [call(1, i32(1, 120), u32(0)), call(2, u32(bit))].map(hex));
+    assert.equal(engine.externalBuffers(), false);
+    engine.dispose();
+  }
 });
 
 test('decorations \'server\' rides init (its third word), bounds follow as set_bounds; later setBounds is CALL 30; EVENT 16 is a decoration event', async () => {

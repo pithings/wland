@@ -853,7 +853,10 @@ pub const Session = struct {
         if (!self.synced) return; // nothing before init
         switch (op) {
             .init => unreachable,
-            .set_gpu_source => c.gpu_source = try a.u32_() != 0,
+            // a bitmask (wasm wland_set_gpu_source): bit 0 virtgpu; bit 1
+            // (external buffers) never applies here — the session relay
+            // takes no --external-buffers, so `external_source` stays false
+            .set_gpu_source => c.gpu_source = (try a.u32_()) & 1 != 0,
             .set_dpr => c.setScale(try a.i32_(), try a.i32_()),
             .desktop_size => c.setDesktopSize(try a.i32_(), try a.i32_()),
             .set_suspended => c.setSuspended(try a.u32_() != 0),

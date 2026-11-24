@@ -468,6 +468,11 @@ pub const interfaces = [_]Interface{
         .{ .name = "presented", .args = &.{ .uint, .uint, .uint, .uint, .uint, .uint, .uint }, .destructor = true, },
         .{ .name = "discarded", .args = &.{  }, .destructor = true, },
     } },
+    .{ .name = "wland_external_buffer_manager_v1", .version = 1, .requests = &.{
+        .{ .name = "destroy", .args = &.{  }, .destructor = true, },
+        .{ .name = "create_buffer", .args = &.{ .new_id, .uint, .uint, .int, .int, .uint, .uint }, .new_id_interface = "wl_buffer", },
+    }, .events = &.{
+    } },
 };
 
 pub fn find(name: []const u8) ?*const Interface {

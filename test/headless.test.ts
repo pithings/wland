@@ -459,6 +459,79 @@ test('gpu: a resolver\'s RgbaImage lands in the scene; the ref is on the surface
   bare.hl.dispose();
 });
 
+// COMMIT kind 3 (external): u64 id, w, h, fourcc, flags
+const externalCommit = (conn: number, surface: number, serial: number, id: bigint, w: number, h: number, flags: number, rects: number[][]) =>
+  frame(0x0a, u32s(conn, surface, serial, rects.length, 3, 24, Number(id & 0xffffffffn), Number(id >> 32n), w, h, 0x34325241, flags),
+    u32s(...rects.flat()));
+
+test('external: resolveExternal\'s RgbaImage lands in the scene (row 0 at the top, its damage only); the ref is on the surface as `external`; a GPU or pixel commit replaces it', async () => {
+  const W = 4, H = 2;
+  const img = (v: number) => ({ width: W, height: H, data: new Uint8Array(W * H * 4).map((_, i) => (i % 4 === 3 ? 255 : v + 10 * (i >> 2) + (i % 4))) });
+  const first = img(0), second = img(100);
+  const asked: [bigint, number][] = [];
+  const released: unknown[] = [];
+  const ID = 0xfedc_ba98_7654_3210n;
+  const ctx = await setup({
+    gpu: {
+      resolve: () => img(200),
+      resolveExternal: (ref) => { asked.push([ref.id, ref.flags]); return ref.id === ID ? first : ref.id === ID + 1n ? second : null; },
+      release: (i) => { released.push(i); },
+    },
+    background: [0, 0, 255, 255],
+  });
+  const { hl, link } = ctx;
+  const a = client(ctx, 1);
+  const t = a.toplevel('ext');
+  const commit = (serial: number, id: bigint, rect: number[], flags = 0) =>
+    ctx.deliver(wire(1, cat(msg(t.surface, 9, ...rect), msg(t.surface, 6))), externalCommit(1, t.surface, serial, id, W, H, flags, [rect]));
+  commit(1, ID, [0, 0, W, H], 1);
+  assert.deepEqual(asked, [[ID, 1]], 'y_invert reaches the resolver (whose image is row 0 at the top)');
+  assert.deepEqual(released, [first]);
+  const [win] = hl.windows();
+  assert.deepEqual([win.width, win.height], [W, H]);
+  const [s] = hl.surfaces();
+  assert.deepEqual(s.external, { id: ID, width: W, height: H, format: 0x34325241, flags: 1 });
+  assert.equal(s.gpu, undefined);
+  const at = (x: number, y: number) => [...hl.surfacePixels(1, t.surface)!.data.subarray((y * W + x) * 4, (y * W + x) * 4 + 4)];
+  assert.deepEqual(at(0, 0), [0, 1, 2, 255]);
+  assert.deepEqual(at(1, 1), [50, 51, 52, 255], 'row 1 is the image\'s row 1');
+  assert.deepEqual(px(hl.screenshot(), win.x + 1, win.y + 1), [50, 51, 52, 255]);
+  assert.ok(link.sent.some((b) => b[0] === 0x0b && new DataView(b.buffer, b.byteOffset).getUint32(5, true) === 1));
+
+  // the next image's damaged rect only
+  commit(2, ID + 1n, [1, 0, 2, 1]);
+  assert.deepEqual([at(0, 0), at(1, 0), at(2, 0), at(3, 0), at(1, 1)],
+    [[0, 1, 2, 255], [110, 111, 112, 255], [120, 121, 122, 255], [30, 31, 32, 255], [50, 51, 52, 255]]);
+  assert.equal(hl.surfaces()[0].external!.id, ID + 1n);
+  // nothing resolved: the content stays, the ref updates
+  commit(3, 99n, [0, 0, 1, 1]);
+  assert.equal(hl.surfaces()[0].external!.id, 99n);
+  assert.deepEqual(at(1, 0), [110, 111, 112, 255]);
+  assert.deepEqual(released, [first, second]);
+  // a GPU commit: `gpu` replaces `external`
+  ctx.deliver(wire(1, cat(msg(t.surface, 9, 0, 0, W, H), msg(t.surface, 6))), virtgpuCommit(1, t.surface, 4, 7, W, H, [[0, 0, W, H]]));
+  assert.equal(hl.surfaces()[0].external, undefined);
+  assert.equal(hl.surfaces()[0].gpu!.resource, 7);
+  commit(5, ID, [0, 0, W, H]);
+  assert.equal(hl.surfaces()[0].gpu, undefined);
+  // a pixel commit: neither
+  a.paint(t.surface, W, H, [1, 2, 3, 255]);
+  assert.equal(hl.surfaces()[0].external, undefined);
+  assert.equal(hl.surfaces()[0].gpu, undefined);
+  hl.dispose();
+
+  // a gpu source without resolveExternal: an error event, the window maps at its size, transparent
+  const bare = await setup({ gpu: { resolve: () => null }, background: [0, 0, 255, 255] });
+  const tb = client(bare, 1).toplevel('ext');
+  bare.deliver(wire(1, cat(msg(tb.surface, 9, 0, 0, W, H), msg(tb.surface, 6))), externalCommit(1, tb.surface, 1, ID, W, H, 0, [[0, 0, W, H]]));
+  assert.ok(bare.events.some((e) => e.type === 'error' && /resolveExternal/.test(e.detail)));
+  const [wb] = bare.hl.windows();
+  assert.deepEqual([wb.width, wb.height], [W, H]);
+  assert.equal(bare.hl.surfaces()[0].external!.id, ID);
+  assert.deepEqual(px(bare.hl.screenshot(), wb.x, wb.y), [0, 0, 255, 255]);
+  bare.hl.dispose();
+});
+
 test('gpu: after a commit that resolved to nothing, the next image lands whole (not just its damage over the stale content)', async () => {
   const W = 4, H = 2;
   const solid = (v: number) => ({ width: W, height: H, data: new Uint8Array(W * H * 4).map((_, i) => (i % 4 === 3 ? 255 : v)) });

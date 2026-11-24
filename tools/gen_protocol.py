@@ -18,6 +18,7 @@ XMLS = [
     ROOT / "protocol" / "relative-pointer-unstable-v1.xml",
     ROOT / "protocol" / "pointer-constraints-unstable-v1.xml",
     ROOT / "protocol" / "presentation-time.xml",
+    ROOT / "protocol" / "wland-external-buffer-v1.xml",
 ]
 OUT = ROOT / "core" / "src" / "protocol_gen.zig"
 

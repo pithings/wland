@@ -44,14 +44,17 @@ export interface WlandOptions {
    *  swizzled by the core when it presents with 2D only (EngineOptions.rgba),
    *  as written when it uses WebGL. */
   buffers?: HandleSource;
-  /** The embedder's access to GPU buffers (EngineOptions.gpu), for a relay
-   *  that names GPU resources (COMMIT kind virtgpu): resolve one to a
-   *  CanvasImageSource (ImageBitmap, OffscreenCanvas, canvas, VideoFrame)
-   *  holding its current content, row 0 at the top. The view draws it into
-   *  the surface's canvas during the commit's dispatch (2D: the damaged
-   *  rects; WebGL: the whole image as the texture), then the engine calls
-   *  release(image) and ACKs. Without it, apps on `wlandr --dmabuf virtgpu`
-   *  are offered no linux-dmabuf and render in software (wl_shm). */
+  /** The embedder's access to GPU and external buffers (EngineOptions.gpu),
+   *  for a relay that names GPU resources (COMMIT kind virtgpu: resolve) or
+   *  external buffers (COMMIT kind external, `wlandr --external-buffers`:
+   *  resolveExternal): resolve one to a CanvasImageSource (ImageBitmap,
+   *  OffscreenCanvas, canvas, VideoFrame) holding its current content, row
+   *  0 at the top. The view draws it into the surface's canvas during the
+   *  commit's dispatch (2D: the damaged rects; WebGL: the whole image as the
+   *  texture), then the engine calls release(image) and ACKs. Without
+   *  resolve, apps on `wlandr --dmabuf virtgpu` are offered no linux-dmabuf
+   *  and render in software (wl_shm); without resolveExternal, no app is
+   *  offered wland_external_buffer_manager_v1 (engine.externalBuffers()). */
   gpu?: GpuSource<CanvasImageSource>;
   /** Who draws window frames for apps that let the compositor choose
    *  (EngineOptions.decorations): 'client' (default) or 'server' — for an

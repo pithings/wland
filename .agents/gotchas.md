@@ -289,6 +289,32 @@ with it. New findings go in the matching section.
   offer it, so a GPU-less page never advertises a global whose commits it
   can't show. linux_dmabuf's bytes can't grow (the table's length is the
   frame's), so a new fact is a new feature kind, not appended bytes.
+- **External buffers: three gates, because the registry is not one.** The
+  core types objects by interface name and (dmabuf and this global aside)
+  lets any bind through, and the relay intercepts by name too — so "not
+  advertised" alone stops no client. Hence: the core refuses the bind
+  while not offered (`externalOffered`: FEATURE external_buffer AND the
+  embedder's bit, read at each get_registry/bind so either may come
+  first); the relay tracks `create_buffer` only with `--external-buffers`
+  (an untracked buffer's commits ship nothing); the engine never hands a
+  kind-3 ref to a source without `resolveExternal` (ACKed, one error).
+  `Compositor.external_source` defaults to FALSE (unlike `gpu_source`):
+  the native twins and the session relay must not offer it by accident,
+  and `set_gpu_source` is a mask there too (`& 1`).
+- **External buffers: nothing bounds a ref but `stream.ExternalRef`.** No
+  device stands behind an id, so width/height (≤ 16384), format and flags
+  are checked by the same function in the core (protocol errors), the
+  relay (not tracked) and the engine (`CommitFrame.external`, ACKed
+  unshown) — the engine sizes canvases and headless allocations from the
+  ref. The relay's own check can't be reached in tests (the core rejects
+  first); it is there for a core that isn't ours.
+- **External buffers hold nothing in the relay.** `Pending.hold.none`: no
+  fd, no GEM handle, no fence wait; ordering and the id's lifetime are the
+  client's and the embedder's (STREAM.md kind 3: an id is never reused, a
+  resolver returns null for one that is gone). Like virtgpu they need the
+  conn's ACK eventfd under `--buffers copy` (`serveApp`'s `commits`) and
+  drop the copy backend's shadow when shown; they are the same
+  `ShownKind.resource` as virtgpu.
 
 - **X11 = xwayland-satellite, launched by wlandr** (`xwayland.zig`). The
   display is claimed like an X server does (pid in `/tmp/.X<n>-lock`, written

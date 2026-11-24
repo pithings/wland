@@ -26,6 +26,19 @@
 // dmabuf_kind (virtgpu), as wlandr does, though it offers no linux-dmabuf
 // (no linux_dmabuf frame follows: its "GPU" buffers are wl_shm ones).
 //
+// With `external: true` it plays a relay with external buffers instead (as
+// wlandr `--external-buffers` does for wland_external_buffer_manager_v1
+// buffers): each COMMIT is kind external, its id `externalId(export id,
+// skew)` — the buffer's kwshm export and the offset of its first byte in
+// it, bit 63 set (so ids pass 2^53 and the high bit: the engine's u64
+// assembly shows) — which the page's createGpuSource().resolveExternal
+// decodes (the "out of band" agreement, standing in for a client and its
+// renderer on the page; the rows are width·4 bytes apart, so it names only
+// buffers so laid out). Handles, ACKs and releases are unchanged. Each
+// link opens with FEATURE external_buffer, as wlandr's do, so the engine
+// offers the global (with a resolveExternal), though no client here binds
+// it: its "external" buffers are wl_shm ones.
+//
 // Frame callbacks are forwarded (this is a stream link): the engine fires
 // them from its frame clock. It also polices both sides and reports
 // violations: an ACK for an unknown serial, a COMMIT left un-ACKed, a release
@@ -35,7 +48,7 @@
 import {
   wlEach, wlMessage, eachEngineFrame, createBatch, stampPresented, monotonicNs, FD, HANDLE,
   connOpen, connClose, fdmsg, handleOpen, handleClose, kwshmBytes, shmCommit, virtgpuCommit,
-  dmabufKindFeature, BUFFER_KIND,
+  dmabufKindFeature, externalBufferFeature, externalCommit, BUFFER_KIND,
 } from './proto.js';
 
 // wl_shm format → DRM fourcc (ARGB8888 'AR24', XRGB8888 'XR24')
@@ -45,7 +58,17 @@ const PAGE = 4096;
 const MAX_RECTS = 64;
 const ACK_DEADLINE_MS = 2000;
 
-export function createRelay({ link, shm, violation, gpu = false }) {
+/** The id an `external: true` relay names a buffer by: bit 63, the skew
+ *  (bits 32..62), the export id (bits 0..31). */
+export const externalId = (exportId, skew) => (1n << 63n) | (BigInt(skew) << 32n) | BigInt(exportId >>> 0);
+/** externalId's parts back, or null for an id it did not make. */
+export function fromExternalId(id) {
+  if (!(id >> 63n)) return null;
+  return { exportId: Number(id & 0xffffffffn), skew: Number((id >> 32n) & 0x7fffffffn) };
+}
+
+export function createRelay({ link, shm, violation, gpu = false, external = false }) {
+  if (gpu && external) throw new Error('createRelay: gpu or external, not both');
   const conns = new Map();
   const batch = createBatch();
   const stats = { commits: 0, acks: 0, releases: 0, handles: 0 };
@@ -60,6 +83,7 @@ export function createRelay({ link, shm, violation, gpu = false }) {
       attached = true;
       // first on the link, before any CONN_OPEN (STREAM.md FEATURE)
       if (gpu) { batch.push(dmabufKindFeature(BUFFER_KIND.VIRTGPU)); flush(); }
+      if (external) { batch.push(externalBufferFeature()); flush(); }
     },
     onMessage(buf) {
       eachEngineFrame(new Uint8Array(buf), (f) => {
@@ -190,7 +214,9 @@ export function createRelay({ link, shm, violation, gpu = false }) {
   }
 
   const fits = (b) => b.pool && (b.format === 0 || b.format === 1) && b.width > 0 && b.height > 0 &&
-    b.stride >= b.width * 4 && b.offset >= 0 && b.offset + b.stride * b.height <= b.pool.size;
+    b.stride >= b.width * 4 && b.offset >= 0 && b.offset + b.stride * b.height <= b.pool.size &&
+    // an external ref carries no stride, nor a size past 16384
+    (!external || (b.stride === b.width * 4 && b.width <= 16384 && b.height <= 16384));
 
   function finishCommit(c, s) {
     if (!s) return;
@@ -217,8 +243,11 @@ export function createRelay({ link, shm, violation, gpu = false }) {
         batch.push(gpu
           ? virtgpuCommit(c.id, s.id, serial, { resource: h.exportId, width: b.width, height: b.height,
             format: FOURCC[b.format], offset: h.skew, stride: b.stride }, rects)
-          : shmCommit(c.id, s.id, serial,
-            { handle: h.id, offset: h.skew, width: b.width, height: b.height, stride: b.stride, format: b.format }, rects));
+          : external
+            ? externalCommit(c.id, s.id, serial, { id: externalId(h.exportId, h.skew), width: b.width, height: b.height,
+              format: FOURCC[b.format] }, rects)
+            : shmCommit(c.id, s.id, serial,
+              { handle: h.id, offset: h.skew, width: b.width, height: b.height, stride: b.stride, format: b.format }, rects));
         b.busy++;
         h.refs++;
         c.unacked.set(serial, { buffer: b, handle: h, at: performance.now(), late: false });

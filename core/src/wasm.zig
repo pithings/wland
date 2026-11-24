@@ -12,7 +12,8 @@
 //!   0x07 BUFFER_LZ  — wland_decode_buffer, then presented like 0x02
 //!   0x0a COMMIT     — wland_commit_notice decodes it, JS reads the pixels
 //!                     through its buffer source (shm) or resolves the GPU
-//!                     resource through its gpu source (virtgpu), dispatches
+//!                     resource through its gpu source (virtgpu, external
+//!                     — the embedder's own ids), dispatches
 //!                     the commit, then wland_commit_ack
 //! wland_tick runs from the host's frame clock (rAF). Outgoing frames go
 //! through the imported js_send; log lines through js_log.
@@ -107,8 +108,9 @@ var compositor: core.compositor.Compositor = undefined;
 /// wland_init has run: a link that opens again re-inits, freeing the old one
 var compositor_live = false;
 /// wland_set_gpu_source's last word; outlives wland_init (every link's
-/// compositor gets it). true until said otherwise.
+/// compositor gets it). virtgpu true, external false until said otherwise.
 var gpu_source = true;
+var external_source = false;
 /// A frame other than FEATURE arrived on this link: the relay's FEATURE
 /// frames (all first on a link) are in, what it can't do is settled.
 var features_settled = false;
@@ -149,6 +151,7 @@ export fn wland_init(scale: i32, scale_120: i32, decorations: u32) void {
     compositor.output_scale = std.math.clamp(scale, 1, 4);
     compositor.scale_120 = @max(1, scale_120);
     compositor.gpu_source = gpu_source;
+    compositor.external_source = external_source;
     compositor.decorations_server = decorations == 1;
     features_settled = false;
 }
@@ -164,15 +167,36 @@ export fn wland_selection_bridged() u32 {
     return if (features_settled) 0 else 2;
 }
 
-/// Whether the embedder can draw GPU buffers (COMMIT kind virtgpu; 1 yes,
-/// 0 no). Without, a relay whose dmabuf commits are GPU resources (FEATURE
-/// dmabuf_kind) gets no linux-dmabuf from the compositor: GPU clients fall
-/// back to wl_shm instead of drawing windows nothing shows. Default 1 (an
-/// embedder that never calls this is unchanged). Kept across wland_init;
+/// Which GPU-side buffers the embedder can draw, a bitmask:
+///   bit 0 (1) — virtgpu resources (COMMIT kind virtgpu). Without, a relay
+///               whose dmabuf commits are GPU resources (FEATURE
+///               dmabuf_kind) gets no linux-dmabuf from the compositor: GPU
+///               clients fall back to wl_shm instead of drawing windows
+///               nothing shows.
+///   bit 1 (2) — external buffers (COMMIT kind external): with FEATURE
+///               external_buffer the compositor advertises
+///               wland_external_buffer_manager_v1 (wland_external_buffers).
+/// Other bits are ignored. Never called: 1 (virtgpu yes, external no — an
+/// embedder that predates the mask is unchanged). Kept across wland_init;
 /// call it before the link's FEATURE frames arrive. Sends nothing.
-export fn wland_set_gpu_source(has: u32) void {
-    gpu_source = has != 0;
-    if (compositor_live) compositor.gpu_source = gpu_source;
+export fn wland_set_gpu_source(mask: u32) void {
+    gpu_source = mask & 1 != 0;
+    external_source = mask & 2 != 0;
+    if (compositor_live) {
+        compositor.gpu_source = gpu_source;
+        compositor.external_source = external_source;
+    }
+}
+
+/// Whether this link offers apps wland_external_buffer_manager_v1 (its
+/// relay sent FEATURE external_buffer and wland_set_gpu_source set bit 1):
+/// 1 yes, 0 no (the link's FEATURE frames are in without it, or the
+/// embedder resolves none), 2 not known yet (no frame but FEATURE has
+/// arrived on this link). A getter: sends nothing.
+export fn wland_external_buffers() u32 {
+    if (!compositor_live) return 2;
+    if (compositor.externalOffered()) return 1;
+    return if (features_settled) 0 else 2;
 }
 
 /// Browser devicePixelRatio changed (matchMedia resolution listener): resend
@@ -662,9 +686,10 @@ fn handleOpen(h: core.stream.HandleOpenFrame) void {
 // The decoded COMMIT notice handed to JS (wland_commit_notice): u32 words,
 // 4-byte aligned, valid until the next call. Layout (word index):
 //   0 conn_id   1 surface_id   2 serial
-//   3 kind      1 = shm, 2 = virtgpu (both validated, presentable); 0 = not
-//               presentable (unknown buffer kind or failed validation, see
-//               CommitFrame.shm/virtgpu) — ack only
+//   3 kind      1 = shm, 2 = virtgpu, 3 = external (validated,
+//               presentable); 0 = not presentable (unknown buffer kind or
+//               failed validation, see CommitFrame.shm/virtgpu/external) —
+//               ack only
 //   4 n_rects   (0 when kind = 0)
 //   5 …13       kind-specific:
 //               shm      5 handle_id  6 offset  7 width  8 height  9 stride
@@ -672,6 +697,8 @@ fn handleOpen(h: core.stream.HandleOpenFrame) void {
 //               virtgpu  5 resource  6 width  7 height  8 format (DRM fourcc)
 //                        9 flags  10 offset  11 stride  12 modifier low 32
 //                        13 modifier high 32
+//               external 5 id low 32  6 id high 32  7 width  8 height
+//                        9 format (DRM fourcc)  10 flags (1 y_invert)
 //  14 …         n_rects × {i32 x, y, w, h}, buffer px
 // Words 4–13 are 0 when kind = 0, and unused kind-specific words are 0.
 pub const notice_words = 14;
@@ -698,6 +725,10 @@ export fn wland_commit_notice(ptr: [*]const u8, len: usize) usize {
             head[3] = 2;
             head[5..14].* = .{ r.resource, r.width, r.height, r.format, r.flags, r.offset, r.stride, @truncate(r.modifier), @truncate(r.modifier >> 32) };
         } else |err| logf("COMMIT c{d} serial {d}: not presentable ({t}, kind virtgpu)", .{ f.conn_id, f.serial, err }),
+        @intFromEnum(core.stream.BufferKind.external) => if (f.external()) |r| {
+            head[3] = 3;
+            head[5..11].* = .{ @truncate(r.id), @truncate(r.id >> 32), r.width, r.height, r.format, r.flags };
+        } else |err| logf("COMMIT c{d} serial {d}: not presentable ({t}, kind external)", .{ f.conn_id, f.serial, err }),
         else => if (f.shm()) |r| {
             head[3] = 1;
             head[5..11].* = .{ r.handle_id, r.offset, r.width, r.height, r.stride, r.format };

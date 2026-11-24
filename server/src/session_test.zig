@@ -965,3 +965,30 @@ fn writeAll(fd: i32, bytes: []const u8) !void {
         }
     }
 }
+
+test "session: set_gpu_source is a bitmask — bit 0 says virtgpu; bit 1 (external buffers) offers nothing here" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    const a = try rig.viewer();
+    try a.init();
+    try rig.synced(a);
+    const Ctx = struct { s: *Session, want: bool };
+    const Step = struct { mask: u32, want: bool };
+    for ([_]Step{ .{ .mask = 2, .want = false }, .{ .mask = 3, .want = true }, .{ .mask = 0, .want = false }, .{ .mask = 1, .want = true } }) |step| {
+        try a.call(.set_gpu_source, &le(step.mask));
+        try rig.until(Ctx{ .s = rig.session, .want = step.want }, struct {
+            fn pred(x: Ctx) bool {
+                x.s.mutex.lockUncancelable(x.s.io);
+                defer x.s.mutex.unlock(x.s.io);
+                return x.s.comp.gpu_source == x.want;
+            }
+        }.pred);
+        rig.session.mutex.lockUncancelable(rig.session.io);
+        defer rig.session.mutex.unlock(rig.session.io);
+        // the session relay takes no --external-buffers: never offered
+        try std.testing.expect(!rig.session.comp.external_source);
+        try std.testing.expect(!rig.session.comp.externalOffered());
+    }
+}

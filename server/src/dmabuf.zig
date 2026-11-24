@@ -512,6 +512,10 @@ pub const View = union(enum) {
         gem: u32,
         importer: *virtgpu.Importer,
     },
+    /// Not a dmabuf: a wland_external_buffer_manager_v1 buffer (relay
+    /// `--external-buffers`), named by the client's id — a COMMIT of kind
+    /// external, released on its ACK; nothing is held for it.
+    external: stream.ExternalRef,
 };
 
 /// How long a commit waits for a dmabuf's pending GPU writes before

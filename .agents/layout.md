@@ -15,7 +15,7 @@ Where things live and which file owns what. Details are in the code.
 ## `server/src/` — the relay
 
 - `main.zig` CLI (`--port/--host/--web-root` = HTTP+WS; `--link fd:|unix:|vsock:`;
-  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `--no-fence-wait`;
+  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `--no-fence-wait`; `--external-buffers`;
   `--link-on-demand [--link-timeout MS]` (the dial loop `serveStreamLink`, bounded `dialWithin`;
   its state is relay.zig `OnDemand`);
   `--version` (version from package.json via `build.zig`, + a features line);
@@ -36,7 +36,11 @@ Where things live and which file owns what. Details are in the code.
   (readback: map + copy path; virtgpu: name the resource → COMMIT kind 2),
   FEATURE bytes · `virtgpu.zig` virtio-gpu DRM UAPI (PRIME import,
   RESOURCE_INFO, GEM_CLOSE), the relay-wide GEM-handle refcounts, and
-  `Fake`, the test-only stand-in device.
+  `Fake`, the test-only stand-in device. External buffers
+  (`wland_external_buffer_manager_v1`, `--external-buffers`) have no file
+  of their own: `relay.zig` tracks `create_buffer` (`Tracked.Source.external`)
+  and emits COMMIT kind 3 from `finishCommit`; the rules a ref is held to
+  are core's `stream.ExternalRef`.
 - `socket.zig` claiming the wayland socket name (flock'd `<name>.lock`,
   first free `wayland-N`, never a live socket; libwayland's scheme) and
   removing both files at exit, signals included.
@@ -119,7 +123,9 @@ import lib/ source, never dist/.
   toplevels, `simple.zig` shm + presentation, `clip.zig`, `pointer.zig`
   cursor/constraints/relative, `term.zig` (foot), `files.zig` (nautilus),
   `browser.zig` (Firefox's seat shape: wl_seat bound twice),
-  `dmabuf.zig` (a linux-dmabuf GPU client over memfds), `touch.zig`
+  `dmabuf.zig` (a linux-dmabuf GPU client over memfds), `external.zig`
+  (wland_external_buffer_manager_v1: two ids committed in turn, wl_shm when
+  the global is absent; no real app speaks it), `touch.zig`
   (weston-simple-touch: wl_touch; its title strip moves it by a finger).
   `test/support/apps.ts` maps E2E roles to a fixture or the real app.
   `test/support/` — plain-JS Wayland helpers for tests (STREAM encoder, JS

@@ -30,13 +30,18 @@
 //!                                is configured with; `b` toggles the border
 //!   touch                        weston-simple-touch: wl_touch, a dot per
 //!                                point; a down in its title strip moves it
+//!   external [--frames N]        a wland_external_buffer_manager_v1 client
+//!                                (no real app: wland's own protocol): two
+//!                                ids committed in turn; wl_shm without the
+//!                                global (`wlandr --external-buffers` + a page
+//!                                that resolves them offers it)
 
 const std = @import("std");
 const wl = @import("wl.zig");
 
 const usage =
     \\usage: wland-fixture <mode> [args]
-    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf game touch
+    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf game touch external
     \\
 ;
 
@@ -71,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "dmabuf", @import("dmabuf.zig").run },
         .{ "game", @import("game.zig").run },
         .{ "touch", @import("touch.zig").run },
+        .{ "external", @import("external.zig").run },
     };
     inline for (modes) |m| {
         if (std.mem.eql(u8, mode, m[0])) return m[1](gpa, env, args);

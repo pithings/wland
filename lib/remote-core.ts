@@ -443,6 +443,9 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
     },
     wland_keyboard_locks_state: () => locks,
     wland_selection_bridged: () => 1,
+    // the session profile offers no external buffers (STREAM.md FEATURE
+    // external_buffer)
+    wland_external_buffers: () => 0,
   };
   for (const [name, [op, kinds]] of Object.entries(CALLS)) {
     if (name === 'wland_keyboard_locks') continue; // (above: it also updates the mirror)

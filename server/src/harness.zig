@@ -24,6 +24,11 @@
 //! dmabuf virtgpu: pass a `dmabuf` Config whose importer runs on a
 //! `virtgpu.Fake` and set `engine.gpu` to it; kind-virtgpu COMMITs land in
 //! `Engine.gpu_commits` and their resources' pixels in `Engine.surfaces`.
+//! External buffers: pass `.external_buffers = true` (the relay's flag) and
+//! `.external_source = true` (the engine resolves them); kind-external
+//! COMMITs land in `Engine.external_commits`, ACKed like the others, and
+//! the engine's stand-in resolver paints each damaged pixel of the surface
+//! as the id's low 32 bits (`externalPixel`).
 //! Copy mode: BUFFER / BUFFER_LZ pixels land in `Engine.surfaces` too (byte
 //! order put back to the client's BGRA; X alpha comes out 0xff). Like the
 //! reference GL presenter, a surface whose content changes kind (handle
@@ -55,6 +60,10 @@ pub const Options = struct {
     dmabuf: ?dmabuf.Config = null,
     /// the engine can draw GPU buffers (Compositor.gpu_source)
     gpu_source: bool = true,
+    /// the relay runs with --external-buffers (FEATURE external_buffer)
+    external_buffers: bool = false,
+    /// the engine resolves external buffers (Compositor.external_source)
+    external_source: bool = false,
 };
 
 pub const Loop = struct {
@@ -84,10 +93,11 @@ pub const Loop = struct {
             .engine = undefined,
         };
         const io = self.threaded.io();
-        self.relay = .{ .io = io, .gpa = gpa, .backend = opts.backend, .dmabuf = opts.dmabuf };
+        self.relay = .{ .io = io, .gpa = gpa, .backend = opts.backend, .dmabuf = opts.dmabuf, .external = opts.external_buffers };
         self.link.init(io, self.link_fds[0], opts.frame_callbacks);
         self.engine.init(gpa, self.link_fds[1]);
         self.engine.comp.gpu_source = opts.gpu_source;
+        self.engine.comp.external_source = opts.external_source;
         self.link_thread = try std.Thread.spawn(.{}, relay_mod.serveLink, .{ &self.relay, &self.link.link });
     }
 
@@ -304,6 +314,8 @@ pub const Engine = struct {
     auto_ack: bool = true,
     /// Every COMMIT of buffer kind virtgpu received, in order.
     gpu_commits: std.ArrayList(SeenGpuCommit) = .empty,
+    /// Every COMMIT of buffer kind external received, in order.
+    external_commits: std.ArrayList(SeenExternalCommit) = .empty,
     /// The virtio-gpu stand-in the relay names resources on (a test's
     /// `virtgpu.Fake`): set, the engine resolves each kind-virtgpu COMMIT's
     /// resource through it as the host renderer would and reads the damaged
@@ -317,6 +329,7 @@ pub const Engine = struct {
     pub const ContentKind = enum { handle, buffer, gpu };
     pub const SeenCommit = struct { conn_id: u32, surface_id: u32, serial: u32, ref: stream.ShmRef, n_rects: u32, first_rect: stream.Rect };
     pub const SeenGpuCommit = struct { conn_id: u32, surface_id: u32, serial: u32, ref: stream.VirtgpuRef, n_rects: u32, first_rect: stream.Rect };
+    pub const SeenExternalCommit = struct { conn_id: u32, surface_id: u32, serial: u32, ref: stream.ExternalRef, n_rects: u32, first_rect: stream.Rect };
 
     pub fn key(conn_id: u32, id: u32) u64 {
         return @as(u64, conn_id) << 32 | id;
@@ -354,6 +367,7 @@ pub const Engine = struct {
         self.surfaces.deinit(self.gpa);
         self.commits.deinit(self.gpa);
         self.gpu_commits.deinit(self.gpa);
+        self.external_commits.deinit(self.gpa);
     }
 
     /// ACK a COMMIT now (auto_ack = false tests). Any serial goes — the
@@ -451,6 +465,7 @@ pub const Engine = struct {
     fn commitNotice(self: *Engine, f: stream.CommitFrame) !void {
         defer if (self.auto_ack) self.batch.ack(self.gpa, f.conn_id, f.serial) catch @panic("OOM");
         if (f.kind == @intFromEnum(stream.BufferKind.virtgpu)) return self.gpuCommit(f);
+        if (f.kind == @intFromEnum(stream.BufferKind.external)) return self.externalCommit(f);
         const ref = f.shm() catch {
             self.errors += 1;
             return;
@@ -507,6 +522,36 @@ pub const Engine = struct {
                 const n = linux.pread(fd, out.ptr, out.len, @intCast(@as(usize, ref.offset) + y * ref.stride + x * 4));
                 if (linux.errno(n) != .SUCCESS or n != out.len) self.errors += 1;
             }
+        }
+    }
+
+    /// What the stand-in resolver shows of external buffer `id`, every
+    /// pixel: its low 32 bits (little-endian, as the surface's bytes).
+    pub fn externalPixel(id: u64) [4]u8 {
+        var px: [4]u8 = undefined;
+        std.mem.writeInt(u32, &px, @truncate(id), .little);
+        return px;
+    }
+
+    /// A kind-external COMMIT: record it and "resolve" it — the damaged
+    /// rects of the surface take `externalPixel(id)`. Same content kind as
+    /// a GPU resource (both are images the embedder resolved).
+    fn externalCommit(self: *Engine, f: stream.CommitFrame) !void {
+        const ref = f.external() catch {
+            self.errors += 1;
+            return;
+        };
+        try self.external_commits.append(self.gpa, .{ .conn_id = f.conn_id, .surface_id = f.surface_id, .serial = f.serial, .ref = ref, .n_rects = f.n_rects, .first_rect = f.rectAt(0) });
+        const dst = try self.surfaceFor(f.conn_id, f.surface_id, ref.width, ref.height, .gpu);
+        const px = externalPixel(ref.id);
+        var i: u32 = 0;
+        while (i < f.n_rects) : (i += 1) {
+            const r = f.rectAt(i);
+            for (0..@intCast(r.h)) |row| for (0..@intCast(r.w)) |col| {
+                const y = @as(usize, @intCast(r.y)) + row;
+                const x = @as(usize, @intCast(r.x)) + col;
+                dst[(y * ref.width + x) * 4 ..][0..4].* = px;
+            };
         }
     }
 

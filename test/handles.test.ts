@@ -6,13 +6,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createEngine, type BufferHandle, type CommitEvent, type GpuRef, type GpuSource, type HandleRead, type HandleSource, type LinkCallbacks } from '../lib/engine.ts';
+import { createEngine, type BufferHandle, type CommitEvent, type ExternalRef, type GpuRef, type GpuSource, type HandleRead, type HandleSource, type LinkCallbacks } from '../lib/engine.ts';
 import { swizzleRect } from '../lib/present.ts';
 import { createView } from '../lib/view.ts';
 import { installFakeDom } from './fake-dom.ts';
 import {
   wlMessage as msg, wlEach, eachEngineFrame, pack, T, FD, HANDLE, SHM,
-  connOpen, connClose, wireFrame, fdmsg, handleOpen, handleClose, kwshmBytes, procfdBytes, shmCommit, virtgpuCommit,
+  connOpen, connClose, wireFrame, fdmsg, handleOpen, handleClose, kwshmBytes, procfdBytes, shmCommit, virtgpuCommit, externalCommit,
 } from './support/proto.js';
 
 const wasm = await readFile(new URL('../lib/wland.wasm', import.meta.url));
@@ -933,6 +933,223 @@ test('2D view through the engine: the image after one that never came is drawn w
     canvas.draws.length = 0;
     deliver(commitWire(), virtgpuCommit(conn, SURF, 4, gref(3), [[6, 3, 1, 1]]));
     assert.deepEqual(canvas.draws, [['clear', 6, 3, 1, 1], ['draw', images[3], 6, 3, 1, 1, 6, 3, 1, 1]], 'then the damage again');
+  } finally {
+    dom.uninstall();
+  }
+});
+
+// --- external buffers: COMMIT kind external (STREAM.md), GpuSource.resolveExternal
+
+const ARGB8888 = 0x34325241;
+// ids past 2^53 with bit 63 set: a Number-based assembly would lose or sign them
+const BIG = 0x8000_0001_2345_6789n;
+const xref = (id: bigint, over: Partial<ExternalRef> = {}): ExternalRef => ({ id, width: W, height: H, format: XBGR8888, flags: 0, ...over });
+
+test('encoder cross-check: an external COMMIT matches the pinned layout', () => {
+  const u32 = (...v: number[]) => [...new Uint8Array(new Uint32Array(v).buffer)];
+  assert.deepEqual([...externalCommit(2, 6, 17, xref(0x0102030405060708n, { flags: 1 }), [[0, 0, 1, 1]])],
+    [0x0a, ...u32(2, 6, 17, 1, 3, 24), 8, 7, 6, 5, 4, 3, 2, 1, ...u32(W, H, XBGR8888, 1), ...u32(0, 0, 1, 1)]);
+});
+
+test('external COMMIT: resolveExternal gets the ref (a u64 id, high bit set) and the commit; dispatched with `external` and the image, released, then ACKed once; resolve is never asked', async () => {
+  const calls: any[] = [];
+  const image = { tag: 'frame' };
+  const gpu: GpuSource<typeof image> = {
+    resolve() { calls.push(['resolve']); return null; },
+    resolveExternal(ref, commit) { calls.push(['resolveExternal', ref, commit.conn, commit.surface, [...commit.damage]]); return image; },
+    release(img) { calls.push(['release', img]); },
+  };
+  const { events, link, deliver, commitWire, conn } = await setup({ gpu });
+  for (const [serial, id] of [[1, BIG], [2, 0xffff_ffff_ffff_ffffn], [3, 0x1_0000_0000n]] as const) {
+    deliver(commitWire(), externalCommit(conn, SURF, serial, xref(id, { flags: 1, format: ARGB8888 }), [[0, 0, W, H], [1, 1, 2, 2]]));
+  }
+  const ids = calls.filter((c) => c[0] === 'resolveExternal').map((c) => c[1].id);
+  assert.deepEqual(ids, [BIG, 0xffff_ffff_ffff_ffffn, 0x1_0000_0000n]);
+  assert.ok(ids.every((id) => typeof id === 'bigint'));
+  assert.deepEqual(calls[0], ['resolveExternal', xref(BIG, { flags: 1, format: ARGB8888 }), conn, SURF, [0, 0, W, H, 1, 1, 2, 2]]);
+  assert.deepEqual(calls[1], ['release', image], 'released after the dispatch');
+  assert.equal(calls.filter((c) => c[0] === 'resolve').length, 0);
+  assert.equal(calls.filter((c) => c[0] === 'release').length, 3, 'once per image');
+  const [c] = events.filter((e) => e.type === 'commit');
+  assert.equal(c.format, 'gpu');
+  assert.deepEqual(c.external, xref(BIG, { flags: 1, format: ARGB8888 }));
+  assert.equal(c.gpu, undefined, 'exactly one of gpu / external');
+  assert.equal(c.image, image);
+  assert.equal(c.pixels.length, 0);
+  assert.deepEqual([c.width, c.height, c.logicalWidth, c.logicalHeight, c.stride], [W, H, W, H, 0]);
+  assert.deepEqual([...c.damage], [0, 0, W, H, 1, 1, 2, 2]);
+  assert.equal(c.acksBefore, 0, 'the ACK follows the dispatch');
+  assert.deepEqual(acks(link), [[conn, 1], [conn, 2], [conn, 3]]);
+});
+
+test('external: a promise stalls later frames until it settles; throwing, rejecting or null shows nothing new; invalid refs (format, 0 or 16385 px, flags 2) are ACKed unseen', async () => {
+  const waiting: (() => void)[] = [];
+  const released: unknown[] = [];
+  const asked: bigint[] = [];
+  const gpu: GpuSource<string> = {
+    resolveExternal(ref) {
+      asked.push(ref.id);
+      if (ref.id === 1n) return new Promise((res) => waiting.push(() => res('late')));
+      if (ref.id === 2n) throw new Error('no such id');
+      if (ref.id === 3n) return Promise.reject(new Error('gone'));
+      return null;
+    },
+    release(img) { released.push(img); },
+  };
+  const { events, link, deliver, commitWire, conn } = await setup({ gpu });
+  deliver(commitWire(), externalCommit(conn, SURF, 1, xref(1n), [[0, 0, W, H]]), wireFrame(conn, msg(TOP, 2, ['after'])),
+    commitWire(), externalCommit(conn, SURF, 2, xref(4n), [[0, 0, W, H]]));
+  const titles = () => events.filter((e) => e.type === 'title').map((e) => e.title);
+  assert.deepEqual(titles(), [], 'the title frame waits for the promise');
+  assert.deepEqual(asked, [1n], 'so does the next COMMIT');
+  assert.deepEqual(acks(link), []);
+  waiting.shift()!();
+  await ticks();
+  assert.deepEqual(titles(), ['after']);
+  assert.deepEqual(asked, [1n, 4n]);
+  assert.deepEqual(events.filter((e) => e.type === 'commit' || e.type === 'title').map((e) => e.type === 'title' ? e.title : e.image),
+    ['late', 'after', null], 'order holds');
+  assert.deepEqual(released, ['late']);
+  assert.deepEqual(acks(link), [[conn, 1], [conn, 2]]);
+
+  const logs = events.filter((e) => e.type === 'log').length;
+  deliver(
+    commitWire(), externalCommit(conn, SURF, 3, xref(2n), [[0, 0, 1, 1]]),   // throws
+    commitWire(), externalCommit(conn, SURF, 4, xref(3n), [[0, 0, 1, 1]]),   // rejects
+    commitWire(), externalCommit(conn, SURF, 5, xref(5n), [[0, 0, 1, 1]]),   // null
+    externalCommit(conn, SURF, 6, xref(6n, { format: 0x3231564e }), [[0, 0, 1, 1]]),           // NV12
+    externalCommit(conn, SURF, 7, xref(7n, { width: 0 }), [[0, 0, 1, 1]]),                     // 0 px
+    externalCommit(conn, SURF, 8, xref(8n, { width: 16385, height: 1 }), [[0, 0, 1, 1]]),      // past 16384
+    externalCommit(conn, SURF, 9, xref(9n, { flags: 2 }), [[0, 0, 1, 1]]),                     // unknown flag
+    externalCommit(conn, SURF, 10, xref(10n), [[W - 1, 0, 2, 1]]),                              // rect outside
+  );
+  await ticks();
+  assert.deepEqual(events.filter((e) => e.type === 'commit').map((e) => [e.external.id, e.image]),
+    [[1n, 'late'], [4n, null], [2n, null], [3n, null], [5n, null]]);
+  assert.deepEqual(asked, [1n, 4n, 2n, 3n, 5n], 'invalid ones never reach the resolver');
+  assert.deepEqual(released, ['late'], 'nothing to release for null');
+  assert.deepEqual(acks(link).map(([, s]) => s).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  const lines = events.filter((e) => e.type === 'log').slice(logs).map((e) => e.line);
+  assert.ok(lines.some((l) => /resolveExternal of id 0x2 failed/.test(l)), lines.join('\n'));
+  assert.ok(lines.some((l) => /resolveExternal of id 0x3 failed/.test(l)), lines.join('\n'));
+  assert.ok(lines.filter((l) => /kind external/.test(l)).length >= 5, 'the core says why each invalid one was refused');
+});
+
+test('external: a resolve pending when the link resets is neither dispatched nor ACKed on the next link, and its image is still released', async () => {
+  const waiting: ((img: string) => void)[] = [];
+  const released: unknown[] = [];
+  const gpu: GpuSource<string> = {
+    resolveExternal: () => new Promise((res) => waiting.push(res)),
+    release(img) { released.push(img); },
+  };
+  const s = await setup({ gpu });
+  s.deliver(s.commitWire(), externalCommit(s.conn, SURF, 1, xref(BIG), [[0, 0, W, H]]));
+  assert.equal(waiting.length, 1);
+  s.link.cb.onClose({ takenOver: false });
+  s.link.cb.onOpen();
+  const cw = s.client(2);
+  s.deliver(cw(), externalCommit(2, SURF, 1, xref(BIG + 1n), [[0, 0, W, H]]), wireFrame(2, msg(TOP, 2, ['after'])));
+  assert.equal(waiting.length, 2);
+  waiting[0]('stale');
+  await ticks();
+  const commits = () => s.events.filter((e) => e.type === 'commit').map((e) => [e.conn, e.image]);
+  assert.deepEqual(commits(), []);
+  assert.deepEqual(acks(s.link), []);
+  assert.deepEqual(released, ['stale']);
+  waiting[1]('fresh');
+  await ticks();
+  assert.deepEqual(commits(), [[2, 'fresh']]);
+  assert.deepEqual(acks(s.link), [[2, 1]]);
+  assert.deepEqual(released, ['stale', 'fresh']);
+  assert.deepEqual(s.events.filter((e) => e.type === 'title').map((e) => e.title), ['after']);
+});
+
+for (const shape of ['no gpu source', 'resolve only'] as const) {
+  test(`external COMMIT with ${shape}: resolve never called, one error per link, each laid out (image null) and ACKed, the next one whole`, async () => {
+    const resolved: unknown[] = [];
+    const gpu: GpuSource | undefined = shape === 'resolve only' ? { resolve: (ref) => { resolved.push(ref); return 'img'; } } : undefined;
+    const s = await setup({ gpu });
+    s.deliver(s.commitWire(), externalCommit(s.conn, SURF, 1, xref(1n), [[0, 0, W, H]]),
+      s.commitWire(), externalCommit(s.conn, SURF, 2, xref(2n), [[1, 1, 1, 1]]));
+    const errors = () => s.events.filter((e) => e.type === 'error').map((e) => e.detail);
+    assert.equal(errors().length, 1);
+    assert.match(errors()[0], /resolveExternal/);
+    assert.deepEqual(resolved, []);
+    const commits = s.events.filter((e) => e.type === 'commit');
+    assert.deepEqual(commits.map((e) => [e.format, e.external.id, e.image, e.gpu]), [['gpu', 1n, null, undefined], ['gpu', 2n, null, undefined]]);
+    assert.deepEqual(commits.map((e) => [...e.damage]), [[0, 0, W, H], [0, 0, W, H]], 'nothing shown: the next one is whole');
+    assert.deepEqual(acks(s.link), [[s.conn, 1], [s.conn, 2]]);
+    // a virtgpu commit is still the resolver's (or the no-source error's)
+    s.deliver(s.commitWire(), virtgpuCommit(s.conn, SURF, 3, gref(9), [[0, 0, 1, 1]]));
+    assert.equal(resolved.length, shape === 'resolve only' ? 1 : 0);
+    assert.equal(errors().length, shape === 'resolve only' ? 1 : 2);
+    // the next link: the error again, once
+    s.link.cb.onClose({ takenOver: false });
+    s.link.cb.onOpen();
+    const cw = s.client(2);
+    const before = errors().length;
+    s.deliver(cw(), externalCommit(2, SURF, 1, xref(3n), [[0, 0, W, H]]), cw(), externalCommit(2, SURF, 2, xref(3n), [[0, 0, W, H]]));
+    assert.equal(errors().length, before + 1);
+    assert.deepEqual(acks(s.link).slice(-2), [[2, 1], [2, 2]]);
+  });
+}
+
+test('resolveExternal only: a virtgpu COMMIT is not handed to it — one error, image null, ACKed', async () => {
+  const asked: unknown[] = [];
+  const { events, link, deliver, commitWire, conn } = await setup({ gpu: { resolveExternal: (ref) => { asked.push(ref); return 'img'; } } });
+  deliver(commitWire(), virtgpuCommit(conn, SURF, 1, gref(42), [[0, 0, W, H]]));
+  assert.deepEqual(asked, []);
+  const errors = events.filter((e) => e.type === 'error');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].detail, /no gpu source with resolve/);
+  assert.deepEqual(events.filter((e) => e.type === 'commit').map((e) => [e.gpu.resource, e.image, e.external]), [[42, null, undefined]]);
+  assert.deepEqual(acks(link), [[conn, 1]]);
+});
+
+test('virtgpu and external COMMITs alternating on one link: each reaches its own resolver, in order, every image released once; neither forces a whole commit on the other', async () => {
+  const order: string[] = [];
+  const released: string[] = [];
+  const gpu: GpuSource<string> = {
+    resolve: (ref) => { order.push(`v${ref.resource}`); return `v${ref.resource}`; },
+    resolveExternal: (ref) => {
+      order.push(`x${ref.id}`);
+      return ref.id === 2n ? Promise.resolve(`x${ref.id}`) : `x${ref.id}`;
+    },
+    release: (img) => { released.push(img); },
+  };
+  const { events, link, deliver, commitWire, conn } = await setup({ gpu });
+  deliver(
+    commitWire(), virtgpuCommit(conn, SURF, 1, gref(1), [[0, 0, W, H]]),
+    commitWire(), externalCommit(conn, SURF, 2, xref(2n), [[1, 1, 1, 1]]), // a promise: the rest waits
+    commitWire(), virtgpuCommit(conn, SURF, 3, gref(3), [[2, 1, 1, 1]]),
+    commitWire(), externalCommit(conn, SURF, 4, xref(4n), [[3, 1, 1, 1]]),
+  );
+  assert.deepEqual(order, ['v1', 'x2']);
+  await ticks();
+  assert.deepEqual(order, ['v1', 'x2', 'v3', 'x4']);
+  const commits = events.filter((e) => e.type === 'commit');
+  assert.deepEqual(commits.map((e) => [e.image, e.gpu?.resource ?? null, e.external?.id ?? null]),
+    [['v1', 1, null], ['x2', null, 2n], ['v3', 3, null], ['x4', null, 4n]]);
+  assert.deepEqual(commits.map((e) => [...e.damage]), [[0, 0, W, H], [1, 1, 1, 1], [2, 1, 1, 1], [3, 1, 1, 1]]);
+  assert.deepEqual(released, ['v1', 'x2', 'v3', 'x4']);
+  assert.deepEqual(acks(link).map(([, n]) => n), [1, 2, 3, 4]);
+});
+
+test('2D view through the engine: an external commit\'s image is drawn like a GPU one; after one that resolved to nothing, whole', async () => {
+  const dom = installFakeDom();
+  try {
+    const view = createView({ container: dom.container(), webgl: 'never' });
+    const images: Record<string, { width: number; height: number } | null> = { 1: { width: W, height: H }, 2: null, 3: { width: W, height: H } };
+    const gpu: GpuSource = { resolveExternal: (ref) => images[String(ref.id)] };
+    const { deliver, commitWire, conn } = await setup({ gpu, peek: (ev) => view.handle(ev) });
+    deliver(commitWire(), externalCommit(conn, SURF, 1, xref(1n), [[0, 0, W, H]]));
+    const canvas = view.canvas(conn, SURF) as any;
+    assert.deepEqual(canvas.draws, [['clear', 0, 0, W, H], ['draw', images[1], 0, 0, W, H, 0, 0, W, H]]);
+    canvas.draws.length = 0;
+    deliver(commitWire(), externalCommit(conn, SURF, 2, xref(2n), [[0, 0, 2, 2]]));
+    assert.deepEqual(canvas.draws, []);
+    deliver(commitWire(), externalCommit(conn, SURF, 3, xref(3n), [[6, 3, 1, 1]]));
+    assert.deepEqual(canvas.draws, [['clear', 0, 0, W, H], ['draw', images[3], 0, 0, W, H, 0, 0, W, H]]);
   } finally {
     dom.uninstall();
   }

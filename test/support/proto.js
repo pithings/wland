@@ -76,10 +76,11 @@ export const T = {
   BUFFER_LZ: 0x07, HANDLE_OPEN: 0x08, HANDLE_CLOSE: 0x09, COMMIT: 0x0a, ACK: 0x0b,
   FEATURE: 0x0c, PRESENTED: 0x0e,
 };
-/** FEATURE kinds: 1 linux_dmabuf, 2 dmabuf_kind (bytes: u32 buffer kind). */
-export const FEATURE = { LINUX_DMABUF: 1, DMABUF_KIND: 2 };
+/** FEATURE kinds: 1 linux_dmabuf, 2 dmabuf_kind (bytes: u32 buffer kind),
+ *  5 external_buffer (no bytes). */
+export const FEATURE = { LINUX_DMABUF: 1, DMABUF_KIND: 2, EXTERNAL_BUFFER: 5 };
 /** COMMIT buffer kinds. */
-export const BUFFER_KIND = { SHM: 1, VIRTGPU: 2 };
+export const BUFFER_KIND = { SHM: 1, VIRTGPU: 2, EXTERNAL: 3 };
 export const FD = { SHM_POOL: 1, KEYMAP: 2, PIPE: 3 };
 export const HANDLE = { KWSHM: 1, PROCFD: 2 };
 export const SHM = { ARGB8888: 0, XRGB8888: 1 };
@@ -113,6 +114,9 @@ export const handleClose = (conn, handle) => frame(T.HANDLE_CLOSE, conn, handle)
 export const feature = (kind, bytes) => frame(T.FEATURE, kind, bytes.length, bytes);
 /** FEATURE dmabuf_kind: the relay's dmabuf commits are COMMITs of `bufferKind`. */
 export const dmabufKindFeature = (bufferKind) => feature(FEATURE.DMABUF_KIND, frame(0, bufferKind).subarray(1));
+/** FEATURE external_buffer: the relay names wland_external_buffer_manager_v1
+ *  buffers in COMMITs of kind external. */
+export const externalBufferFeature = () => feature(FEATURE.EXTERNAL_BUFFER, new Uint8Array(0));
 /** COMMIT with buffer kind 1 = shm. ref: {handle, offset, width, height,
  *  stride, format}; rects: [[x, y, w, h], ...] in buffer px. */
 export function shmCommit(conn, surface, serial, ref, rects) {
@@ -126,6 +130,14 @@ export function virtgpuCommit(conn, surface, serial, ref, rects) {
   const r = frame(0, ref.resource, ref.width, ref.height, ref.format, ref.flags ?? 0, ref.offset ?? 0, ref.stride ?? ref.width * 4,
     { u64: ref.modifier ?? 0x00ffffffffffffffn }).subarray(1);
   return frame(T.COMMIT, conn, surface, serial, rects.length, 2, r.length, r, ...rects.flat());
+}
+
+/** COMMIT with buffer kind 3 = external. ref: {id (bigint, u64), width,
+ *  height, format (DRM fourcc), flags}; `extra` bytes are appended to the
+ *  ref (a longer ref from a newer relay). */
+export function externalCommit(conn, surface, serial, ref, rects, extra = new Uint8Array(0)) {
+  const r = frame(0, { u64: ref.id }, ref.width, ref.height, ref.format, ref.flags ?? 0, extra).subarray(1);
+  return frame(T.COMMIT, conn, surface, serial, rects.length, 3, r.length, r, ...rects.flat());
 }
 
 /** Concatenate frames into one link message (an ArrayBuffer). */

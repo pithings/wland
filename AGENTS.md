@@ -10,7 +10,9 @@ Relay ⇄ engine speak STREAM v2 over a WebSocket or a byte stream; pixels trave
 stream (copy) or stay in shared memory by handle (procfd/kwshm — the
 unkernel path); GPU clients' dmabufs are copied like shm (`--dmabuf
 readback`) or named by their virtio-gpu resource for the page's renderer
-(`--dmabuf virtgpu`, COMMIT kind 2 — the unkernel path).
+(`--dmabuf virtgpu`, COMMIT kind 2 — the unkernel path); a client can also
+name content only the page knows by an id (`--external-buffers`,
+`wland_external_buffer_manager_v1`, COMMIT kind 3 — unkernel's Vulkan).
 
 ## Docs — read when relevant, not upfront
 
@@ -111,6 +113,17 @@ any of them (update this list when it does).
   only while a handle is held (each open DRM file costs the page a host
   virgl context). `--dmabuf virtgpu:@fake` is a test-only stand-in device,
   never in the usage text.
+- External buffers (`wland_external_buffer_manager_v1`, our own protocol:
+  a wl_buffer from a u64 id, no fd) are offered only when the relay sent
+  FEATURE external_buffer (`wlandr --external-buffers`) AND the embedder
+  resolves them (`GpuSource.resolveExternal`; `wland_set_gpu_source` is a
+  mask, bit 0 virtgpu, bit 1 external, external off unless set) — the
+  global's presence is the client's capability signal, so a bind while off
+  is refused. The client's claims (format, sides ≤ 16384, flags) are held
+  to `stream.ExternalRef` rules in the core, the relay and the engine;
+  the relay holds nothing for an id (no device, no fence wait); COMMITs of
+  kind 3 ride the conn's serial space and ACK ledger like virtgpu's, and
+  are the same content kind as virtgpu's for the full-rect rule.
 - A surface's full-buffer damage rect follows the dims AND the kind
   (pixels / GPU resource) of what the engine last showed (`SurfaceState`).
 - The embedder's clipboard (pipe_read reads, its own selection offered to

@@ -23,7 +23,8 @@
 //     toplevels after a GL context loss; a 2D-only view asks the engine for
 //     'rgba' instead (EngineOptions.rgba, the core's wland_swizzle).
 //   - 'gpu': no pixels; `image` is what the embedder's GpuSource resolved
-//     the GPU buffer to (a CanvasImageSource, row 0 at the top), drawn
+//     the GPU or external buffer to (a CanvasImageSource, row 0 at the
+//     top; which buffer — `gpu` or `external` — is never read here), drawn
 //     during the commit's dispatch and never kept (the engine ACKs right
 //     after). 2D: clearRect + drawImage per damage rect (the whole image
 //     scaled to the buffer if its size differs). GL: the whole image

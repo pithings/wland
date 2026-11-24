@@ -56,6 +56,13 @@ backend**, also fixed at startup:
 | `readback` (needs the `copy` buffer mode) | a LINEAR dmabuf mapped and shipped exactly like a wl_shm buffer — BUFFER/BUFFER_LZ; the engine cannot tell the two apart | at commit time, by the relay |
 | `virtgpu` (any buffer mode; unkernel: with `kwshm`) | nothing: a COMMIT of buffer kind 2 names the virtio-gpu resource behind the dmabuf, which the embedder's renderer holds | when the engine ACKs the COMMIT |
 
+External buffers (`wland_external_buffer_manager_v1`, only on a relay
+started with `--external-buffers` in front of an embedder that resolves
+them, see FEATURE `external_buffer`) are neither: a client names content
+only the embedder knows by an opaque id — no fd, no pixels — and each commit
+travels as a COMMIT of buffer kind 3, released when the engine ACKs it,
+whatever the buffer and dmabuf backends are.
+
 Only an engine that can draw those resources offers linux-dmabuf in front
 of a `virtgpu` relay: the relay says how its dmabuf commits travel (FEATURE
 `dmabuf_kind`), and an engine with no GPU source leaves the global off, so
@@ -531,7 +538,7 @@ u32 conn_id
 u32 surface_id
 u32 serial            ← per conn: 1, 2, 3, … (+1 per COMMIT; never 0)
 u32 n_rects
-u32 kind              ← buffer kind: 1 = shm, 2 = virtgpu (0 is never valid)
+u32 kind              ← buffer kind: 1 = shm, 2 = virtgpu, 3 = external (0 is never valid)
 u32 ref_len
 u8  ref[ref_len]      ← kind-specific buffer reference
 { i32 x, i32 y, i32 w, i32 h }[n_rects]   ← damage, buffer px
@@ -718,6 +725,55 @@ COMMIT's resource outlives `wl_buffer.destroy` until its ACK; a conn or
 link ending drops its holds at once. Release: the shared ledger (Buffer
 release), so after the ACK. Nothing here has run on a real virtio-gpu node.
 
+Buffer kind **3 = external**: content only the embedder knows, named by an
+opaque id the client chose (`wland_external_buffer_manager_v1.create_buffer`,
+`protocol/wland-external-buffer-v1.xml`): no fd, no pixels, no device. wlandr
+emits it with `--external-buffers`. Ref (≥ 24 bytes; fields are only ever
+appended, a receiver reads the first 24 and ignores the rest):
+
+```
+u64 id                ← opaque: the client and the embedder agree on it out of band
+u32 width, height     ← the wl_buffer's size, buffer px (each 1..16384)
+u32 format            ← DRM fourcc: ARGB8888, XRGB8888, ABGR8888 or XBGR8888
+u32 flags             ← 1 y_invert; no other bit
+```
+
+All of it is the client's claim (create_buffer's arguments), held to the
+same rules three times — the compositor at the request (protocol errors),
+the relay when it tracks the buffer, the engine at the COMMIT
+(`ExternalRef.check`): nothing else bounds it, as no device stands behind
+the id. Whether the id names anything, of that size and format, is the
+resolver's to check.
+
+Validity (`CommitFrame.external()`): kind 3, ref_len ≥ 24, the ref's rules
+above, n_rects ≥ 1, every rect non-empty and inside the buffer. An invalid
+one is ACKed without presenting.
+
+When it is sent, damage, the full-buffer rule: as kind virtgpu, and the two
+are ONE kind of content for that rule (an image the embedder resolved; a
+surface moving between them needs no full rect, moving to or from pixels
+does). A commit with no effective damage sends nothing — a client must
+damage what changed.
+
+The contract with the embedder is kind virtgpu's (above; the reference
+engine: `GpuSource.resolveExternal`), with these differences:
+
+- *Ordering* is entirely the client's and the embedder's: the relay knows
+  no device and waits for nothing. The client has its content complete at
+  the embedder before `wl_surface.commit` (or the resolver waits — a
+  promise, which stalls the whole link, frame callbacks included).
+- *Ids.* The relay holds nothing for an id: after `wl_buffer.destroy` of a
+  busy buffer, or a conn's end, a COMMIT naming it may still be in flight
+  and no release will tell the client when it was consumed. So an id names
+  one content object for good (the client never reuses it for another),
+  and a resolver given an id it no longer has shows nothing (null).
+- *Namespace.* Ids are not scoped by conn: any client that binds the global
+  can name any id. An embedder that needs them apart puts its own
+  unguessable token into the id.
+- An engine whose embedder does not resolve external buffers never
+  advertises the global (FEATURE `external_buffer`); a kind-3 COMMIT that
+  reaches such an engine anyway is ACKed without the resolver being called.
+
 *The relay's own renderer context.* On a device without
 `VIRTIO_GPU_F_CONTEXT_INIT` (unkernel's offers only VIRGL) the guest kernel
 creates a host virgl context for a DRM file at its first PRIME import
@@ -764,8 +820,8 @@ a sync file and the ref carries no fence.
 
 ```
 u8  type = 0x0c
-u32 feature           ← 1 = linux_dmabuf, 2 = dmabuf_kind, 3 = selection_cache
-                        (0 is never valid)
+u32 feature           ← 1 = linux_dmabuf, 2 = dmabuf_kind, 3 = selection_cache,
+                        4 = session, 5 = external_buffer (0 is never valid)
 u32 len
 u8  bytes[len]        ← feature-specific
 ```
@@ -839,6 +895,21 @@ that link (one log line; copy/paste chords are plain keys). Apps' own
 selections travel between apps as ever (FDMSG pipe with a wire message).
 Which it is is known at the link's first frame that is not a FEATURE
 (every app starts with CONN_OPEN), and decided again on every link.
+
+**4 = session**: the link runs the session profile; see
+[Profiles](#profiles-passthrough-and-session).
+
+**5 = external_buffer**: the relay tracks
+`wland_external_buffer_manager_v1` buffers and names them in COMMITs of
+kind external (wlandr: `--external-buffers`; not with `--profile session`).
+Bytes: none (any are ignored). The compositor advertises the global only
+with this frame AND an embedder that resolves external buffers
+(`wland_set_gpu_source` bit 1; the reference engine: `EngineOptions.gpu`
+has `resolveExternal`) — so to a client the global's presence means its ids
+will be resolved, and its absence means "use wl_shm". A bind of it while
+not advertised is a protocol error. An engine that predates the feature
+skips the frame, a relay that predates it sends none: either way the global
+is not offered. The reference browser: `Engine.externalBuffers()`.
 
 ### 0x0d DMABUF_CREATED — a server-made dmabuf wl_buffer, browser→server only
 

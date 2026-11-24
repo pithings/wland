@@ -772,18 +772,56 @@ to 100 ms) for the GPU to finish writing the buffer; `--no-fence-wait` skips
 that wait, for a device that already delivers the GPU work to the page
 before the frame (unkernel). It is refused without `--dmabuf virtgpu`.
 
+`--external-buffers` lets an app show content that exists only in the
+page: a `wl_buffer` made from a 64-bit id, with no pixels and no file
+descriptor (`wland_external_buffer_manager_v1`,
+`protocol/wland-external-buffer-v1.xml`). What an id means is between the
+app and the page, e.g. a renderer in the page that the app drives over its
+own channel (unkernel's Vulkan). The page turns each committed id into an
+image with `resolveExternal` of the `gpu` option:
+
+```js
+createWland(el, {
+  gpu: {
+    resolve(ref) { /* --dmabuf virtgpu: ref.resource → image */ },
+    resolveExternal(ref, commit) {
+      // ref: { id: bigint, width, height, format (DRM fourcc), flags (1 = y_invert) }
+      return imageFor(ref.id); // an ImageBitmap/canvas…, a promise of one, or null: nothing new to show
+    },
+    release(image) { image.close?.(); },
+  },
+});
+```
+
+Apps see the global only when both sides are there (the relay's flag and a
+page with `resolveExternal`), so an app that finds it can rely on its ids
+being resolved and one that doesn't uses shared memory.
+`wland.engine.externalBuffers()` tells the page which it is. It works with
+any `--buffers` and `--dmabuf` mode, not with `--profile session`. The
+size and format of a buffer are the app's claim and ids are not separated
+by app: a page that cares checks them against what it holds and puts
+something unguessable into its ids. While a promise from either resolver
+is pending nothing else from the relay is shown, in any window: keep it
+short and bounded. Experimental.
+
+A resolver that draws WebGPU textures into an `OffscreenCanvas` and
+returns `transferToImageBitmap()`: in headless Chrome without
+`--use-angle=swiftshader` that call destroys the `GPUDevice` (seen by
+unkernel, 2026-11). Probe for it once and leave `resolveExternal` out
+when it fails, so apps are not offered buffers the page can't show.
+
 `wlandr --version` prints two lines:
 
 ```
 wlandr 0.1.0
-features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland link-on-demand
+features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland link-on-demand profile:session external-buffers
 ```
 
 The first is the package version the binary was built from. The second
 has one space-separated token per thing this build supports: `http` (the
 HTTP server; absent from the `--link`-only build), each `--link` kind,
 each `--buffers` and `--dmabuf` mode, `no-fence-wait`, `selection_cache`
-(the page clipboard bridge), `xwayland` and `link-on-demand`. A token keeps its spelling once
+(the page clipboard bridge), `xwayland`, `link-on-demand` and `external-buffers`. A token keeps its spelling once
 listed and new ones are only added, so a script can test for a whole
 token, e.g. `case " $(wlandr --version | sed -n 's/^features: //p') " in
 *" dmabuf:virtgpu "*)`. Releases up to v0.1.0-261122-f36330a have no
@@ -803,6 +841,7 @@ same `--link` flags too, but they are twice the size.
 tar -xzf wlandr-link-linux-arm64.tar.gz      # → ./wlandr
 ./wlandr --link vsock:2:PORT --buffers kwshm                   # shm apps, by handle
 ./wlandr --link vsock:2:PORT --buffers kwshm --dmabuf virtgpu  # + GPU apps, by resource
+./wlandr --link vsock:2:PORT --buffers kwshm --dmabuf virtgpu --external-buffers  # + buffers the page resolves by id
 ./wlandr --link vsock:2:PORT --buffers kwshm --link-on-demand   # started at boot: dials for the first app
 ```
 

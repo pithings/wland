@@ -52,6 +52,14 @@ which here only runs against the test-only stand-in device
 fixture in both Node E2Es); the JS test relay sends it too (the handle
 demo's `gpu=1` mode names kwshm exports as resources). No real
 virtio-gpu node exists here.
+COMMIT kind 3 (external buffers): wlandr emits it with `--external-buffers`
+for buffers of `wland_external_buffer_manager_v1`, wland's own protocol —
+the only client is the `external` fixture (`--frames N`: prints
+`external: offered|not offered`, a `commit`/`release` line per buffer use,
+`external: done frames=N`, then stays open like an app; it draws through
+wl_shm when the global is absent). The JS test relay's `external: true`
+relabels wl_shm buffers as ids, like `gpu: true`. Nothing here resolves an
+id to a real GPU image: the resolvers in tests paint solid colours.
 
 Real clients that set cursor surfaces (`wl_pointer.set_cursor`, no
 cursor-shape): weston's toytoolkit apps (`weston-flower`; it loads its
@@ -138,6 +146,7 @@ apps do through the compositor is checked without a browser, by
 | `server/src/xwayland.zig`, the X11 launch path | `zig build test` + `node --test test/relay.test.ts` (a stand-in satellite) + `WLAND_E2E_APPS=real node tools/headless-e2e-test.ts` with `xwayland-satellite`, `Xwayland`, `xeyes` on PATH (the x11 phase skips otherwise) |
 | `server/` relay: `--link`, STREAM framing, handle backends | `zig build test` + `node tools/relay-e2e-test.ts` (+ `node --test test/link-on-demand.test.ts` for the dial loop / `--link-on-demand`) |
 | linux-dmabuf (`dmabuf.zig`, `virtgpu.zig`, the dmabuf paths in relay/core) | `zig build test` (also Debug; memfds stand in for dmabufs, `virtgpu.Fake` for a virtio-gpu node) + both Node E2Es (their GPU phases: the `dmabuf` fixture over the test-only `--dmabuf virtgpu:@fake`, fixtures only — skipped with `WLAND_E2E_APPS=real`); a real GPU client is a human check (see Setup), a real virtio-gpu node unkernel's |
+| External buffers (`wland-external-buffer-v1.xml`, `stream.ExternalRef`, the relay's tracking/COMMIT kind 3, `GpuSource.resolveExternal`) | `zig build test` (also Debug; core gating + protocol errors, relay harness: ACK/release ledger beside shm and virtgpu) + `node --test test/core-abi.test.ts test/engine.test.ts test/handles.test.ts test/headless.test.ts test/session.test.ts` + `node tools/headless-e2e-test.ts` (its external phase: the fixture on `--dmabuf virtgpu:@fake --external-buffers`, with and without a resolver) |
 | GPU commits in the engine/view/headless (`EngineOptions.gpu`, format 'gpu') | `node --test test/handles.test.ts test/client.test.ts test/headless.test.ts` + run-poc `handle-demo` (its `gpu=1` modes, 2D and GL) |
 | `lib/engine.ts`, links, handles | `npm run typecheck` + `node --test test/*.test.ts` + both Node E2Es |
 | `lib/index.ts` (`startServer`, `startRelay`, `serverBinary`) | `node --test test/relay.test.ts` (real wlandr on an fd link + headless + fixtures) + `tools/smoke.sh` |

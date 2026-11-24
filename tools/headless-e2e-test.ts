@@ -82,6 +82,16 @@
 //     linux-dmabuf off (FEATURE dmabuf_kind), the GPU client exits for
 //     want of the global (as weston-simple-dmabuf-egl does), a wl_shm
 //     client draws.
+// 10. external buffers (fixtures only): a relay with `--external-buffers`
+//     (beside `--dmabuf virtgpu:@fake`) and a headless client with
+//     resolveExternal: the `external` fixture finds
+//     wland_external_buffer_manager_v1, its two ids arrive as COMMITs of
+//     kind external with its size and format, each buffer comes back
+//     after its commit (release after the ACK), the resolved images are
+//     in the screenshot and all released; the GPU fixture's resources
+//     still reach `resolve` on the same link. Then a page without
+//     resolveExternal on the same relay: the global is not offered and
+//     the client draws through wl_shm.
 //
 // Needs `zig build` (wlandr, wland-fixture, lib/wland.wasm). Own
 // XDG_RUNTIME_DIR, display name and port: it never touches a demo's session.
@@ -94,7 +104,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { GpuRef } from '../lib/engine.ts';
+import type { ExternalRef, GpuRef } from '../lib/engine.ts';
 import {
   createHeadless, EDGE_BOTTOM, EDGE_LEFT, EDGE_TOP, NO_SELECTION_BRIDGE, ROLE_POPUP, ROLE_SUBSURFACE,
   type ConfigureEvent, type DropFilesHook, type Headless, type HeadlessWindow, type RgbaImage,
@@ -1364,6 +1374,125 @@ async function gpu() {
   }
 }
 
+async function external() {
+  console.log('== external buffers: ids the embedder resolves (--external-buffers) ==');
+  if (realApps) return console.log('  skipped: fixtures only (wland\'s own protocol: no real app speaks it)');
+  if (RELAY.includes('session')) return console.log('  skipped: a session relay takes no --external-buffers');
+  const features = spawnSync(RELAY[0], [...RELAY.slice(1), '--version'], { encoding: 'utf8' }).stdout ?? '';
+  if (!/ external-buffers( |$)/m.test(features)) {
+    return console.log('  skipped: this relay has no --external-buffers (WLAND_E2E_RELAY: an older build)');
+  }
+  const frames = 12;
+  const spec = app('external', ['--frames', String(frames)]);
+  const gpuSpec = app('dmabuf');
+  const display = 'wland-hl-ext', port = PORT + 2;
+  const relay2 = run(RELAY[0], [...RELAY.slice(1), '--port', String(port), '--web-root', webRoot, '--display', display, '--xwayland', 'off',
+    '--dmabuf', 'virtgpu:@fake', '--external-buffers']);
+  let hl2: Headless | null = null;
+  const refs: ExternalRef[] = [], gpuRefs: GpuRef[] = [];
+  const errs: string[] = [];
+  let released = 0, open2 = false;
+  const solid = (width: number, height: number, c: number[]) => {
+    const data = new Uint8Array(width * height * 4);
+    for (let i = 0; i < data.length; i += 4) data.set(c, i);
+    return { width, height, data };
+  };
+  const runOut = (s: AppSpec) => {
+    const p = run(s.cmd, s.args, { ...s.env, WAYLAND_DISPLAY: display });
+    const o = { p, out: '' };
+    p.stdout!.on('data', (c) => { o.out += c; });
+    return o;
+  };
+  try {
+    for (let up = false; !up;) {
+      if (!alive(relay2)) throw new Error('FAIL: the external-buffers relay exited at startup');
+      up = await fetch(`http://127.0.0.1:${port}/`).then(() => true, () => false);
+      if (!up) await sleep(50);
+    }
+    hl2 = await createHeadless({
+      link: `ws://127.0.0.1:${port}/ws`, width: 800, height: 600,
+      // stand-in renderers: the id's low bits pick the colour; every other
+      // external frame resolves late (a promise), as a page's renderer may
+      gpu: {
+        resolve(ref) { gpuRefs.push(ref); return solid(ref.width, ref.height, [0x20, 0x20, 0x20, 0xff]); },
+        resolveExternal(ref) {
+          refs.push(ref);
+          const img = solid(ref.width, ref.height, (ref.id & 1n) ? [0xff, 0x40, 0x00, 0xff] : [0x00, 0x40, 0xff, 0xff]);
+          return refs.length % 2 ? img : sleep(5).then(() => img);
+        },
+        release() { released++; },
+      },
+      onEvent(ev) {
+        if (ev.type === 'open') open2 = true;
+        else if (ev.type === 'error') errs.push(ev.detail);
+      },
+    });
+    await until(() => open2, 5000, 'the external-buffers link to open');
+    check(hl2.engine.externalBuffers() === true, 'Engine.externalBuffers(): offered on this link');
+    const a = runOut(spec);
+    const done = new RegExp(`^external: done frames=${frames}$`, 'm');
+    let win: HeadlessWindow | undefined, shot = 0;
+    await until(() => {
+      // while it draws: the window shows what resolveExternal returned
+      win ??= hl2!.windows()[0];
+      if (win && !shot && refs.length >= 2) shot = colours(hl2!.screenshot({ window: win }));
+      return done.test(a.out) || !alive(a.p);
+    }, 10000, 'the external client to finish its frames');
+    check(alive(a.p) && /^external: offered$/m.test(a.out) && done.test(a.out), `the client found the global and finished ${frames} frames`);
+    const ids = [...new Set(refs.map((r) => r.id))];
+    check(refs.length === frames && ids.length === 2 && ids.includes(0x1122334400000001n) && ids.includes(0x1122334400000002n),
+      `${refs.length} COMMITs of kind external naming its two ids (${ids.map((i) => `0x${i.toString(16)}`).join(', ')})`);
+    check(refs.every((r) => r.width === 200 && r.height === 120 && r.format === 0x34325241 && r.flags === 0), 'every ref: 200x120 AR24, flags 0');
+    const commits = [...a.out.matchAll(/^external: (commit|release) id=(0x[0-9a-f]+)/gm)].map((m) => `${m[1]} ${m[2]}`);
+    const busy = new Set<string>();
+    let orderly = commits.length === frames * 2;
+    for (const c of commits) {
+      const [what, id] = c.split(' ') as [string, string];
+      if (what === 'commit') { orderly &&= !busy.has(id); busy.add(id); } else { orderly &&= busy.delete(id); }
+    }
+    check(orderly && busy.size === 0, `each buffer released once per commit, never reused while busy (${commits.length} lines)`);
+    check(shot >= 1 && win !== undefined, 'its window showed a resolved image');
+    check(released === refs.length, `every resolved image released (${released}/${refs.length})`);
+    await stop(a.p);
+    await until(() => hl2!.windows().length === 0, 5000, 'the window to go');
+
+    // virtgpu beside it on the same link: each kind reaches its own method
+    const n0 = refs.length;
+    const g = runOut(gpuSpec);
+    await until(() => gpuRefs.length > 10 || !alive(g.p), 10000, 'GPU commits beside external buffers');
+    check(alive(g.p) && gpuRefs.length > 10 && refs.length === n0, `a GPU client on the same link: ${gpuRefs.length} resources to resolve(), none to resolveExternal()`);
+    await stop(g.p);
+    await until(() => hl2!.windows().length === 0, 5000, 'the GPU window to go');
+    check(errs.length === 0, `no engine error events ${errs.join('; ')}`);
+
+    // the same relay, a page that resolves no external buffers: the global
+    // is not offered, the client takes wl_shm
+    hl2.dispose();
+    hl2 = null;
+    let open3 = false;
+    hl2 = await createHeadless({
+      link: `ws://127.0.0.1:${port}/ws`, width: 800, height: 600,
+      onEvent(ev) {
+        if (ev.type === 'open') open3 = true;
+        else if (ev.type === 'error') errs.push(ev.detail);
+      },
+    });
+    await until(() => open3, 5000, 'the resolver-less link to open');
+    const b = runOut(spec);
+    await until(() => done.test(b.out) || !alive(b.p), 10000, 'the external client to finish over wl_shm');
+    check(hl2.engine.externalBuffers() === false, 'no resolveExternal: Engine.externalBuffers() is false');
+    check(alive(b.p) && /^external: not offered$/m.test(b.out) && /^external: wl_shm fallback 200x120$/m.test(b.out) && done.test(b.out) && refs.length === n0,
+      'the client finds no global and draws its frames through wl_shm');
+    check(colours(hl2.screenshot({ window: hl2.windows()[0]! })) >= 1, 'its wl_shm window is in the scene');
+    await stop(b.p);
+    check(errs.length === 0, `no engine error events ${errs.join('; ')}`);
+  } finally {
+    hl2?.dispose();
+    relay2.kill('SIGTERM');
+    await until(() => !alive(relay2), 3000, 'the external-buffers relay to exit').catch(() => {});
+  }
+}
+
 let code = 0;
 try {
   // the WS link connects once: the relay must be listening first
@@ -1391,6 +1520,7 @@ try {
   await reattach();
   await decorations();
   await gpu();
+  await external();
   check(errors.length === 0, `no engine error events ${errors.join('; ')}`);
   console.log('HEADLESS-E2E PASS');
 } catch (e) {
