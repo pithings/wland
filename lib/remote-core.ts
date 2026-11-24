@@ -94,6 +94,11 @@ const CALLS: Record<string, readonly [number, string]> = {
   wland_set_visible: [31, 'uuu'],
   wland_set_tiled: [32, 'uuuiiu'],
   wland_set_window_position: [33, 'uuii'],
+  wland_touch_down: [34, 'uuuiii'],
+  wland_touch_motion: [35, 'uuiii'],
+  wland_touch_up: [36, 'uui'],
+  wland_touch_frame: [37, 'u'],
+  wland_touch_cancel: [38, 'u'],
 };
 const OP_PREEDIT = 17, OP_COMMIT_STRING = 18, OP_SET_SELECTION = 27, OP_READ_SELECTION = 28;
 
@@ -272,6 +277,7 @@ export function createRemoteCore(options: RemoteCoreOptions): CoreExports {
         const conn = a.u32(), surface = a.u32(), serial = a.u32(), w = a.i32(), h = a.i32();
         return env.js_acked(conn, surface, serial, w, h);
       }
+      case 19: { const conn = a.u32(), bound = a.u32(); return env.js_touch_bound(conn, bound); }
       default: return; // an op this viewer does not know: skipped
     }
   }

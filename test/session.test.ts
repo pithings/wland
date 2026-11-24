@@ -309,6 +309,45 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
   ].map(hex));
 });
 
+test('touch: CALLs 34–38 in order with the pointer\'s (pending motion first); EVENT 19 is touch-bound, touchBound() follows it until the conn or the link goes', async () => {
+  const { link, events, engine, take } = await setup();
+  link.cb!.onMessage(msg(feature(4, u64(SID)), connOpen(7), connOpen(8), event(13)));
+  take();
+  const fx = (v: number) => Math.round(v * 256);
+  assert.equal(engine.touchBound(7), false);
+  events.length = 0;
+  link.cb!.onMessage(msg(event(19, u32(7, 1)), event(19, u32(8, 1)), event(19, u32(8, 0))));
+  assert.deepEqual(events, [
+    { type: 'touch-bound', conn: 7, bound: true },
+    { type: 'touch-bound', conn: 8, bound: true },
+    { type: 'touch-bound', conn: 8, bound: false },
+  ]);
+  assert.equal(engine.touchBound(7), true);
+  assert.equal(engine.touchBound(8), false);
+
+  engine.pointerMotion(8, 99, 1, 1);
+  engine.touchDown(7, 100, 10, 2, 1.5, -2);
+  engine.touchMotion(7, 0xffffffff + 102, 2, 3, 4.25);
+  engine.touchFrame(7);
+  engine.touchUp(7, 103, 2);
+  engine.touchCancel(7);
+  assert.deepEqual(take(), [
+    call(8, u32(8, 99), i32(fx(1), fx(1), 0, 0, 0, 0), f64(99000)),
+    call(34, u32(7, 100, 10), i32(2, fx(1.5), fx(-2))),
+    call(35, u32(7, 101), i32(2, fx(3), fx(4.25))),
+    call(37, u32(7)),
+    call(36, u32(7, 103), i32(2)),
+    call(38, u32(7)),
+  ].map(hex));
+
+  // the conn goes: no longer bound; nor after the link closed
+  link.cb!.onMessage(msg(event(19, u32(8, 1)), connClose(7)));
+  assert.equal(engine.touchBound(7), false);
+  assert.equal(engine.touchBound(8), true);
+  link.cb!.onClose({ takenOver: false });
+  assert.equal(engine.touchBound(8), false);
+});
+
 test('clipboard: set_selection packs entries, read_selection is answered by EVENT selection_data', async () => {
   const { link, events, engine, take } = await setup();
   link.cb!.onMessage(msg(feature(4, u64(SID)), connOpen(7), event(13)));

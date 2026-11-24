@@ -556,6 +556,58 @@ test('relative pointer + pointer lock through the engine: motions coalesce with 
   assert.deepEqual(events, [{ type: 'pointer-lock', conn: CONN, surface: 0 }, { type: 'disconnect', conn: CONN }]);
 });
 
+test('touch through the engine: get_touch is a touch-bound event, the calls are wl_touch down/motion/up/frame/cancel, a pending motion goes first; release unbinds', async () => {
+  const link = scriptedLink();
+  const events: any[] = [];
+  const engine = await createEngine({ wasm, link, onEvent: (ev) => { if (ev.type !== 'log') events.push(ev); } });
+  engine.start();
+  link.cb!.onOpen();
+  link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, msg(1, 1, 2))));
+  const g = globals(link.sent, 2);
+  // wl_compositor 4, wl_seat 5 (v5), surface 6, wl_pointer 10, wl_touch 11
+  link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+    ...msg(2, 0, g.wl_compositor.name, 'wl_compositor', 4, 4),
+    ...msg(2, 0, g.wl_seat.name, 'wl_seat', 5, 5),
+    ...msg(4, 0, 6), ...msg(5, 0, 10),
+  ]))));
+  assert.equal(engine.touchBound(CONN), false);
+  events.length = 0;
+  link.cb!.onMessage(pack(wireFrame(CONN, msg(5, 2, 11))));
+  assert.deepEqual(events, [{ type: 'touch-bound', conn: CONN, bound: true }]);
+  assert.equal(engine.touchBound(CONN), true);
+
+  const FIX = 256, T = 11;
+  engine.pointerEnter(CONN, 6, 1, 1);
+  engine.pointerMotion(CONN, 1, 2, 2);
+  link.sent.length = 0;
+  engine.touchDown(CONN, 5, 6, 0, 10.5, 20);
+  engine.touchMotion(CONN, 6, 0, -3, 4);
+  engine.touchFrame(CONN);
+  engine.touchUp(CONN, 7, 0);
+  engine.touchFrame(CONN);
+  engine.touchDown(CONN, 8, 6, 1, 0, 0);
+  engine.touchCancel(CONN);
+  const got = wireEvents(link.sent, CONN);
+  const down = got[2], up = got[5];
+  assert.deepEqual(got, [
+    [10, 2, 1, 2 * FIX, 2 * FIX], [10, 5], // the coalesced pointer motion first
+    [T, 0, down[2], 5, 6, 0, 10.5 * FIX, 20 * FIX],
+    [T, 2, 6, 0, -3 * FIX, 4 * FIX],
+    [T, 3],
+    [T, 1, up[2], 7, 0],
+    [T, 3],
+    [T, 0, up[2] + 1, 8, 6, 1, 0, 0],
+    [T, 4],
+  ]);
+  assert.ok(up[2] > down[2]);
+
+  events.length = 0;
+  link.cb!.onMessage(pack(wireFrame(CONN, msg(T, 0)))); // release
+  assert.deepEqual(events, [{ type: 'touch-bound', conn: CONN, bound: false }]);
+  assert.equal(engine.touchBound(CONN), false);
+  engine.dispose();
+});
+
 test('lock modifiers through the engine: NumLock (Mod2) locked from the start, keyboardLocks sets the browser\'s state; the state — lock keys\' toggles included — is kept across a link reopen', async () => {
   const link = scriptedLink();
   const engine = await createEngine({ wasm, link, onEvent: () => {} });

@@ -163,6 +163,7 @@ const shm_format_xrgb8888: u32 = 1;
 
 const seat_capability_pointer: u32 = 1;
 const seat_capability_keyboard: u32 = 2;
+const seat_capability_touch: u32 = 4;
 
 // wl_pointer.axis_source: our browser wheel input is always a physical wheel
 const axis_source_wheel: u32 = 0;
@@ -721,6 +722,15 @@ pub const max_source_mimes = 128;
 /// the spec's other bad requests without an error code: the object exists
 /// and stays silent.
 pub const max_seat_objects = 8;
+/// Most touch points one client has down at once (a touchscreen's ten
+/// fingers); a down beyond them is ignored, its motion and up too.
+pub const max_touch_points = 10;
+
+/// A touch point of a client's (Conn.touch_points): the embedder's id from
+/// its touchDown to its touchUp, the surface it went down on (motion keeps
+/// naming it, wherever the finger goes) and the down's serial — what a
+/// move/resize may name while the point is down (touchGrab).
+const TouchPoint = struct { id: i32, surface: u32, serial: u32 };
 
 /// The objects of one kind a client made for the one seat — from every
 /// wl_seat binding it holds (Firefox binds wl_seat twice: GTK's, whose
@@ -821,6 +831,15 @@ const Conn = struct {
     /// one made while its client has focus is sent the enter at once.
     pointers: SeatObjects = .{},
     keyboards: SeatObjects = .{},
+    /// wl_touch objects (every one gets every touch event). Points exist
+    /// only while there is one: the last released forgets them.
+    touches: SeatObjects = .{},
+    /// the points down now (TouchPoint), in down order
+    touch_points: [max_touch_points]TouchPoint = undefined,
+    touch_n: u8 = 0,
+    /// a touch event went out since the last wl_touch.frame (touchFrame
+    /// sends one only then)
+    touch_unframed: bool = false,
     pointer_focus: u32 = 0,
     /// serial of the latest pointer enter (one serial, sent to every
     /// wl_pointer; a late wl_pointer's enter repeats it) —
@@ -1064,6 +1083,11 @@ pub const Compositor = struct {
     /// and reports the grant (pointerLockGranted) and the loss
     /// (pointerLockLost); `locked` goes out only on the grant.
     pointer_lock_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, surface_id: u32) void = null,
+    /// The conn now has a wl_touch (bound: its first get_touch) or none any
+    /// more (its last released). Touch calls for a conn without one are
+    /// ignored: the embedder sends that client the finger as a pointer.
+    /// Nothing is told when the conn closes (its CONN_CLOSE says it).
+    touch_bound_fn: ?*const fn (ctx: ?*anyopaque, conn_id: u32, bound: bool) void = null,
     /// A wp_presentation_feedback.presented event (`msg`, one whole wire
     /// message) whose timestamp the transport must replace: the core's is
     /// the page's frame time, which no client can read. The transport
@@ -1663,7 +1687,6 @@ pub const Compositor = struct {
         if (std.mem.eql(u8, iface.name, "wl_seat")) {
             // every wl_seat binding's objects get the seat's events (a
             // client may bind it twice: Firefox), at their binding's version
-            // (get_touch: no touch capability, no events — nothing to track)
             const id = args[0].new_id;
             if (std.mem.eql(u8, msg.name, "get_pointer")) {
                 if (!conn.pointers.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_pointer", id);
@@ -1672,6 +1695,14 @@ pub const Compositor = struct {
                 if (!conn.keyboards.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_keyboard", id);
                 self.sendKeymap(conn_id, id, entry.version);
                 self.lateKeyboardEnter(conn_id, conn, id);
+            } else if (std.mem.eql(u8, msg.name, "get_touch")) {
+                // (no late downs: a point already down stays the other
+                // objects'; the next down reaches this one too)
+                const was = conn.touches.len;
+                if (!conn.touches.add(id, entry.version)) return self.seatObjectIgnored(conn_id, "wl_touch", id);
+                if (was == 0) {
+                    if (self.touch_bound_fn) |f| f(self.ctx, conn_id, true);
+                }
             }
             return;
         }
@@ -1733,7 +1764,8 @@ pub const Compositor = struct {
         {
             // CSD titlebar / border drag; args = seat, serial[, edges]. The
             // embedder owns the drag, and starts it only for a press still
-            // held on this window (inImplicitGrab): the request of a slow
+            // held on this window (inImplicitGrab) or a touch point still
+            // down on it (touchGrab): the request of a slow
             // client can arrive after the release, and a grab started then
             // follows a pointer with no button down until the next click.
             // Not while fullscreen (it neither moves nor resizes).
@@ -1742,9 +1774,16 @@ pub const Compositor = struct {
                 const is_move = msg.name[0] == 'm';
                 if (surface.fullscreen) {
                     // its size and place are the desktop's
-                } else if (!inImplicitGrab(conn, args[1].uint, id)) {
-                    self.logf("c{d}: xdg_toplevel.{s} with serial {d} outside a held press — ignored", .{ conn_id, msg.name, args[1].uint });
-                } else if (self.interactive_fn) |f| f(self.ctx, conn_id, id, if (is_move) 0 else 1, if (is_move) 0 else args[2].uint);
+                } else if (inImplicitGrab(conn, args[1].uint, id) or touchGrab(conn, args[1].uint, id)) {
+                    // a finger's: the embedder's drag follows it from here,
+                    // so the client's touch sequence ends (as a gesture's).
+                    // (touchGrab first: a down's serial between two held
+                    // presses also passes inImplicitGrab's range test)
+                    if (touchGrab(conn, args[1].uint, id)) self.cancelTouches(conn_id, conn);
+                    if (self.interactive_fn) |f| f(self.ctx, conn_id, id, if (is_move) 0 else 1, if (is_move) 0 else args[2].uint);
+                } else {
+                    self.logf("c{d}: xdg_toplevel.{s} with serial {d} outside a held press or touch — ignored", .{ conn_id, msg.name, args[1].uint });
+                }
             }
         } else if (std.mem.eql(u8, iface.name, "xdg_toplevel") and
             (std.mem.eql(u8, msg.name, "set_maximized") or std.mem.eql(u8, msg.name, "unset_maximized")))
@@ -1908,8 +1947,11 @@ pub const Compositor = struct {
                 } else self.logf("c{d}: set_selection without keyboard focus (serial {d}) — ignored", .{ conn_id, args[1].uint });
             } else if (std.mem.eql(u8, msg.name, "start_drag")) {
                 // args: source (nullable), origin, icon (nullable), serial —
-                // a press of this client's, still held (like move/resize)
-                if (pressHeld(conn, args[3].uint)) {
+                // a press of this client's, still held (like move/resize).
+                // Not a touch point's: the dnd session follows the pointer
+                // (touch-driven dnd is not done), so a touch serial is as
+                // stale as any — even one between two held presses
+                if (pressHeld(conn, args[3].uint) and touchBySerial(conn, args[3].uint) == null) {
                     self.startDrag(conn_id, conn, args[0].object, args[1].object, args[2].object);
                 } else self.logf("c{d}: start_drag with serial {d} outside a held press — ignored", .{ conn_id, args[3].uint });
             }
@@ -2189,6 +2231,9 @@ pub const Compositor = struct {
                 _ = conn.surfaces.remove(header.object_id);
                 self.dropToplevelStrings(conn, header.object_id);
                 self.restacked(conn); // it, or its children, may have been placed
+                // its touch points and its subsurfaces' (still chained to
+                // it here) go silently, like focus below: no up for them
+                dropTouchesOn(conn, header.object_id);
                 // its subsurfaces are unmapped with it, their role objects
                 // inert (the id may name another surface right after)
                 var child_it = conn.surfaces.iterator();
@@ -2259,6 +2304,7 @@ pub const Compositor = struct {
                         (surface.role == .toplevel and surface.toplevel_id == header.object_id);
                     if (match) {
                         self.positions_dirty = true;
+                        dropTouchesOn(conn, kv.key_ptr.*); // unmapped: silently, as unmapped() does
                         if (surface.role == .toplevel) {
                             self.dropToplevelStrings(conn, kv.key_ptr.*);
                             // its size hints are the xdg_toplevel's too
@@ -2316,6 +2362,7 @@ pub const Compositor = struct {
                     surface.role = .none;
                     surface.sub_obj_id = 0;
                     surface.parent_id = 0;
+                    dropTouchesOn(conn, kv.key_ptr.*); // (its own subsurfaces stop at it now)
                     self.setOnOutput(conn_id, conn, kv.key_ptr.*, surface, false);
                     self.notifySurface(conn_id, kv.key_ptr.*, @intFromEnum(Role.none));
                     break;
@@ -2410,6 +2457,15 @@ pub const Compositor = struct {
                 conn.pointers.remove(header.object_id);
             } else if (std.mem.eql(u8, iface.name, "wl_keyboard")) {
                 conn.keyboards.remove(header.object_id);
+            } else if (std.mem.eql(u8, iface.name, "wl_touch")) {
+                // the last one: its points have nobody left to end them for
+                const was = conn.touches.len;
+                conn.touches.remove(header.object_id);
+                if (was > 0 and conn.touches.len == 0) {
+                    conn.touch_n = 0;
+                    conn.touch_unframed = false;
+                    if (self.touch_bound_fn) |f| f(self.ctx, conn_id, false);
+                }
             } else if (std.mem.eql(u8, iface.name, "wl_data_device")) {
                 // v2 release; its offers live on (the client destroys them)
                 conn.data_devices.remove(header.object_id);
@@ -2456,6 +2512,9 @@ pub const Compositor = struct {
             .subsurface, .popup => {},
             else => return,
         }
+        // off screen: its touch points (and its subsurfaces') end
+        // silently, as for a destroyed surface
+        if (self.conns.get(conn_id)) |conn| dropTouchesOn(conn, surface_id);
         self.notifySurface(conn_id, surface_id, @intFromEnum(Role.none));
     }
 
@@ -3077,7 +3136,8 @@ pub const Compositor = struct {
     /// set_minimized, or the embedder's setMinimized: the window hides (the
     /// embedder is told) or comes back. Hiding takes the pointer and the
     /// keyboard from its surfaces (an active pointer constraint ends first:
-    /// unlocked/unconfined before the leave) and dismisses its popups; a
+    /// unlocked/unconfined before the leave), cancels the client's touch
+    /// points when one is on it and dismisses its popups; a
     /// v6 client gets `suspended` until it is restored. Its frame callbacks
     /// wait meanwhile (tick) and its presentation feedback is discarded
     /// (surfaceShown). Only for toplevels past their initial configure.
@@ -3089,6 +3149,9 @@ pub const Compositor = struct {
             self.refreshFloatingSize(conn_id, conn, surface);
             surface.minimized = true;
             if (conn.pointer_focus != 0 and underMinimized(conn, conn.pointer_focus)) self.pointerLeave(conn_id);
+            // a finger on it: the client's touch sequence ends (one cancel
+            // ends every point of the client's, as wl_touch has it)
+            if (touchesUnder(conn, underMinimized)) self.cancelTouches(conn_id, conn);
             // (the leave's configure, no longer activated, carries `suspended`)
             told = conn.keyboard_focus == id;
             if (conn.keyboard_focus == id) self.keyboardLeave(conn_id);
@@ -3188,7 +3251,8 @@ pub const Compositor = struct {
     /// (Surface.hidden). Hidden, it is rendered for like a minimized one —
     /// frame callbacks held (tick), feedback discarded (surfaceShown), a
     /// v6 client `suspended` — but nothing else changes: not `minimized`,
-    /// not keyboard or pointer focus, not its popups. Shown again, the held
+    /// not keyboard or pointer focus, not its popups; only a finger on it
+    /// is cancelled (wl_touch.cancel, the client's points). Shown again, the held
     /// callbacks fire at the next tick. Only `suspended` reaches the app,
     /// in a configure repeating its size, and only when it changes (not
     /// while the window is minimized or the tab hidden). Before the
@@ -3198,6 +3262,9 @@ pub const Compositor = struct {
         const surface = t.surface;
         if (surface.hidden == !visible) return;
         surface.hidden = !visible;
+        // a finger on a window the user can't see any more: the client's
+        // touch sequence ends (the only input change hiding makes)
+        if (!visible and touchesUnder(t.conn, underHidden)) self.cancelTouches(conn_id, t.conn);
         if (!surface.configured or surface.minimized or self.suspended) return;
         if (objVersion(t.conn, surface.toplevel_id) < 6) return;
         self.refreshFloatingSize(conn_id, t.conn, surface);
@@ -3588,7 +3655,7 @@ pub const Compositor = struct {
             self.sendEvent(conn_id, id, "wp_presentation", "clock_id", &.{.{ .uint = presentation_clock_monotonic }});
         } else if (std.mem.eql(u8, interface, "wl_seat")) {
             self.sendEvent(conn_id, id, "wl_seat", "capabilities", &.{
-                .{ .uint = seat_capability_pointer | seat_capability_keyboard },
+                .{ .uint = seat_capability_pointer | seat_capability_keyboard | seat_capability_touch },
             });
             if (version >= 2) {
                 self.sendEvent(conn_id, id, "wl_seat", "name", &.{.{ .string = "wland-seat" }});
@@ -4595,6 +4662,142 @@ pub const Compositor = struct {
     }
 
     // ------------------------------------------------------------------
+    // touch (wl_touch): the embedder's points, one table per conn
+    // (Conn.touch_points). Unlike the pointer there is no focus: each point
+    // stays with the surface it went down on until its up. Every event goes
+    // to every wl_touch of the conn (SeatObjects); a group ends with frame.
+    // ------------------------------------------------------------------
+
+    /// A touch point went down on `surface_id` at x,y (surface-local
+    /// wl_fixed): wl_touch.down, a serial of its own (an input serial, like
+    /// a button press: set_selection, and move/resize while the point is
+    /// down). Ignored for a conn with no wl_touch, a surface that is gone,
+    /// a cursor or dnd icon, a minimized window, during a dnd drag (its
+    /// grab owns input), for an id already down and beyond
+    /// max_touch_points.
+    pub fn touchDown(self: *Compositor, conn_id: u32, time_ms: u32, surface_id: u32, id: i32, x_fixed: i32, y_fixed: i32) void {
+        if (self.drag != null) return;
+        const conn = self.conns.get(conn_id) orelse return;
+        if (conn.touches.len == 0) return;
+        // the down names the surface: a gone one would kill the client
+        const surface = conn.surfaces.getPtr(surface_id) orelse return;
+        switch (surface.role) {
+            .cursor, .dnd_icon => return,
+            else => {},
+        }
+        if (underMinimized(conn, surface_id)) return; // an embedder lagging behind
+        if (touchById(conn, id) != null or conn.touch_n == max_touch_points) return;
+        const serial = nextSerial(conn);
+        noteInputSerial(conn, serial);
+        self.last_input_conn = conn_id;
+        conn.touch_points[conn.touch_n] = .{ .id = id, .surface = surface_id, .serial = serial };
+        conn.touch_n += 1;
+        self.seatEvent(conn_id, &conn.touches, "wl_touch", "down", &.{
+            .{ .uint = serial }, .{ .uint = time_ms }, .{ .object = surface_id },
+            .{ .int = id },      .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
+        }, 1);
+        conn.touch_unframed = true;
+    }
+
+    /// A point that is down moved: x,y local to the surface it went down
+    /// on, wherever it is now. Ignored for an id that is not down.
+    pub fn touchMotion(self: *Compositor, conn_id: u32, time_ms: u32, id: i32, x_fixed: i32, y_fixed: i32) void {
+        const conn = self.conns.get(conn_id) orelse return;
+        if (touchById(conn, id) == null) return;
+        self.seatEvent(conn_id, &conn.touches, "wl_touch", "motion", &.{
+            .{ .uint = time_ms }, .{ .int = id }, .{ .fixed = x_fixed }, .{ .fixed = y_fixed },
+        }, 1);
+        conn.touch_unframed = true;
+    }
+
+    /// A point went up: wl_touch.up with a serial of its own (an input
+    /// serial, as a button release's), and the id is free again. Ignored
+    /// for an id that is not down.
+    pub fn touchUp(self: *Compositor, conn_id: u32, time_ms: u32, id: i32) void {
+        const conn = self.conns.get(conn_id) orelse return;
+        const i = touchById(conn, id) orelse return;
+        const serial = nextSerial(conn);
+        noteInputSerial(conn, serial);
+        self.last_input_conn = conn_id;
+        removeTouch(conn, i);
+        self.seatEvent(conn_id, &conn.touches, "wl_touch", "up", &.{
+            .{ .uint = serial }, .{ .uint = time_ms }, .{ .int = id },
+        }, 1);
+        conn.touch_unframed = true;
+    }
+
+    /// The embedder's touch calls since the last one happened together:
+    /// wl_touch.frame, if any of them sent something.
+    pub fn touchFrame(self: *Compositor, conn_id: u32) void {
+        const conn = self.conns.get(conn_id) orelse return;
+        if (!conn.touch_unframed) return;
+        conn.touch_unframed = false;
+        self.seatEvent(conn_id, &conn.touches, "wl_touch", "frame", &.{}, 1);
+    }
+
+    /// The embedder took the touch sequence (the browser's pointercancel,
+    /// its own drag): every point of the conn ends without its up.
+    pub fn touchCancel(self: *Compositor, conn_id: u32) void {
+        const conn = self.conns.get(conn_id) orelse return;
+        self.cancelTouches(conn_id, conn);
+    }
+
+    /// wl_touch.cancel if a point is down, and every point is forgotten
+    /// (cancel ends them all: wl_touch has no per-point cancel). The
+    /// embedder's later calls naming them are ignored.
+    fn cancelTouches(self: *Compositor, conn_id: u32, conn: *Conn) void {
+        if (conn.touch_n == 0) return;
+        conn.touch_n = 0;
+        conn.touch_unframed = false;
+        self.seatEvent(conn_id, &conn.touches, "wl_touch", "cancel", &.{}, 1);
+    }
+
+    fn touchById(conn: *const Conn, id: i32) ?usize {
+        for (conn.touch_points[0..conn.touch_n], 0..) |p, i| if (p.id == id) return i;
+        return null;
+    }
+
+    /// The point whose down had `serial` (still down), or null.
+    fn touchBySerial(conn: *const Conn, serial: u32) ?TouchPoint {
+        if (serial == 0) return null;
+        for (conn.touch_points[0..conn.touch_n]) |p| if (p.serial == serial) return p;
+        return null;
+    }
+
+    /// Order-preserving, like SeatObjects.remove.
+    fn removeTouch(conn: *Conn, i: usize) void {
+        std.mem.copyForwards(TouchPoint, conn.touch_points[i .. conn.touch_n - 1], conn.touch_points[i + 1 .. conn.touch_n]);
+        conn.touch_n -= 1;
+    }
+
+    /// Is `serial` the down of a point still down on `toplevel_id`'s window
+    /// (the toplevel or one of its subsurfaces)? What move/resize may name
+    /// besides a held press (inImplicitGrab).
+    fn touchGrab(conn: *Conn, serial: u32, toplevel_id: u32) bool {
+        const p = touchBySerial(conn, serial) orelse return false;
+        return subsurfaceRoot(conn, p.surface) == toplevel_id;
+    }
+
+    /// Is a point of the conn's on a surface `pred` holds for?
+    fn touchesUnder(conn: *const Conn, comptime pred: fn (*const Conn, u32) bool) bool {
+        for (conn.touch_points[0..conn.touch_n]) |p| if (pred(conn, p.surface)) return true;
+        return false;
+    }
+
+    /// `surface_id` was destroyed or unmapped: the points on it and on
+    /// surfaces whose subsurface chain leads to it are forgotten, SILENTLY
+    /// (no up: the client already dropped what it hung on that surface;
+    /// the embedder's calls naming them are ignored). Call it while the
+    /// subsurfaces are still chained to it.
+    fn dropTouchesOn(conn: *Conn, surface_id: u32) void {
+        var i: usize = 0;
+        while (i < conn.touch_n) {
+            const s = conn.touch_points[i].surface;
+            if (s == surface_id or subsurfaceRoot(conn, s) == surface_id) removeTouch(conn, i) else i += 1;
+        }
+    }
+
+    // ------------------------------------------------------------------
     // pointer constraints (lock + confine) — the state machine is the
     // core's (Constraint); the embedder only grants and loses Pointer Lock
     // ------------------------------------------------------------------
@@ -5270,7 +5473,8 @@ pub const Compositor = struct {
 
     /// The seat half of an attaching embedder's replay: per conn
     /// (ascending) the pointer image while it holds the pointer, its text
-    /// input while entered, the pointer lock it wants; then the clipboard
+    /// input while entered, the pointer lock it wants, whether it has a
+    /// wl_touch (touch_bound_fn, only when it has); then the clipboard
     /// selection (selection_fn, always once).
     pub fn replaySeat(self: *Compositor) void {
         const ids = self.connIds(self.gpa) catch return;
@@ -5288,6 +5492,9 @@ pub const Compositor = struct {
             if (conn.lock_surface != 0) {
                 if (self.pointer_lock_fn) |f| f(self.ctx, conn_id, conn.lock_surface);
             }
+            if (conn.touches.len > 0) {
+                if (self.touch_bound_fn) |f| f(self.ctx, conn_id, true);
+            }
         }
         self.notifySelection();
     }
@@ -5299,10 +5506,10 @@ pub const Compositor = struct {
     }
 
     /// The embedder went (a viewer closed): what only it held up ends —
-    /// a drag is cancelled, every pointer lock is lost and the pointer and
+    /// a drag is cancelled, every pointer lock is lost, the pointer and
     /// keyboard leave every client (held buttons and modifiers released:
-    /// the next enter starts clean), and the apps are told they are
-    /// suspended until an embedder says otherwise. Clients stay connected.
+    /// the next enter starts clean), touch points are cancelled, and the
+    /// apps are told they are suspended until an embedder says otherwise. Clients stay connected.
     pub fn embedderGone(self: *Compositor) void {
         self.dragCancel();
         if (self.connIds(self.gpa)) |ids| {
@@ -5311,6 +5518,7 @@ pub const Compositor = struct {
                 self.pointerLockLost(conn_id);
                 self.pointerLeave(conn_id);
                 self.keyboardLeave(conn_id);
+                self.touchCancel(conn_id);
                 if (self.conns.get(conn_id)) |conn| {
                     conn.buttons_held = 0;
                     conn.mods_depressed = 0;
@@ -5494,6 +5702,17 @@ const TestSink = struct {
     // acked_fn: last {serial, w, h} + count
     acked: ?[3]u32 = null,
     acked_calls: u32 = 0,
+    // touch_bound_fn: last call + count
+    touch_conn: u32 = 0,
+    touch_bound: ?bool = null,
+    touch_bound_calls: u32 = 0,
+
+    fn touchBound(ctx: ?*anyopaque, conn_id: u32, bound: bool) void {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        self.touch_conn = conn_id;
+        self.touch_bound = bound;
+        self.touch_bound_calls += 1;
+    }
 
     fn configure(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, cfg: Configure, cause: u32) void {
         const self: *TestSink = @ptrCast(@alignCast(ctx.?));
@@ -11170,6 +11389,445 @@ test "seat: objects over max_seat_objects get no events (the cap); a release mak
     try std.testing.expectEqual(@as(u8, max_seat_objects), comp.conns.get(1).?.data_devices.len);
 }
 
+const TouchTest = struct {
+    const touch = protocol.find("wl_touch").?;
+    const down = touch.eventIndex("down").?;
+    const up = touch.eventIndex("up").?;
+    const motion = touch.eventIndex("motion").?;
+    const frame = touch.eventIndex("frame").?;
+    const cancel = touch.eventIndex("cancel").?;
+    const release = touch.requestIndex("release").?;
+    const get_touch = protocol.find("wl_seat").?.requestIndex("get_touch").?;
+
+    /// SeatTest's toplevel (surface 6) plus wl_seat 20 (v9) and its
+    /// wl_touch 21, the embedder told (touch_bound_fn)
+    fn setup(comp: *Compositor) !void {
+        comp.touch_bound_fn = TestSink.touchBound;
+        try SeatTest.setup(comp);
+        try SeatTest.bindSeat(comp, 20, 9);
+        try SeatTest.send(comp, 20, get_touch, &.{.{ .new_id = 21 }});
+    }
+    /// conn 1's wl_touch events since the last clear, as {object, opcode}
+    fn events(sink: *const TestSink, out: [][2]u32) []const [2]u32 {
+        var n: usize = 0;
+        for (sink.events.items) |e| {
+            if (e.conn_id != 1 or e.object_id < 21 or e.object_id > 29) continue; // the tests' wl_touch ids
+            out[n] = .{ e.object_id, e.opcode };
+            n += 1;
+        }
+        return out[0..n];
+    }
+    fn expectEvents(sink: *TestSink, want: []const [2]u32) !void {
+        var buf: [64][2]u32 = undefined;
+        const got = events(sink, &buf);
+        errdefer for (got) |g| std.debug.print("got: @{d} op {d}\n", .{ g[0], g[1] });
+        try std.testing.expectEqualSlices([2]u32, want, got);
+        sink.events.clearRetainingCapacity();
+    }
+};
+
+test "touch: wl_seat advertises touch; touch_bound on the first get_touch and the last release; down, motion, up, frame in order with their args; a frame only after something" {
+    const T = TouchTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.touch_bound_fn = TestSink.touchBound;
+    try SeatTest.setup(&comp);
+
+    // the capabilities event names all three
+    sink.events.clearRetainingCapacity();
+    try SeatTest.bindSeat(&comp, 20, 9);
+    var vals: [wire.max_args]wire.Value = undefined;
+    const caps = try SeatTest.argsOf(&sink, 20, comptime protocol.find("wl_seat").?.eventIndex("capabilities").?, &.{.uint}, &vals);
+    try std.testing.expectEqual(seat_capability_pointer | seat_capability_keyboard | seat_capability_touch, caps[0].uint);
+
+    // no wl_touch yet: touch calls are ignored, no serial spent
+    const serial0 = comp.conns.get(1).?.serial;
+    comp.touchDown(1, 5, 6, 0, 256, 256);
+    comp.touchFrame(1);
+    try std.testing.expectEqual(serial0, comp.conns.get(1).?.serial);
+    try std.testing.expectEqual(@as(u8, 0), comp.conns.get(1).?.touch_n);
+    try std.testing.expectEqual(@as(u32, 0), sink.touch_bound_calls);
+
+    // the first wl_touch: bound; a second one: nothing new
+    try SeatTest.send(&comp, 20, T.get_touch, &.{.{ .new_id = 21 }});
+    try std.testing.expectEqual(@as(u32, 1), sink.touch_bound_calls);
+    try std.testing.expectEqual(true, sink.touch_bound.?);
+    try std.testing.expectEqual(@as(u32, 1), sink.touch_conn);
+    try SeatTest.send(&comp, 20, T.get_touch, &.{.{ .new_id = 22 }});
+    try std.testing.expectEqual(@as(u32, 1), sink.touch_bound_calls);
+    try SeatTest.send(&comp, 22, T.release, &.{});
+    try std.testing.expectEqual(@as(u32, 1), sink.touch_bound_calls);
+    sink.events.clearRetainingCapacity();
+
+    // nothing sent yet: no frame
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{});
+
+    comp.touchDown(1, 10, 6, 3, 10 * 256, 20 * 256);
+    const s_down = comp.conns.get(1).?.serial;
+    const d = try SeatTest.argsOf(&sink, 21, T.down, &.{ .uint, .uint, .object, .int, .fixed, .fixed }, &vals);
+    try std.testing.expectEqual(s_down, d[0].uint);
+    try std.testing.expectEqual(@as(u32, 10), d[1].uint);
+    try std.testing.expectEqual(@as(u32, 6), d[2].object);
+    try std.testing.expectEqual(@as(i32, 3), d[3].int);
+    try std.testing.expectEqual(@as(i32, 10 * 256), d[4].fixed);
+    try std.testing.expectEqual(@as(i32, 20 * 256), d[5].fixed);
+    // an input serial, like a press: a set_selection naming it counts
+    try std.testing.expectEqual(@as(u32, 1), comp.last_input_conn);
+    try std.testing.expect(comp.maySetSelection(1, comp.conns.get(1).?, s_down));
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{ .{ 21, T.down }, .{ 21, T.frame } });
+
+    // outside the surface, still its coordinates
+    comp.touchMotion(1, 11, 3, -5 * 256, 900 * 256);
+    const m = try SeatTest.argsOf(&sink, 21, T.motion, &.{ .uint, .int, .fixed, .fixed }, &vals);
+    try std.testing.expectEqual(@as(u32, 11), m[0].uint);
+    try std.testing.expectEqual(@as(i32, 3), m[1].int);
+    try std.testing.expectEqual(@as(i32, -5 * 256), m[2].fixed);
+    try std.testing.expectEqual(@as(i32, 900 * 256), m[3].fixed);
+    comp.touchFrame(1);
+    comp.touchFrame(1); // nothing since: no second frame
+    try T.expectEvents(&sink, &.{ .{ 21, T.motion }, .{ 21, T.frame } });
+
+    comp.touchUp(1, 12, 3);
+    const u = try SeatTest.argsOf(&sink, 21, T.up, &.{ .uint, .uint, .int }, &vals);
+    try std.testing.expectEqual(comp.conns.get(1).?.serial, u[0].uint);
+    try std.testing.expect(u[0].uint != s_down);
+    try std.testing.expectEqual(@as(u32, 12), u[1].uint);
+    try std.testing.expectEqual(@as(i32, 3), u[2].int);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{ .{ 21, T.up }, .{ 21, T.frame } });
+    try std.testing.expectEqual(@as(u8, 0), comp.conns.get(1).?.touch_n);
+
+    // the last wl_touch released: unbound, its points forgotten
+    comp.touchDown(1, 13, 6, 4, 0, 0);
+    try SeatTest.send(&comp, 21, T.release, &.{});
+    try std.testing.expectEqual(@as(u32, 2), sink.touch_bound_calls);
+    try std.testing.expectEqual(false, sink.touch_bound.?);
+    try std.testing.expectEqual(@as(u8, 0), comp.conns.get(1).?.touch_n);
+    sink.events.clearRetainingCapacity();
+    comp.touchUp(1, 14, 4);
+    comp.touchFrame(1);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+}
+
+test "touch: several points, every wl_touch of the client (two wl_seat bindings) gets every event with one serial; an id already down, an unknown id and one beyond the cap are ignored" {
+    const T = TouchTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    // a second binding at v3 (release's version) and its wl_touch 22
+    try SeatTest.bindSeat(&comp, 23, 3);
+    try SeatTest.send(&comp, 23, T.get_touch, &.{.{ .new_id = 22 }});
+    try std.testing.expectEqual(@as(u32, 1), sink.touch_bound_calls);
+    sink.events.clearRetainingCapacity();
+
+    // two fingers down together, one frame
+    comp.touchDown(1, 1, 6, 0, 0, 0);
+    comp.touchDown(1, 1, 6, 1, 256, 256);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{ .{ 21, T.down }, .{ 22, T.down }, .{ 21, T.down }, .{ 22, T.down }, .{ 21, T.frame }, .{ 22, T.frame } });
+    comp.touchDown(1, 2, 6, 0, 0, 0); // already down
+    comp.touchMotion(1, 2, 7, 0, 0); // never down
+    comp.touchUp(1, 2, 7);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{});
+
+    comp.touchDown(1, 2, 6, 2, 0, 0);
+    _ = try SeatTest.sameSerial(&sink, &.{ 21, 22 }, T.down);
+    comp.touchMotion(1, 3, 1, 512, 512);
+    comp.touchUp(1, 3, 0);
+    _ = try SeatTest.sameSerial(&sink, &.{ 21, 22 }, T.up);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{ .{ 21, T.down }, .{ 22, T.down }, .{ 21, T.motion }, .{ 22, T.motion }, .{ 21, T.up }, .{ 22, T.up }, .{ 21, T.frame }, .{ 22, T.frame } });
+    const c = comp.conns.get(1).?;
+    try std.testing.expectEqual(@as(u8, 2), c.touch_n);
+    // the freed id may go down again
+    comp.touchDown(1, 4, 6, 0, 0, 0);
+    try std.testing.expectEqual(@as(u8, 3), c.touch_n);
+
+    // the cap
+    for (0..max_touch_points) |i| comp.touchDown(1, 5, 6, 100 + @as(i32, @intCast(i)), 0, 0);
+    try std.testing.expectEqual(@as(u8, max_touch_points), c.touch_n);
+    sink.events.clearRetainingCapacity();
+    comp.touchMotion(1, 6, 100 + max_touch_points - 1, 0, 0); // the one that didn't go down
+    try T.expectEvents(&sink, &.{});
+
+    // GTK's released: the other one still hears
+    try SeatTest.send(&comp, 21, T.release, &.{});
+    try std.testing.expectEqual(@as(u32, 1), sink.touch_bound_calls);
+    sink.events.clearRetainingCapacity();
+    comp.touchUp(1, 7, 1);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{ .{ 22, T.up }, .{ 22, T.frame } });
+}
+
+test "touch: cancel ends every point (later calls naming them ignored), nothing when none is down; embedderGone cancels; downs ignored on a cursor surface or a surface that is gone" {
+    const T = TouchTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    sink.events.clearRetainingCapacity();
+
+    comp.touchCancel(1);
+    try T.expectEvents(&sink, &.{});
+
+    comp.touchDown(1, 1, 6, 0, 0, 0);
+    comp.touchDown(1, 1, 6, 1, 0, 0);
+    comp.touchCancel(1); // (unframed: the cancel ends the group, no frame follows)
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{ .{ 21, T.down }, .{ 21, T.down }, .{ 21, T.cancel } });
+    comp.touchMotion(1, 2, 0, 0, 0);
+    comp.touchUp(1, 2, 1);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{});
+
+    // the embedder goes: the points it was holding up are cancelled
+    comp.touchDown(1, 3, 6, 0, 0, 0);
+    comp.touchFrame(1);
+    sink.events.clearRetainingCapacity();
+    comp.embedderGone();
+    try T.expectEvents(&sink, &.{.{ 21, T.cancel }});
+    try std.testing.expectEqual(@as(u8, 0), comp.conns.get(1).?.touch_n);
+
+    // a cursor surface (40) is not a touch target; nor is a surface that
+    // does not exist (the down would name it)
+    try SeatTest.getPointer(&comp, 20, 30);
+    comp.pointerEnter(1, 6, 0, 0);
+    try SeatTest.send(&comp, 3, 0, &.{.{ .new_id = 40 }});
+    try SeatTest.send(&comp, 30, SeatTest.set_cursor_op, &.{ .{ .uint = comp.conns.get(1).?.pointer_enter_serial }, .{ .object = 40 }, .{ .int = 0 }, .{ .int = 0 } });
+    sink.events.clearRetainingCapacity();
+    comp.touchDown(1, 4, 40, 0, 0, 0);
+    comp.touchDown(1, 4, 99, 1, 0, 0);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{});
+}
+
+test "touch: move/resize honoured with the serial of a point down on the window, then the client's touch is cancelled; a stale (up) touch serial refused; start_drag never takes a touch serial" {
+    const T = TouchTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    comp.interactive_fn = TestSink.interactive;
+    const move_op = comptime protocol.find("xdg_toplevel").?.requestIndex("move").?;
+    const resize_op = comptime protocol.find("xdg_toplevel").?.requestIndex("resize").?;
+    var calls = sink.inter_calls;
+
+    // a finger up again: its serial is stale
+    comp.touchDown(1, 1, 6, 0, 0, 0);
+    const s_up = comp.conns.get(1).?.serial;
+    comp.touchUp(1, 2, 0);
+    comp.touchFrame(1);
+    try SeatTest.send(&comp, 8, move_op, &.{ .{ .object = 20 }, .{ .uint = s_up } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
+
+    // two fingers down; the titlebar's move names the first: honoured, and
+    // every point of the client is cancelled (the embedder's drag has it)
+    comp.touchDown(1, 3, 6, 0, 0, 0);
+    const s1 = comp.conns.get(1).?.serial;
+    comp.touchDown(1, 3, 6, 1, 0, 0);
+    comp.touchFrame(1);
+    sink.events.clearRetainingCapacity();
+    try SeatTest.send(&comp, 8, move_op, &.{ .{ .object = 20 }, .{ .uint = s1 } });
+    try std.testing.expectEqual(calls + 1, sink.inter_calls);
+    try std.testing.expectEqual(@as(u32, 0), sink.inter_kind);
+    try std.testing.expectEqual(@as(u32, 6), sink.inter_surface);
+    try T.expectEvents(&sink, &.{.{ 21, T.cancel }});
+    calls = sink.inter_calls;
+    // the fingers are the embedder's now: their calls and serial are dead
+    comp.touchMotion(1, 4, 0, 256, 256);
+    comp.touchUp(1, 4, 0);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{});
+    try SeatTest.send(&comp, 8, resize_op, &.{ .{ .object = 20 }, .{ .uint = s1 }, .{ .uint = 4 } });
+    try std.testing.expectEqual(calls, sink.inter_calls);
+
+    // a resize from a finger on a subsurface of the window counts too
+    try SeatTest.send(&comp, 2, 0, &.{ .{ .uint = 2 }, .{ .new_id_dynamic = .{ .interface = "wl_subcompositor", .version = 1, .id = 50 } } });
+    try SeatTest.send(&comp, 3, 0, &.{.{ .new_id = 51 }});
+    try SeatTest.send(&comp, 50, 1, &.{ .{ .new_id = 52 }, .{ .object = 51 }, .{ .object = 6 } });
+    comp.touchDown(1, 5, 51, 2, 0, 0);
+    try SeatTest.send(&comp, 8, resize_op, &.{ .{ .object = 20 }, .{ .uint = comp.conns.get(1).?.serial }, .{ .uint = 8 } });
+    try std.testing.expectEqual(calls + 1, sink.inter_calls);
+    try std.testing.expectEqual(@as(u32, 1), sink.inter_kind);
+    try std.testing.expectEqual(@as(u32, 8), sink.inter_value);
+    try std.testing.expectEqual(@as(u8, 0), comp.conns.get(1).?.touch_n);
+    calls = sink.inter_calls;
+
+    // start_drag: a touch serial is refused, even one inside a held
+    // press's range (press, finger, press); the press's own is honoured
+    try SeatTest.getPointer(&comp, 20, 30);
+    try SeatTest.send(&comp, 2, 0, &.{ .{ .uint = 7 }, .{ .new_id_dynamic = .{ .interface = "wl_data_device_manager", .version = 3, .id = 60 } } });
+    try SeatTest.send(&comp, 60, 1, &.{ .{ .new_id = 61 }, .{ .object = 20 } }); // get_data_device
+    try SeatTest.send(&comp, 60, 0, &.{.{ .new_id = 62 }}); // create_data_source
+    comp.pointerEnter(1, 6, 0, 0);
+    comp.pointerButton(1, 6, 0x110, true);
+    comp.touchDown(1, 6, 6, 3, 0, 0);
+    const s_touch = comp.conns.get(1).?.serial;
+    comp.pointerButton(1, 6, 0x111, true);
+    const s_press = comp.conns.get(1).?.serial;
+    const start_drag_op = comptime protocol.find("wl_data_device").?.requestIndex("start_drag").?;
+    try SeatTest.send(&comp, 61, start_drag_op, &.{ .{ .object = 62 }, .{ .object = 6 }, .{ .object = 0 }, .{ .uint = s_touch } });
+    try std.testing.expect(comp.drag == null);
+    try std.testing.expectEqual(calls, sink.inter_calls);
+    try SeatTest.send(&comp, 61, start_drag_op, &.{ .{ .object = 62 }, .{ .object = 6 }, .{ .object = 0 }, .{ .uint = s_press } });
+    try std.testing.expect(comp.drag != null);
+    // the dnd grab owns input: no new finger goes down
+    sink.events.clearRetainingCapacity();
+    comp.touchDown(1, 7, 6, 4, 0, 0);
+    try T.expectEvents(&sink, &.{});
+}
+
+test "touch: a move naming a touch-down serial that falls between two held presses is the finger's: the client's touch is cancelled; the press's own serial cancels nothing" {
+    const T = TouchTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    comp.interactive_fn = TestSink.interactive;
+    const move_op = comptime protocol.find("xdg_toplevel").?.requestIndex("move").?;
+    try SeatTest.getPointer(&comp, 20, 30);
+    comp.pointerEnter(1, 6, 0, 0);
+
+    // a button held, a finger down, another button: the down's serial is
+    // inside the held presses' range (inImplicitGrab passes it too)
+    comp.pointerButton(1, 1, 0x110, true);
+    comp.touchDown(1, 2, 6, 0, 0, 0);
+    const s_touch = comp.conns.get(1).?.serial;
+    comp.touchFrame(1);
+    comp.pointerButton(1, 3, 0x111, true);
+    const s_press = comp.conns.get(1).?.serial;
+    sink.events.clearRetainingCapacity();
+    const calls = sink.inter_calls;
+    try SeatTest.send(&comp, 8, move_op, &.{ .{ .object = 20 }, .{ .uint = s_touch } });
+    try std.testing.expectEqual(calls + 1, sink.inter_calls);
+    try T.expectEvents(&sink, &.{.{ 21, T.cancel }});
+    try std.testing.expectEqual(@as(u8, 0), comp.conns.get(1).?.touch_n);
+
+    // the press's serial with a finger down: the pointer's move, the
+    // finger stays the client's
+    comp.touchDown(1, 4, 6, 1, 0, 0);
+    comp.touchFrame(1);
+    sink.events.clearRetainingCapacity();
+    try SeatTest.send(&comp, 8, move_op, &.{ .{ .object = 20 }, .{ .uint = s_press } });
+    try std.testing.expectEqual(calls + 2, sink.inter_calls);
+    try T.expectEvents(&sink, &.{});
+    try std.testing.expectEqual(@as(u8, 1), comp.conns.get(1).?.touch_n);
+}
+
+test "touch: a destroyed or unmapped surface drops its points (and its subsurfaces') silently" {
+    const T = TouchTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp);
+    // subsurfaces 51 and 53 of the toplevel, 55 of 53
+    try SeatTest.send(&comp, 2, 0, &.{ .{ .uint = 2 }, .{ .new_id_dynamic = .{ .interface = "wl_subcompositor", .version = 1, .id = 50 } } });
+    for ([_][2]u32{ .{ 51, 6 }, .{ 53, 6 }, .{ 55, 53 } }) |sp| {
+        try SeatTest.send(&comp, 3, 0, &.{.{ .new_id = sp[0] }});
+        try SeatTest.send(&comp, 50, 1, &.{ .{ .new_id = sp[0] + 1 }, .{ .object = sp[0] }, .{ .object = sp[1] } });
+    }
+    const surf_destroy = comptime protocol.find("wl_surface").?.requestIndex("destroy").?;
+    const c = comp.conns.get(1).?;
+
+    // a finger on 51, 53, 55 and the toplevel
+    comp.touchDown(1, 1, 51, 1, 0, 0);
+    comp.touchDown(1, 1, 53, 2, 0, 0);
+    comp.touchDown(1, 1, 55, 3, 0, 0);
+    comp.touchDown(1, 1, 6, 4, 0, 0);
+    comp.touchFrame(1);
+    sink.events.clearRetainingCapacity();
+    // 51 destroyed: its point goes, no event names it
+    try SeatTest.send(&comp, 51, surf_destroy, &.{});
+    try std.testing.expectEqual(@as(u8, 3), c.touch_n);
+    // 53 destroyed: its point and 55's (hanging from it)
+    try SeatTest.send(&comp, 53, surf_destroy, &.{});
+    try std.testing.expectEqual(@as(u8, 1), c.touch_n);
+    comp.touchUp(1, 2, 1);
+    comp.touchUp(1, 2, 3);
+    comp.touchFrame(1);
+    try T.expectEvents(&sink, &.{});
+    // the xdg_toplevel destroyed (unmapped, the wl_surface lives on): 6's
+    try SeatTest.send(&comp, 8, comptime protocol.find("xdg_toplevel").?.requestIndex("destroy").?, &.{});
+    try std.testing.expectEqual(@as(u8, 0), c.touch_n);
+    try T.expectEvents(&sink, &.{});
+}
+
+test "touch: a popup grabbing with the serial of a tap's down (GTK's menu on a tap) is mapped and kept, not dismissed" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
+    try T.send(&comp, 9, TouchTest.get_touch, &.{.{ .new_id = 21 }});
+    comp.touchDown(1, 1, 6, 0, 0, 0);
+    const s_down = comp.conns.get(1).?.serial;
+    comp.touchFrame(1);
+    // the menu: surface 15, xdg_surface 16, xdg_popup 17, grabbing with it
+    try PopupTest.positioner(&comp, 14, 10, 10, .{ 8, 8 }, 50, 40);
+    try PopupTest.popup(&comp, 15, 7, 14);
+    try T.send(&comp, 17, comptime protocol.find("xdg_popup").?.requestIndex("grab").?, &.{ .{ .object = 9 }, .{ .uint = s_down } });
+    try T.send(&comp, 15, T.commit_op, &.{});
+    try T.send(&comp, 15, T.attach_op, &.{ .{ .object = 31 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(&comp, 15, T.commit_op, &.{});
+    // (the finger may lift before or after: the menu stays either way)
+    comp.touchUp(1, 2, 0);
+    comp.touchFrame(1);
+    const done_op = comptime protocol.find("xdg_popup").?.eventIndex("popup_done").?;
+    for (sink.events.items) |e| try std.testing.expect(!(e.object_id == 17 and e.opcode == done_op));
+    try std.testing.expectEqual(Role.popup, comp.surfaceRole(1, 15));
+    try std.testing.expect(comp.surfaceHasContent(1, 15));
+}
+
+test "touch: minimizing a window with a finger on it cancels the client's touch, a minimized one takes no down; hiding cancels too, a hidden one still takes downs" {
+    const T = WinTest;
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    try T.setup(&comp, &sink);
+    try T.send(&comp, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 9 } } });
+    try T.send(&comp, 9, TouchTest.get_touch, &.{.{ .new_id = 21 }});
+    sink.events.clearRetainingCapacity();
+    const c = comp.conns.get(1).?;
+
+    comp.touchDown(1, 1, 6, 0, 0, 0);
+    comp.touchFrame(1);
+    sink.events.clearRetainingCapacity();
+    comp.setMinimized(1, 6, true);
+    try TouchTest.expectEvents(&sink, &.{.{ 21, TouchTest.cancel }});
+    comp.touchDown(1, 2, 6, 0, 0, 0);
+    try std.testing.expectEqual(@as(u8, 0), c.touch_n);
+    comp.setMinimized(1, 6, false);
+    sink.events.clearRetainingCapacity();
+
+    // hidden with no finger on it: nothing for wl_touch
+    comp.setVisible(1, 6, false);
+    comp.setVisible(1, 6, true);
+    try TouchTest.expectEvents(&sink, &.{});
+    comp.touchDown(1, 3, 6, 0, 0, 0);
+    comp.touchFrame(1);
+    sink.events.clearRetainingCapacity();
+    comp.setVisible(1, 6, false);
+    try TouchTest.expectEvents(&sink, &.{.{ 21, TouchTest.cancel }});
+    try std.testing.expectEqual(@as(u8, 0), c.touch_n);
+    // the embedder routes input to hidden windows as it likes
+    comp.touchDown(1, 4, 6, 0, 0, 0);
+    try std.testing.expectEqual(@as(u8, 1), c.touch_n);
+}
+
 test "data devices: each of a client's wl_data_devices and primary devices gets an offer of its own (dense server ids, SRVOBJ per primary offer); a late one while focused gets the selection; release" {
     var sink: TestSink = undefined;
     var comp = testSetup(&sink);
@@ -11398,6 +12056,9 @@ const ReplayRecorder = struct {
     fn decoration(ctx: ?*anyopaque, c: u32, s: u32, on: bool) void {
         of(ctx).add("decoration {d} {d} {}", .{ c, s, on });
     }
+    fn touch(ctx: ?*anyopaque, c: u32, on: bool) void {
+        of(ctx).add("touch {d} {}", .{ c, on });
+    }
     fn expect(self: *const ReplayRecorder, want: []const []const u8) !void {
         errdefer for (self.lines.items) |l| std.debug.print("got: {s}\n", .{l});
         try std.testing.expectEqual(want.len, self.lines.items.len);
@@ -11405,7 +12066,7 @@ const ReplayRecorder = struct {
     }
 };
 
-test "replay: an embedder attaching later is told each surface (parents first: role, title, app id, input region, size hints, decoration, window states) and the seat (pointer image, lock, selection); embedderGone lets go of the seat and suspends" {
+test "replay: an embedder attaching later is told each surface (parents first: role, title, app id, input region, size hints, decoration, window states) and the seat (pointer image, lock, touch, selection); embedderGone lets go of the seat and suspends" {
     var rec: ReplayRecorder = .{};
     defer rec.deinit();
     var comp = Compositor.init(std.testing.allocator, &rec, ReplayRecorder.send, ReplayRecorder.log);
@@ -11420,6 +12081,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     comp.selection_fn = ReplayRecorder.selection;
     comp.cursor_shape_fn = ReplayRecorder.shape;
     comp.pointer_lock_fn = ReplayRecorder.lock;
+    comp.touch_bound_fn = ReplayRecorder.touch;
 
     const surf = comptime protocol.find("wl_surface").?;
     const tl = comptime protocol.find("xdg_toplevel").?;
@@ -11473,6 +12135,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     try S.send(&comp, &buf, 2, 0, &.{ .{ .uint = 4 }, .{ .new_id_dynamic = .{ .interface = "wl_seat", .version = 9, .id = 20 } } });
     try S.send(&comp, &buf, 20, 0, &.{.{ .new_id = 21 }}); // get_pointer
     try S.send(&comp, &buf, 20, 1, &.{.{ .new_id = 22 }}); // get_keyboard
+    try S.send(&comp, &buf, 20, 2, &.{.{ .new_id = 25 }}); // get_touch
     comp.pointerEnter(1, 6, 0, 0);
     comp.keyboardEnter(1, 6);
     comp.keyboardKey(1, 0, 42, true); // shift held
@@ -11483,7 +12146,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     try S.send(&comp, &buf, 24, 1, &.{ .{ .uint = enter_serial }, .{ .uint = 3 } }); // set_shape
     rec.clear();
     comp.replaySeat();
-    try rec.expect(&.{ "shape 1 3", "selection 0 0" });
+    try rec.expect(&.{ "shape 1 3", "touch 1 true", "selection 0 0" });
 
     // the embedder goes: pointer and keyboard leave, nothing held, suspended
     rec.clear();
@@ -11498,7 +12161,7 @@ test "replay: an embedder attaching later is told each surface (parents first: r
     try rec.expect(&.{"shape 1 0"}); // the pointer image reset with the leave
     rec.clear();
     comp.replaySeat();
-    try rec.expect(&.{"selection 0 0"});
+    try rec.expect(&.{ "touch 1 true", "selection 0 0" }); // (the wl_touch outlives the embedder)
 
     // destroying the xdg_toplevel (its decoration first) drops its title,
     // app id, hints and decoration; the role-none surface is not replayed

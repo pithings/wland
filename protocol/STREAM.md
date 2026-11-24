@@ -1119,7 +1119,9 @@ last word of CALLs 19, 20, 23 and 32) is the viewer's token for the call:
 every EVENT configure the call makes carries it back, so a viewer learns
 the serial its own call produced without a reply (absent: 0); a relay
 before EVENTs 17–18 tells neither configures nor acks; a relay before
-CALL 33 places popups without constraint adjustment.
+CALL 33 places popups without constraint adjustment; a relay before CALLs
+34–38 / EVENT 19 advertises no touch and says no app has a wl_touch, so a
+viewer sends fingers as the pointer.
 
 ### 0x0f CALL — an embedder call, viewer→relay only (session)
 
@@ -1165,6 +1167,11 @@ u8  args[len]
 | 31 | set_visible | u32 conn, u32 surface, u32 visible (0: the viewer hides the toplevel's window — frame callbacks held, feedback discarded, v6 `suspended`, nothing else changed; 1: shown) |
 | 32 | set_tiled | u32 conn, u32 surface, u32 edges, i32 w, i32 h, u32 cause (the tiled_* states from now on: edges 1 top, 2 bottom, 4 left, 8 right, 0 none; w×h > 0 rides the same configure, clamped like request_resize) |
 | 33 | set_window_position | u32 conn, u32 surface, i32 x, i32 y (where the toplevel's window-geometry origin sits in the output, logical px: its popups are constrained to the output from then on) |
+| 34 | touch_down | u32 conn, u32 time_ms, u32 surface, i32 id, i32 x_fixed, i32 y_fixed (touch point `id` went down on the surface, x,y surface-local) |
+| 35 | touch_motion | u32 conn, u32 time_ms, i32 id, i32 x_fixed, i32 y_fixed (local to the surface the point went down on) |
+| 36 | touch_up | u32 conn, u32 time_ms, i32 id |
+| 37 | touch_frame | u32 conn (the touch CALLs since the last one happened together: wl_touch.frame) |
+| 38 | touch_cancel | u32 conn (every point of the conn ends without its up: wl_touch.cancel) |
 
 **init is the attach.** A viewer sends it once, first, when it has seen
 FEATURE session (followed by its set_gpu_source / desktop_size /
@@ -1185,7 +1192,8 @@ kinds 2/6/8 that are set),
 parents before what hangs from them, then
 for every surface with content one BUFFER (or BUFFER_LZ) holding its whole
 current image as one damage rect, then the current cursor, text_input,
-pointer_lock, selection and keyboard_locks_state EVENTs, then EVENT
+pointer_lock, touch_bound (for each app that has a wl_touch), selection
+and keyboard_locks_state EVENTs, then EVENT
 `synced`. Nothing but the FEATURE frame(s) is sent to a viewer before its
 init; CALLs before init are ignored. Every init starts the SURFACE diffing
 afresh: the relay forgets the records it sent before (they were another
@@ -1210,7 +1218,8 @@ as it is.
 
 **When a viewer goes** (link closed or taken over) the relay ends what
 only it was holding up: the pointer leaves, the keyboard leaves (held keys
-and buttons are released), a pointer lock is lost, a drag is cancelled,
+and buttons are released), touch points are cancelled (wl_touch.cancel),
+a pointer lock is lost, a drag is cancelled,
 pending selection reads are dropped, and the apps are told they are
 suspended until the next init.
 
@@ -1243,6 +1252,7 @@ u8  args[len]
 | 16 | decoration | u32 conn, u32 surface, u32 decorated (1: the toplevel was configured server_side, the viewer draws its frame; 0: client-side again) |
 | 17 | configure | u32 conn, u32 surface, u32 serial, i32 w, i32 h, u32 states, u32 cause (every xdg_toplevel configure the compositor sends: its xdg_surface serial, the size asked — 0 = the client decides —, the states as the app was told them: 1 maximized, 2 fullscreen, 4 activated, 8 suspended, the tiled edges << 4 (1 top, 2 bottom, 4 left, 8 right); cause = the token of the CALL that made it, 0 = none) |
 | 18 | acked | u32 conn, u32 surface, u32 serial, i32 w, i32 h (a commit applied the configure `serial` the app acked since its last commit; w×h is what it asked; before that commit's pixel frames) |
+| 19 | touch_bound | u32 conn, u32 bound (1: the app made its first wl_touch, the touch CALLs reach it; 0: it released its last — touch CALLs for it are ignored; not sent at the conn's close) |
 
 EVENTs keep the order the compositor made them in, relative to each other
 and to the pixel frames, CONN_OPEN/CONN_CLOSE and SURFACE frames around

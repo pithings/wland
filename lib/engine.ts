@@ -432,6 +432,25 @@ export interface Engine {
   /** axis 0 vertical, 1 horizontal; value in surface units; value120 high-res
    *  wheel steps (120 per detent). */
   pointerAxis(conn: number, time: number, axis: 0 | 1, value: number, value120: number): void;
+  /** Touch (wl_touch). A point is `id` (any small non-negative integer the
+   *  embedder picks, unique among the conn's points that are down) from its
+   *  touchDown on `surface` to its touchUp; x, y are local to that surface
+   *  all along, also outside it. Calls for an id that is not down are
+   *  ignored (the core may have cancelled it: a window move took it over,
+   *  its window was minimized or hidden, its surface went).
+   *  End each group of calls that happened together with touchFrame.
+   *  Only for a conn with touchBound(): another gets nothing (send it the
+   *  finger as a pointer instead, never both). */
+  touchDown(conn: number, time: number, surface: number, id: number, x: number, y: number): void;
+  touchMotion(conn: number, time: number, id: number, x: number, y: number): void;
+  touchUp(conn: number, time: number, id: number): void;
+  touchFrame(conn: number): void;
+  /** Ends all of the conn's points without their up (wl_touch.cancel): the
+   *  browser took the gesture (pointercancel), the embedder's own drag did. */
+  touchCancel(conn: number): void;
+  /** Does this client have a wl_touch (it asked for one and has not
+   *  released it)? Changes are 'touch-bound' events. */
+  touchBound(conn: number): boolean;
   keyboardEnter(conn: number, surface: number): void;
   keyboardLeave(conn: number): void;
   /** code: linux evdev keycode. Caps Lock (58) and NumLock (69) presses
@@ -592,6 +611,7 @@ export type Event =
   | OpenEvent | ErrorEvent | CloseEvent | LogEvent
   | SurfaceEvent | CommitEvent | DestroyEvent | DisconnectEvent
   | TitleEvent | AppIdEvent | SizeLimitsEvent | DecorationEvent | CursorEvent | TextInputEvent | InputRegionEvent | PointerLockEvent
+  | TouchBoundEvent
   | MoveEvent | ResizeEvent | MaximizeEvent | FullscreenEvent | MinimizeEvent | DragStartEvent | DragEndEvent
   | ConfigureEvent | AckedEvent
   | SelectionEvent | PositionEvent | SyncedEvent;
@@ -818,6 +838,12 @@ export interface InputRegionEvent { type: 'input-region'; conn: number; surface:
  *  pointerLockLost. 0: the lock is not wanted any more — exit the
  *  browser's pointer lock (no report needed). */
 export interface PointerLockEvent { type: 'pointer-lock'; conn: number; surface: number }
+/** The app got its first wl_touch (`bound` true: send it fingers with
+ *  touchDown/touchMotion/touchUp/touchFrame) or released its last (false:
+ *  send them as the pointer again). Engine.touchBound answers the same. Not
+ *  sent when the app goes ('disconnect' is) or the link closes; a session's
+ *  scene replay carries it for every app that has one. */
+export interface TouchBoundEvent { type: 'touch-bound'; conn: number; bound: boolean }
 /** The core sent a toplevel an xdg_toplevel configure (whoever caused
  *  it: your call, the app's own request, keyboard focus, bounds, the tab's
  *  visibility, its initial configure). `serial` is its xdg_surface
@@ -1070,6 +1096,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
   let live = false; // link open and compositor initialised
   let disposed = false;
   const conns = new Set<number>(); // app conns the core holds (CONN_OPEN seen, not yet closed)
+  const touchConns = new Set<number>(); // conns with a wl_touch ('touch-bound')
   // the clipboard selection as the core last reported it, and the bytes of
   // the embedder's own (setSelection) while it is the selection
   let selection: { conn: number; mimes: string[] } = { conn: 0, mimes: [] };
@@ -1214,6 +1241,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       js_conn_close: (conn) => {
         conn >>>= 0;
         conns.delete(conn);
+        touchConns.delete(conn);
         for (const key of stale) if (key.startsWith(`${conn}:`)) stale.delete(key);
         for (const key of placed.keys()) if (key.startsWith(`${conn}:`)) placed.delete(key);
         if (pending && pending.conn === conn) pending = null;
@@ -1240,6 +1268,11 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       js_text_input: (conn, active, x, y, width, height) =>
         emit({ type: 'text-input', conn: conn >>> 0, active: active !== 0, x, y, width, height }),
       js_pointer_lock: (conn, surface) => emit({ type: 'pointer-lock', conn: conn >>> 0, surface: surface >>> 0 }),
+      js_touch_bound: (conn, bound) => {
+        conn >>>= 0;
+        if (bound) touchConns.add(conn); else touchConns.delete(conn);
+        emit({ type: 'touch-bound', conn, bound: bound !== 0 });
+      },
       js_input_region: (conn, surface, infinite, ptr, n) =>
         emit({ type: 'input-region', conn: conn >>> 0, surface,
                region: infinite ? null : new Int32Array(ex.memory.buffer, ptr, n * 4).slice() }),
@@ -1859,6 +1892,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       gpuWarned = false;
       stale.clear();
       placed.clear();
+      touchConns.clear();
       // no GPU source: a relay whose dmabufs are GPU resources gets no
       // linux-dmabuf (its FEATURE frames come next), so GPU clients use wl_shm
       run(ex.wland_set_gpu_source, gpu ? 1 : 0);
@@ -1894,6 +1928,7 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
         if (p) run(ex.wland_on_frame, p, 5);
       }
       conns.clear();
+      touchConns.clear();
       closeHandles(() => true);
       ex = real; // (the remote core's mirror goes with it)
       // the next link's compositor starts with an empty clipboard
@@ -2017,6 +2052,15 @@ export async function createEngine(options: EngineOptions): Promise<Engine> {
       ex.wland_pointer_button(conn, time >>> 0, button, pressed ? 1 : 0), true),
     pointerAxis: call((conn, time, axis, value, value120) =>
       ex.wland_pointer_axis(conn, time >>> 0, axis, fixed(value), value120), true),
+    // touch: in order with the pointer calls (a finger the embedder sends
+    // one app as touch and another as the pointer), so pending motion first
+    touchDown: call((conn, time, surface, id, x, y) =>
+      ex.wland_touch_down(conn, time >>> 0, surface, id | 0, fixed(x), fixed(y)), true),
+    touchMotion: call((conn, time, id, x, y) => ex.wland_touch_motion(conn, time >>> 0, id | 0, fixed(x), fixed(y)), true),
+    touchUp: call((conn, time, id) => ex.wland_touch_up(conn, time >>> 0, id | 0), true),
+    touchFrame: call((conn) => ex.wland_touch_frame(conn), true),
+    touchCancel: call((conn) => ex.wland_touch_cancel(conn), true),
+    touchBound: (conn) => live && touchConns.has(conn >>> 0),
     pointerLockGranted: call((conn, surface) => ex.wland_pointer_lock_granted(conn, surface), true),
     pointerLockLost: call((conn) => ex.wland_pointer_lock_lost(conn), true),
 

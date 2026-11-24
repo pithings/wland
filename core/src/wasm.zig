@@ -71,6 +71,11 @@ extern "env" fn js_input_region(conn_id: u32, surface_id: u32, infinite: u32, pt
 /// to it and reports wland_pointer_lock_granted / _lost), 0 = none any more
 /// (JS lets the browser's lock go).
 extern "env" fn js_pointer_lock(conn_id: u32, surface_id: u32) void;
+/// The conn has a wl_touch now (bound = 1: its first get_touch) or none any
+/// more (0: its last released). The wland_touch_* calls for a conn without
+/// one are ignored (JS sends that client the finger as a pointer). Not told
+/// at the conn's close (js_conn_close is).
+extern "env" fn js_touch_bound(conn_id: u32, bound: u32) void;
 /// HANDLE_OPEN (STREAM.md 0x08), decoded. kind 1 = kwshm: a = export id,
 /// b = 0, offset = 0. kind 2 = procfd: a = pid, b = fd, offset = file offset
 /// of handle byte 0. size = the handle's length in bytes (< 2^53, exact as
@@ -133,6 +138,7 @@ export fn wland_init(scale: i32, scale_120: i32, decorations: u32) void {
     compositor.text_input_fn = textInput;
     compositor.input_region_fn = inputRegion;
     compositor.pointer_lock_fn = pointerLock;
+    compositor.touch_bound_fn = touchBound;
     compositor.selection_fn = selectionEvent;
     compositor.output_scale = std.math.clamp(scale, 1, 4);
     compositor.scale_120 = @max(1, scale_120);
@@ -240,6 +246,36 @@ export fn wland_pointer_button(conn_id: u32, time_ms: u32, button: u32, pressed:
 /// value120 = high-resolution discrete component (120 per wheel detent).
 export fn wland_pointer_axis(conn_id: u32, time_ms: u32, axis: u32, value_fixed: i32, value120: i32) void {
     compositor.pointerAxis(conn_id, time_ms, axis, value_fixed, value120);
+    flushOut();
+}
+
+/// Touch point `id` (the embedder's, unique among the conn's points that
+/// are down) went down on the surface at x,y (surface-local, wl_fixed).
+export fn wland_touch_down(conn_id: u32, time_ms: u32, surface_id: u32, id: i32, x_fixed: i32, y_fixed: i32) void {
+    compositor.touchDown(conn_id, time_ms, surface_id, id, x_fixed, y_fixed);
+    flushOut();
+}
+
+/// x,y local to the surface the point went down on, wherever it is now.
+export fn wland_touch_motion(conn_id: u32, time_ms: u32, id: i32, x_fixed: i32, y_fixed: i32) void {
+    compositor.touchMotion(conn_id, time_ms, id, x_fixed, y_fixed);
+    flushOut();
+}
+
+export fn wland_touch_up(conn_id: u32, time_ms: u32, id: i32) void {
+    compositor.touchUp(conn_id, time_ms, id);
+    flushOut();
+}
+
+/// The touch calls since the last frame happened together: wl_touch.frame.
+export fn wland_touch_frame(conn_id: u32) void {
+    compositor.touchFrame(conn_id);
+    flushOut();
+}
+
+/// Every point of the conn ends without its up (wl_touch.cancel).
+export fn wland_touch_cancel(conn_id: u32) void {
+    compositor.touchCancel(conn_id);
     flushOut();
 }
 
@@ -848,6 +884,11 @@ fn inputRegion(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, region: ?*const 
 fn pointerLock(ctx: ?*anyopaque, conn_id: u32, surface_id: u32) void {
     _ = ctx;
     js_pointer_lock(conn_id, surface_id);
+}
+
+fn touchBound(ctx: ?*anyopaque, conn_id: u32, bound: bool) void {
+    _ = ctx;
+    js_touch_bound(conn_id, @intFromBool(bound));
 }
 
 fn setTitle(ctx: ?*anyopaque, conn_id: u32, surface_id: u32, title: []const u8) void {

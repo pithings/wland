@@ -164,6 +164,7 @@ pub const Session = struct {
         c.text_input_fn = evTextInput;
         c.input_region_fn = evInputRegion;
         c.pointer_lock_fn = evPointerLock;
+        c.touch_bound_fn = evTouchBound;
         c.selection_fn = evSelection;
         return self;
     }
@@ -637,6 +638,13 @@ pub const Session = struct {
         self.endEvent(.pointer_lock);
     }
 
+    fn evTouchBound(ctx: ?*anyopaque, conn_id: u32, bound: bool) void {
+        const self = of(ctx);
+        const w = self.beginEvent() orelse return;
+        inline for (.{ conn_id, @as(u32, @intFromBool(bound)) }) |v| w.u32_(v) catch return;
+        self.endEvent(.touch_bound);
+    }
+
     fn evSelection(ctx: ?*anyopaque, conn_id: u32, mimes: []const []const u8) void {
         const self = of(ctx);
         const w = self.beginEvent() orelse return;
@@ -860,6 +868,11 @@ pub const Session = struct {
             .pointer_lock_lost => c.pointerLockLost(try a.u32_()),
             .pointer_button => c.pointerButton(try a.u32_(), try a.u32_(), try a.u32_(), try a.u32_() != 0),
             .pointer_axis => c.pointerAxis(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_()),
+            .touch_down => c.touchDown(try a.u32_(), try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_(), try a.i32_()),
+            .touch_motion => c.touchMotion(try a.u32_(), try a.u32_(), try a.i32_(), try a.i32_(), try a.i32_()),
+            .touch_up => c.touchUp(try a.u32_(), try a.u32_(), try a.i32_()),
+            .touch_frame => c.touchFrame(try a.u32_()),
+            .touch_cancel => c.touchCancel(try a.u32_()),
             .keyboard_enter => c.keyboardEnter(try a.u32_(), try a.u32_()),
             .keyboard_leave => c.keyboardLeave(try a.u32_()),
             .key => c.keyboardKey(try a.u32_(), try a.u32_(), try a.u32_(), try a.u32_() != 0),

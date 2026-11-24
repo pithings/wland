@@ -815,6 +815,59 @@ test "session: set_window_position constrains the app's popups to the output (fl
     try std.testing.expectEqual(@as(i32, 51), try popupX(c, try openPopup(&rig, c, w, 50, 20)));
 }
 
+test "session: touch — touch_bound when the app gets a wl_touch, the touch CALLs reach it, a viewer that goes cancels its points, the next one's replay says the app has one" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    const c = try rig.connect();
+    const w = try openWindow(&rig, c);
+    const conn: u32 = 1;
+
+    const a = try rig.viewer();
+    try a.init();
+    try rig.synced(a);
+    const mark = a.frames.items.len;
+    const touch = c.newId();
+    try c.send(w.seat, comptime op("wl_seat", .request, "get_touch"), &.{.{ .new_id = touch }});
+    try rig.until(a, struct {
+        fn pred(v: *Viewer) bool {
+            return v.findEvent(0, .touch_bound) != null;
+        }
+    }.pred);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(1)), a.frames.items[a.findEvent(mark, .touch_bound).?].parse().event.args);
+
+    try a.call(.touch_down, &(le(conn) ++ le(7) ++ le(w.surface) ++ leI(2) ++ leI(3 * 256) ++ leI(4 * 256)));
+    try a.call(.touch_motion, &(le(conn) ++ le(8) ++ leI(2) ++ leI(5 * 256) ++ leI(6 * 256)));
+    try a.call(.touch_frame, &le(conn));
+    const down = comptime op("wl_touch", .event, "down");
+    const frame = comptime op("wl_touch", .event, "frame");
+    const Ctx = struct { c: *Client, id: u32, opcode: u16, n: usize };
+    const seen = struct {
+        fn pred(x: Ctx) bool {
+            return x.c.count(x.id, x.opcode) >= x.n;
+        }
+    }.pred;
+    try rig.until(Ctx{ .c = c, .id = touch, .opcode = frame, .n = 1 }, seen);
+    const d = c.last(touch, down) orelse return error.NoDown;
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, d.body[4..8], .little)); // time
+    try std.testing.expectEqual(w.surface, std.mem.readInt(u32, d.body[8..12], .little));
+    try std.testing.expectEqual(@as(i32, 2), std.mem.readInt(i32, d.body[12..16], .little));
+    try std.testing.expectEqual(@as(usize, 1), c.count(touch, comptime op("wl_touch", .event, "motion")));
+
+    // the viewer goes with the finger down: cancelled
+    a.close();
+    try rig.until(Ctx{ .c = c, .id = touch, .opcode = comptime op("wl_touch", .event, "cancel"), .n = 1 }, seen);
+
+    // the next viewer learns the app has a wl_touch from the replay
+    const b = try rig.viewer();
+    try b.init();
+    try rig.synced(b);
+    const at = b.findEvent(0, .touch_bound).?;
+    try std.testing.expect(at < b.findEvent(0, .synced).?);
+    try std.testing.expectEqualSlices(u8, &(le(conn) ++ le(1)), b.frames.items[at].parse().event.args);
+}
+
 fn writeAll(fd: i32, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {

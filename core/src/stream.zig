@@ -747,6 +747,11 @@ pub const CallOp = enum(u16) {
     set_visible = 31,
     set_tiled = 32,
     set_window_position = 33,
+    touch_down = 34,
+    touch_motion = 35,
+    touch_up = 36,
+    touch_frame = 37,
+    touch_cancel = 38,
     _,
 };
 
@@ -770,6 +775,7 @@ pub const EventOp = enum(u16) {
     decoration = 16,
     configure = 17,
     acked = 18,
+    touch_bound = 19,
     _,
 };
 
@@ -1640,6 +1646,47 @@ test "session frames: call and event roundtrip with encoded args, unknown ops fr
     const synced = encodeOpFrame(&buf, .event, @intFromEnum(EventOp.synced), &.{});
     try std.testing.expectEqual(@as(usize, 7), synced.len);
     try std.testing.expectEqual(EventOp.synced, @as(EventOp, @enumFromInt((try parse(synced)).event.op)));
+}
+
+test "session frames: touch calls and touch_bound (ops 34–38, EVENT 19) roundtrip with their args" {
+    const gpa = std.testing.allocator;
+    // the numbers are the wire contract (STREAM.md tables)
+    try std.testing.expectEqual(@as(u16, 34), @intFromEnum(CallOp.touch_down));
+    try std.testing.expectEqual(@as(u16, 35), @intFromEnum(CallOp.touch_motion));
+    try std.testing.expectEqual(@as(u16, 36), @intFromEnum(CallOp.touch_up));
+    try std.testing.expectEqual(@as(u16, 37), @intFromEnum(CallOp.touch_frame));
+    try std.testing.expectEqual(@as(u16, 38), @intFromEnum(CallOp.touch_cancel));
+    try std.testing.expectEqual(@as(u16, 19), @intFromEnum(EventOp.touch_bound));
+    var args: std.ArrayList(u8) = .empty;
+    defer args.deinit(gpa);
+    const w: ArgWriter = .{ .list = &args, .gpa = gpa };
+    // touch_down: conn, time_ms, surface, id, x_fixed, y_fixed
+    try w.u32_(3);
+    try w.u32_(0xffff_fff0);
+    try w.u32_(6);
+    try w.i32_(-1);
+    try w.i32_(-5 * 256);
+    try w.i32_(900 * 256);
+    var buf: [64]u8 = undefined;
+    const call = encodeOpFrame(&buf, .call, @intFromEnum(CallOp.touch_down), args.items);
+    try std.testing.expectEqual(op_frame_header_len + 24, call.len);
+    const f = (try parse(call)).call;
+    try std.testing.expectEqual(CallOp.touch_down, @as(CallOp, @enumFromInt(f.op)));
+    var r: ArgReader = .{ .rest = f.args };
+    try std.testing.expectEqual(@as(u32, 3), try r.u32_());
+    try std.testing.expectEqual(@as(u32, 0xffff_fff0), try r.u32_());
+    try std.testing.expectEqual(@as(u32, 6), try r.u32_());
+    try std.testing.expectEqual(@as(i32, -1), try r.i32_());
+    try std.testing.expectEqual(@as(i32, -5 * 256), try r.i32_());
+    try std.testing.expectEqual(@as(i32, 900 * 256), try r.i32_());
+    try expectPrefixesTruncated(call);
+
+    const ev = encodeOpFrame(&buf, .event, @intFromEnum(EventOp.touch_bound), &.{ 3, 0, 0, 0, 1, 0, 0, 0 });
+    const e = (try parse(ev)).event;
+    try std.testing.expectEqual(EventOp.touch_bound, @as(EventOp, @enumFromInt(e.op)));
+    var er: ArgReader = .{ .rest = e.args };
+    try std.testing.expectEqual(@as(u32, 3), try er.u32_());
+    try std.testing.expectEqual(@as(u32, 1), try er.u32_());
 }
 
 test "session frames: surface roundtrip (65 bytes), truncation, batch order" {
