@@ -32,6 +32,12 @@
 //     python3 ctypes (skipped without them) in relative mouse mode: locked,
 //     its xrel/yrel are the moves, re-locked by a press after Escape.
 //     (fixtures: `cursor`, `constraints`, `relative`)
+//     Touch (fixture `touch`, real weston-simple-touch; WAYLAND_DEBUG): a
+//     tap, a drag out of the window, two fingers, cancels (touchCancel, the
+//     window minimized or hidden under a finger) as wl_touch and never as
+//     wl_pointer; the fixture's title strip moves the window by the finger
+//     (its points cancelled); weston-flower (no wl_touch) gets the finger
+//     as the pointer.
 //  3. foot (fixture `term`): maps focused; typed keys (shift, symbols) run a printf that
 //     retitles it; pixels change; CSD subsurfaces sit around the grid; a
 //     pointer sweep, clicks and wheel leave it alive, motion coalesced;
@@ -95,6 +101,7 @@ import {
 import { xDisplayOf } from '../lib/index.ts';
 import { app, appHome, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
 import { parsePresentationShm, presentationChecks } from '../test/support/presentation-shm.ts';
+import { moveRequests, pointerEvents, touchEvents, touchLines } from '../test/support/touch-log.ts';
 
 const RELAY = (process.env.WLAND_E2E_RELAY || fileURLToPath(new URL('../zig-out/bin/wlandr', import.meta.url))).split(' ');
 const PORT = Number(process.env.PORT || 8937);
@@ -346,6 +353,127 @@ async function constraints() {
   await until(() => / -6\.00 4\.00 rel=1/.test(sdl.text().slice(from)), 5000, 'an SDL motion of xrel -6, yrel 4');
   check(true, 're-locked: relative motion again');
   await stop(sdl.p);
+  await noWindows();
+}
+
+/** wl_touch, read off the clients' WAYLAND_DEBUG (test/support/touch-log.ts):
+ *  weston-simple-touch (fixture `touch`) gets fingers as touch points — a
+ *  tap, a drag out of the window (its coordinates all along), two fingers
+ *  (ids the lowest free, reused), touchCancel, a window minimized or hidden
+ *  under a finger (the core's cancel), and (fixture only) a down in its
+ *  title strip asking for a move that the finger then drives — and none of
+ *  it as wl_pointer; weston-flower (fixture `cursor`: no wl_touch) gets a
+ *  finger as the pointer. */
+async function touch() {
+  console.log('== touch: wl_touch for weston-simple-touch, the pointer for a client without it ==');
+  const spec = need('touch');
+  if (!spec) return;
+  const app = runLogged(spec, { WAYLAND_DEBUG: '1' });
+  const win = await oneWindow(spec.name);
+  await until(() => hl.engine.touchBound(win.conn), 5000, 'its wl_touch (touch-bound)');
+  const lines = (from: number) => touchLines(touchEvents(app.text().slice(from)));
+  const expectLines = async (from: number, want: string[], what: string) => {
+    await until(() => lines(from).length >= want.length, 5000, what).catch(() => {});
+    const got = lines(from);
+    check(got.join(' | ') === want.join(' | '), `${what}: ${got.join(' | ')}`);
+  };
+  const ox = win.originX, oy = win.originY;
+  check(win.width === 600 && win.height === 500 && win.focused, `bound wl_touch, mapped ${win.width}x${win.height}`);
+
+  let from = app.text().length;
+  hl.tap(ox + 300, oy + 250);
+  await expectLines(from, ['down 0 300,250', 'frame', 'up 0', 'frame'], 'a tap');
+  check(pointerEvents(app.text().slice(from)).length === 0, `no wl_pointer event for it${realApps ? '' : ' (the fixture has a wl_pointer too)'}`);
+
+  from = app.text().length;
+  hl.touchDown(0, ox + 100, oy + 100);
+  hl.touchMove(0, ox - 30, oy + 10);
+  hl.touchMove(0, ox + 700, oy + 600);
+  hl.touchUp(0);
+  await expectLines(from, ['down 0 100,100', 'frame', 'motion 0 -30,10', 'frame', 'motion 0 700,600', 'frame', 'up 0', 'frame'],
+    'a drag out of the window, both ways: its coordinates all along');
+
+  from = app.text().length;
+  hl.touchDown(10, ox + 100, oy + 300);
+  hl.touchDown(11, ox + 200, oy + 300);
+  hl.touchMove(11, ox + 210, oy + 300);
+  hl.touchUp(10);
+  hl.touchDown(12, ox + 300, oy + 300);
+  hl.touchUp(11);
+  hl.touchUp(12);
+  await expectLines(from, ['down 0 100,300', 'frame', 'down 1 200,300', 'frame', 'motion 1 210,300', 'frame', 'up 0', 'frame',
+    'down 0 300,300', 'frame', 'up 1', 'frame', 'up 0', 'frame'], 'two fingers, then a third takes the freed id');
+
+  from = app.text().length;
+  hl.touchDown(0, ox + 100, oy + 100);
+  hl.touchDown(1, ox + 120, oy + 100);
+  hl.touchCancel();
+  hl.touchUp(0);
+  await expectLines(from, ['down 0 100,100', 'frame', 'down 1 120,100', 'frame', 'cancel'], 'touchCancel: one cancel ends both, nothing after');
+
+  // the core's own cancels: the window minimized, then hidden, under a finger
+  from = app.text().length;
+  hl.touchDown(0, ox + 100, oy + 100);
+  hl.minimize(win);
+  await until(() => hl.windows()[0]!.minimized, 2000, 'the minimize event');
+  hl.touchMove(0, ox + 110, oy + 100);
+  hl.restore(win);
+  await until(() => !hl.windows()[0]!.minimized, 2000, 'the restore event');
+  hl.touchUp(0);
+  await expectLines(from, ['down 0 100,100', 'frame', 'cancel'], 'minimized under a finger: cancelled, its later calls dropped');
+  from = app.text().length;
+  hl.touchDown(0, ox + 100, oy + 100);
+  hl.setVisible(win, false);
+  hl.setVisible(win, true);
+  hl.touchUp(0);
+  await expectLines(from, ['down 0 100,100', 'frame', 'cancel'], 'hidden under a finger: cancelled');
+  await settle();
+
+  if (realApps) console.log('  skipped move by finger: weston-simple-touch has no title strip');
+  else {
+    // a down in the fixture's title strip: its move names the down's serial,
+    // the core cancels its points and the finger drives the grab
+    from = app.text().length;
+    const g0 = grabs.length, w0 = hl.windows()[0]!;
+    hl.touchDown(0, ox + 300, oy + 20);
+    await until(() => grabs.length > g0, 5000, 'the move the touch-down asked for');
+    const downSerial = touchEvents(app.text().slice(from)).find((e) => e.type === 'down');
+    check(downSerial?.type === 'down' && moveRequests(app.text().slice(from)).includes(downSerial.serial),
+      `xdg_toplevel.move with the down's serial (${downSerial?.type === 'down' ? downSerial.serial : '?'}) → a move grab`);
+    hl.touchMove(0, ox + 400, oy + 70);
+    hl.touchUp(0);
+    const w1 = hl.windows()[0]!;
+    check(w1.x === w0.x + 100 && w1.y === w0.y + 50, `the finger dragged the window by (100, 50): ${w0.x},${w0.y} → ${w1.x},${w1.y}`);
+    await until(() => lines(from).includes('cancel'), 3000, 'wl_touch.cancel').catch(() => {});
+    await settle();
+    check(lines(from).join(' | ') === 'down 0 300,20 | frame | cancel', `the app's point cancelled, nothing of the drag reached it: ${lines(from).join(' | ')}`);
+    hl.tap(w1.originX + 300, w1.originY + 250);
+    await expectLines(from, ['down 0 300,20', 'frame', 'cancel', 'down 0 300,250', 'frame', 'up 0', 'frame'], 'a tap after it is the app\'s again');
+  }
+  await stop(app.p);
+  await noWindows();
+
+  // a client without wl_touch: the finger is the pointer
+  const plain = need('cursor');
+  if (!plain) return;
+  const p = runLogged(plain, { WAYLAND_DEBUG: '1' });
+  const pw = await oneWindow(plain.name);
+  if (hl.engine.touchBound(pw.conn)) {
+    console.log(`  skipped the pointer emulation: ${plain.name} binds wl_touch`);
+  } else {
+    const at = p.text().length;
+    const px = pw.originX + 100, py = pw.originY + 100;
+    hl.touchDown(0, px, py);
+    hl.touchMove(0, pw.originX - 20, py);
+    hl.touchUp(0);
+    const names = () => pointerEvents(p.text().slice(at)).map((e) => e.name === 'button' ? `button ${e.args[3]}` : e.name);
+    await until(() => names().includes('leave'), 5000, 'the emulated finger\'s leave');
+    const motion = pointerEvents(p.text().slice(at)).find((e) => e.name === 'motion');
+    check(names().join() === 'enter,button 1,motion,button 0,leave' && Math.round(+motion!.args[1]!) === -20,
+      `no wl_touch: the finger is the pointer — ${names().join(', ')}; held by the implicit grab out of the window (x ${motion?.args[1]})`);
+    check(!/wl_touch/.test(p.text()), 'and it never had a wl_touch');
+  }
+  await stop(p.p);
   await noWindows();
 }
 
@@ -1199,6 +1327,7 @@ try {
   await presentation();
   await cursor();
   await constraints();
+  await touch();
   await foot();
   await states();
   await clipboard();

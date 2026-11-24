@@ -37,7 +37,10 @@ export type AppRole =
   | 'dmabuf'
   // an SDL2 game: xdg-decoration made before its first commit, no frame of
   // its own (neverball)
-  | 'game';
+  | 'game'
+  // wl_touch, read off WAYLAND_DEBUG (weston-simple-touch; the fixture's
+  // title strip also moves its window by a finger, the real one's doesn't)
+  | 'touch';
 
 export interface AppSpec {
   role: AppRole;
@@ -154,6 +157,7 @@ function real(role: AppRole, args: string[]): AppSpec {
     // container at GTK's first icon, testing.md "Setup")
     case 'browser': return spec('firefox', ['--no-remote', '--new-instance', ...args]);
     case 'dmabuf': return spec('weston-simple-dmabuf-egl', args);
+    case 'touch': return spec('weston-simple-touch', args);
     // SDL2 (sdl2-compat here); no libdecor (its GTK plugin aborts in this
     // container), no audio device needed
     case 'game': return spec('neverball', args, { SDL_VIDEO_DRIVER: 'wayland', SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR: '0', SDL_AUDIODRIVER: 'dummy' });

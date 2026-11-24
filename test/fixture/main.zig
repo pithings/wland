@@ -28,13 +28,15 @@
 //!   game                         an SDL2 game (neverball): xdg-decoration made
 //!                                before the first commit, prints the mode it
 //!                                is configured with; `b` toggles the border
+//!   touch                        weston-simple-touch: wl_touch, a dot per
+//!                                point; a down in its title strip moves it
 
 const std = @import("std");
 const wl = @import("wl.zig");
 
 const usage =
     \\usage: wland-fixture <mode> [args]
-    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf game
+    \\modes: info shm presentation copy paste cursor constraints relative term files fullscreen browser dmabuf game touch
     \\
 ;
 
@@ -68,6 +70,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "browser", @import("browser.zig").run },
         .{ "dmabuf", @import("dmabuf.zig").run },
         .{ "game", @import("game.zig").run },
+        .{ "touch", @import("touch.zig").run },
     };
     inline for (modes) |m| {
         if (std.mem.eql(u8, mode, m[0])) return m[1](gpa, env, args);

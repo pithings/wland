@@ -25,6 +25,9 @@
 #   cursor       weston-flower: a cursor surface as the pointer image (fixture: cursor)
 #   constraints  weston-constraints: confine, Pointer Lock, relative motion
 #                (fixture: constraints)
+#   touch        weston-simple-touch: browser fingers as wl_touch, a move by
+#                finger; weston-flower gets them as the pointer (fixtures:
+#                touch, cursor)
 #   states       foot: fullscreen (+ the browser's), minimize/restore (fixture: term)
 #   embedder     foot: an embedder's window manager — interactive move/resize
 #                and Alt+drag handed over, grabs ended by a blur, autoFocus
@@ -36,7 +39,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_GROUPS=(foot gtk cursor constraints states embedder retina takeover handle-demo relay)
+ALL_GROUPS=(foot gtk cursor constraints touch states embedder retina takeover handle-demo relay)
 DEMO=0
 ONLY=()
 for arg in "$@"; do
@@ -278,6 +281,11 @@ fi
 if want constraints; then
 echo "== pointer constraints: weston-constraints confined + locked through Pointer Lock =="
 $E2E constraints $CDP          # spawns the app itself (it reads its WAYLAND_DEBUG)
+fi
+
+if want touch; then
+echo "== touch: browser fingers → wl_touch (weston-simple-touch), the pointer for a client without one =="
+$E2E touch $CDP                # spawns its apps itself (it reads their WAYLAND_DEBUG)
 fi
 
 if want states; then

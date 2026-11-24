@@ -14,8 +14,8 @@
 //
 // The apps are test/support/apps.ts's: wland-fixture modes by default
 // (`term` for foot, `files` for nautilus, `cursor` for weston-flower,
-// `constraints` for weston-constraints), the real ones with
-// WLAND_E2E_APPS=real. run-poc starts them from the same table.
+// `constraints` for weston-constraints, `touch` for weston-simple-touch),
+// the real ones with WLAND_E2E_APPS=real. run-poc starts them from the same table.
 //
 // Phases (the app each expects is run-poc's to start, unless noted):
 //   terminal     foot: typed keys (KeyboardEvent → evdev) render glyphs
@@ -37,6 +37,14 @@
 //                motion clamped (pointer capture); the next press locks — the
 //                browser grants Pointer Lock, relative motion only — and an
 //                exit the page didn't ask for reaches the app as unlocked
+//   touch        weston-simple-touch + weston-flower (spawned with
+//                WAYLAND_DEBUG, read back): CDP fingers are wl_touch points —
+//                a tap, a drag out of the window (its coordinates, no pan:
+//                touch-action none), two fingers (ids reused), a title-strip
+//                drag moving the window by the finger (the app's point
+//                cancelled; fixture only), a pan with touch-action auto
+//                cancelled — and no wl_pointer; flower (no wl_touch) gets the
+//                finger as the pointer
 //   dnd          fixture `files` only: its file dragged onto its folder (the
 //                browser's pointer → wm dnd → wl_data_device) arrives
 //   gtk          nautilus: popup opens below its button, outside click
@@ -77,6 +85,7 @@
 
 import { app as appFor, realApps, type AppRole } from "../test/support/apps.ts";
 import { isolatedMirror } from "../test/support/isolated.ts";
+import { moveRequests, pointerEvents, touchEvents, touchLines } from "../test/support/touch-log.ts";
 
 const [phase = "", cdpPort = "9222", ...args] = process.argv.slice(2);
 
@@ -629,6 +638,209 @@ const phases: Record<string, () => Promise<void>> = {
     } finally {
       app.kill();
       await evalJs(`(() => { const e = window.wland.engine; for (const n of ['pointerLockGranted', 'pointerLockLost', 'pointerMotion']) if (e['_' + n]) e[n] = e['_' + n]; })()`);
+    }
+  },
+
+  // Touch: real Chromium fingers (CDP Input.dispatchTouchEvent: PointerEvents
+  // with pointerType 'touch', no touch emulation needed) on weston-simple-touch
+  // (spawned with WAYLAND_DEBUG, read back through test/support/touch-log.ts)
+  // are its wl_touch points and never its pointer; on weston-flower (no
+  // wl_touch) a finger is the pointer. The container's touch-action: none
+  // keeps a drag the app's: with it set back to auto for a moment, the same
+  // drag is a browser pan — pointercancel → wl_touch.cancel.
+  async touch() {
+    const app = spawnApp("touch", { stderr: "pipe", env: { WAYLAND_DEBUG: "1" } });
+    let log = "";
+    (async () => { for await (const c of app.stderr) log += new TextDecoder().decode(c); })();
+    let flower: ReturnType<typeof spawnApp> | null = null;
+    const touch = (type: string, touchPoints: { x: number; y: number; id: number }[]) =>
+      call("Input.dispatchTouchEvent", { type, touchPoints });
+    // a canvas of that buffer size: its viewport rect and surface
+    const find = (w: number, h: number): Promise<any> => evalJs(`(() => {
+      window.scrollTo(0, 0);
+      const c = [...document.querySelectorAll('#desktop canvas')].find(c => c.width === ${w} && c.height === ${h} && c.style.display !== 'none');
+      if (!c) return null;
+      const r = c.getBoundingClientRect(), s = window.wland.view.surfaceOf(c);
+      return { conn: s.conn, surface: s.surface, x: r.left, y: r.top, bound: window.wland.engine.touchBound(s.conn) };
+    })()`);
+    const waitFor = async (w: number, h: number, what: string) => {
+      for (let i = 0; i < 75; i++) {
+        const s = await find(w, h);
+        if (s) return s;
+        await sleep(200);
+      }
+      return fail(`${what} never appeared`);
+    };
+    // the app's touch events since `from`, one line each (touch-log.ts)
+    const lines = (from: number) => touchLines(touchEvents(log.slice(from)));
+    // equal, coordinates within a px (the window may sit at a fractional place)
+    const same = (got: string[], want: string[]) => got.length === want.length && got.every((g, i) => {
+      const a = g.split(/[ ,]/), b = want[i]!.split(/[ ,]/);
+      return a.length === b.length && a.every((x, j) => x === b[j] || Math.abs(Number(x) - Number(b[j])) <= 1);
+    });
+    const expectLines = async (from: number, want: string[], what: string) => {
+      for (let i = 0; i < 30 && lines(from).length < want.length; i++) await sleep(100);
+      await sleep(150); // nothing more may follow
+      if (!same(lines(from), want)) fail(`${what}: got ${lines(from).join(" | ")}, want ${want.join(" | ")}`);
+      if (pointerEvents(log.slice(from)).length) fail(`${what}: the app also got wl_pointer events: ${pointerEvents(log.slice(from)).map((e) => e.name)}`);
+      console.log(`${what}: ${lines(from).join(" | ")}`);
+    };
+    // a finger's path, a frame apart (Chromium coalesces moves to ~1 per frame)
+    const path = async (id: number, from: [number, number], to: [number, number], steps: number) => {
+      for (let i = 1; i <= steps; i++) {
+        await touch("touchMove", [{ x: from[0] + ((to[0] - from[0]) * i) / steps, y: from[1] + ((to[1] - from[1]) * i) / steps, id }]);
+        await sleep(30);
+      }
+    };
+    try {
+      let s = await waitFor(600, 500, "weston-simple-touch's window");
+      for (let i = 0; i < 25 && !s.bound; i++) { await sleep(200); s = await find(600, 500); }
+      if (!s.bound) fail("its wl_touch never bound (touchBound false)");
+      // every engine call input makes for the fingers and the pointer
+      await evalJs(`(() => {
+        const e = window.wland.engine, seen = window.touchSeen = [];
+        for (const name of ['touchDown', 'touchMotion', 'touchUp', 'touchCancel', 'pointerEnter', 'pointerButton', 'pointerMotion', 'pointerLeave']) {
+          const orig = e['_' + name] = e[name];
+          e[name] = (...a) => { seen.push([name, a[0]]); return orig(...a); };
+        }
+      })()`);
+      const seen = async (): Promise<string[]> => (await evalJs("window.touchSeen.splice(0)")).map((c: any[]) => `${c[0]} c${c[1]}`);
+
+      // a tap
+      let from = log.length;
+      await touch("touchStart", [{ x: s.x + 300, y: s.y + 250, id: 0 }]);
+      await touch("touchEnd", []);
+      await expectLines(from, ["down 0 300,250", "frame", "up 0", "frame"], "a tap");
+      const tapCalls = await seen();
+      if (tapCalls.some((c) => c.startsWith("pointer"))) fail(`the tap also went the pointer path: ${tapCalls}`);
+
+      // a drag out of the window, left then far right and down: the
+      // surface's coordinates all along (the press captured the finger), and
+      // no pan (touch-action: none): no pointercancel, so no cancel
+      from = log.length;
+      await touch("touchStart", [{ x: s.x + 300, y: s.y + 250, id: 0 }]);
+      await path(0, [s.x + 300, s.y + 250], [s.x - 30, s.y + 10], 6);
+      await path(0, [s.x - 30, s.y + 10], [s.x + 700, s.y + 560], 6);
+      await touch("touchEnd", []);
+      for (let i = 0; i < 30 && !lines(from).includes("up 0"); i++) await sleep(100);
+      const drag = lines(from);
+      if (!same(drag.slice(0, 2), ["down 0 300,250", "frame"]) || !same(drag.slice(-2), ["up 0", "frame"])) fail(`the drag: ${drag.join(" | ")}`);
+      const moves = touchEvents(log.slice(from)).filter((e) => e.type === "motion") as { x: number; y: number }[];
+      const last = moves.at(-1);
+      if (!moves.some((m) => m.x < 0) || !last || Math.abs(last.x - 700) > 1 || Math.abs(last.y - 560) > 1)
+        fail(`the drag's motion did not follow the finger out of the window: ${drag.join(" | ")}`);
+      if (drag.includes("cancel") || (await seen()).includes(`touchCancel c${s.conn}`)) fail(`the drag was cancelled (a pan?): ${drag.join(" | ")}`);
+      if (pointerEvents(log.slice(from)).length) fail("the drag also reached the app as wl_pointer");
+      if (drag.filter((l) => l !== "frame").length * 2 !== drag.length) fail(`not every event framed: ${drag.join(" | ")}`);
+      console.log(`a drag out of the window: ${moves.length} motions, x down to ${Math.min(...moves.map((m) => m.x))}, ending at ${last.x},${last.y}; no cancel (touch-action: none)`);
+
+      // two fingers; the first lifts and a third takes its id
+      from = log.length;
+      const A = { x: s.x + 100, y: s.y + 300, id: 0 }, B = { x: s.x + 200, y: s.y + 300, id: 1 }, C = { x: s.x + 300, y: s.y + 300, id: 2 };
+      await touch("touchStart", [A]);
+      await touch("touchStart", [A, B]);
+      await sleep(30);
+      await touch("touchMove", [A, { ...B, x: B.x + 10 }]);
+      await sleep(30);
+      await touch("touchEnd", [A]);
+      await touch("touchStart", [{ ...B, x: B.x + 10 }, C]);
+      await touch("touchEnd", []);
+      for (let i = 0; i < 30 && lines(from).filter((l) => l.startsWith("up")).length < 3; i++) await sleep(100);
+      const two = lines(from);
+      const head = ["down 0 100,300", "frame", "down 1 200,300", "frame", "motion 1 210,300", "frame", "up 0", "frame", "down 0 300,300", "frame"];
+      if (!same(two.slice(0, head.length), head) || two.slice(head.length).filter((l) => l !== "frame").sort().join() !== "up 0,up 1")
+        fail(`two fingers: ${two.join(" | ")}`);
+      if (pointerEvents(log.slice(from)).length) fail("two fingers: the app also got wl_pointer events");
+      console.log(`two fingers, a third reusing the freed id: ${two.join(" | ")}`);
+      await seen();
+
+      // a finger in the fixture's title strip: its move names the down; the
+      // window manager drags the window by that finger, the app's point is
+      // cancelled and nothing of the drag reaches it
+      if (realApps) console.log("move by finger: skipped (weston-simple-touch has no title strip)");
+      else {
+        from = log.length;
+        await touch("touchStart", [{ x: s.x + 300, y: s.y + 20, id: 0 }]);
+        for (let i = 0; i < 50 && !(moveRequests(log.slice(from)).length && (await evalJs("document.body.style.cursor")) === "grabbing"); i++) await sleep(100);
+        if (!moveRequests(log.slice(from)).length) fail("the touch-down in the title strip asked for no move");
+        if ((await evalJs("document.body.style.cursor")) !== "grabbing") fail("the move request started no grab");
+        await path(0, [s.x + 300, s.y + 20], [s.x + 400, s.y + 70], 8);
+        await touch("touchEnd", []);
+        await sleep(300);
+        const moved = await find(600, 500);
+        if (Math.abs(moved.x - s.x - 100) > 1 || Math.abs(moved.y - s.y - 50) > 1)
+          fail(`the window did not follow the finger by (100, 50): ${s.x},${s.y} → ${moved.x},${moved.y}`);
+        const down = touchEvents(log.slice(from)).find((e) => e.type === "down");
+        if (down?.type !== "down" || !moveRequests(log.slice(from)).includes(down.serial)) fail("the move did not name the down's serial");
+        await expectLines(from, ["down 0 300,20", "frame", "cancel"], "a title-strip drag: the app's lines");
+        if ((await evalJs("document.body.style.cursor")) === "grabbing") fail("the grab did not end at the finger's lift");
+        console.log(`the finger moved the window by (${moved.x - s.x}, ${moved.y - s.y}) and the app got wl_touch.cancel`);
+        s = moved;
+        await seen();
+      }
+
+      // touch-action back to auto for a moment: the same kind of drag is now
+      // the browser's pan — pointercancel, so wl_touch.cancel
+      from = log.length;
+      await evalJs("document.getElementById('desktop').style.touchAction = 'auto'");
+      await touch("touchStart", [{ x: s.x + 300, y: s.y + 250, id: 0 }]);
+      await path(0, [s.x + 300, s.y + 250], [s.x + 300, s.y + 450], 6);
+      await touch("touchEnd", []);
+      await evalJs("document.getElementById('desktop').style.touchAction = 'none'");
+      for (let i = 0; i < 20 && !lines(from).includes("cancel"); i++) await sleep(100);
+      const panned = lines(from);
+      if (!panned.includes("cancel") || panned.includes("up 0")) fail(`with touch-action auto the drag was not cancelled (the control): ${panned.join(" | ")}`);
+      if (!(await seen()).includes(`touchCancel c${s.conn}`)) fail("pointercancel did not reach the engine as touchCancel");
+      console.log(`control, touch-action auto: the drag became a pan — ${panned.join(" | ")}`);
+      // and a tap after it is the app's again
+      from = log.length;
+      await touch("touchStart", [{ x: s.x + 50, y: s.y + 400, id: 0 }]);
+      await touch("touchEnd", []);
+      await expectLines(from, ["down 0 50,400", "frame", "up 0", "frame"], "touch-action none again: a tap");
+      app.kill();
+
+      // a client with no wl_touch: the finger is the pointer (the emulation)
+      const before: string[] = await evalJs("window.wland.view.windows().map((w) => w.key)");
+      flower = spawnApp("cursor", { stderr: "pipe", env: { WAYLAND_DEBUG: "1" } });
+      let flog = "";
+      (async () => { for await (const c of flower!.stderr!) flog += new TextDecoder().decode(c as Uint8Array); })();
+      // its toplevel's canvas (the real one's buffer is not 240x240: frame, shadow)
+      let f: any = null;
+      for (let i = 0; i < 75 && !f; i++) {
+        await sleep(200);
+        f = await evalJs(`(() => {
+          const wl = window.wland, w = wl.view.windows().find((w) => !${JSON.stringify(before)}.includes(w.key));
+          const c = w && wl.view.canvas(w.conn, w.surface);
+          if (!c || !c.width) return null;
+          const r = c.getBoundingClientRect();
+          return { conn: w.conn, surface: w.surface, x: r.left, y: r.top, bound: wl.engine.touchBound(w.conn) };
+        })()`);
+      }
+      if (!f) fail("weston-flower's window never appeared");
+      await sleep(300); // (its wl_touch, if it takes one, comes with its seat: before the map)
+      f.bound = await evalJs(`window.wland.engine.touchBound(${f.conn})`);
+      if (f.bound) console.log("the pointer emulation: skipped (this weston-flower binds wl_touch)");
+      else {
+        await seen();
+        await touch("touchStart", [{ x: f.x + 100, y: f.y + 100, id: 0 }]);
+        await path(0, [f.x + 100, f.y + 100], [f.x - 20, f.y + 100], 4);
+        await touch("touchEnd", []);
+        for (let i = 0; i < 30 && !pointerEvents(flog).some((e) => e.name === "leave"); i++) await sleep(100);
+        const evs = pointerEvents(flog).filter((e) => e.name !== "axis");
+        const names = evs.map((e) => e.name === "button" ? `button ${e.args[3]}` : e.name);
+        const order = names.filter((n, i) => n !== names[i - 1]).join();
+        const out = evs.filter((e) => e.name === "motion").at(-1);
+        if (order !== "enter,button 1,motion,button 0,leave") fail(`the finger as the pointer: ${names.join(", ")}`);
+        if (!out || Math.abs(+out.args[1]! + 20) > 1) fail(`the implicit grab did not keep the finger's pointer (last motion ${out?.args})`);
+        const calls = await seen();
+        if (calls.some((c) => c.startsWith("touch"))) fail(`the finger also went the touch path: ${calls}`);
+        console.log(`no wl_touch: the finger is the pointer — ${order}; dragged out, x ${out.args[1]}`);
+      }
+      console.log("touch ok: fingers are wl_touch points (tap, drag out, two fingers, move by finger, cancel on a pan), the pointer for a client without wl_touch");
+    } finally {
+      app.kill();
+      flower?.kill();
+      await evalJs(`(() => { const e = window.wland.engine; for (const n of ['touchDown', 'touchMotion', 'touchUp', 'touchCancel', 'pointerEnter', 'pointerButton', 'pointerMotion', 'pointerLeave']) if (e['_' + n]) e[n] = e['_' + n]; })()`);
     }
   },
 
