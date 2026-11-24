@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { installFakeDom } from './fake-dom.ts';
 import { createView, watchOutput } from '../lib/view.ts';
-import { createInput } from '../lib/input.ts';
+import { createInput, type PointerGrab } from '../lib/input.ts';
 import { createWindowManager, type WindowManagerOptions } from '../lib/wm.ts';
 import { createWland, type ViewWindow, type Wland } from '../lib/client.ts';
 import type { Engine, Link, LinkCallbacks, Role } from '../lib/engine.ts';
@@ -842,15 +842,18 @@ test('createWland: the frame loop ticks with rAF timestamps and the display inte
 // engine; the states arrive as events, as the core sends them ---------------
 type Ev = Parameters<ReturnType<typeof createView>['handle']>[0];
 function wmRig(dom: ReturnType<typeof installFakeDom>,
-  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive' | 'positions'> & { autoFocus?: boolean; manageDisplay?: boolean } = {}) {
-  const { autoFocus, manageDisplay, ...wmOpts } = opts;
+  opts: Pick<WindowManagerOptions, 'browserFullscreen' | 'shortcuts' | 'interactive' | 'positions'>
+    & { autoFocus?: boolean; manageDisplay?: boolean; touchBound?: (conn: number) => boolean } = {}) {
+  const { autoFocus, manageDisplay, touchBound, ...wmOpts } = opts;
   const container = dom.container();
   const view = createView({ container, webgl: 'never', focusOnMap: autoFocus !== false, manageDisplay });
   const calls: unknown[][] = [];
-  // setWindowPosition calls (what the wm tells the core) are kept apart
+  // setWindowPosition calls (what the wm tells the core) are kept apart;
+  // touchBound answers (not recorded): which clients have a wl_touch
   const positions: unknown[][] = [];
   const engine = new Proxy({} as Engine, {
-    get: (_, name) => (...args: unknown[]) => { (name === 'setWindowPosition' ? positions : calls).push([name, ...args]); },
+    get: (_, name) => name === 'touchBound' ? (conn: number) => !!touchBound?.(conn)
+      : (...args: unknown[]) => { (name === 'setWindowPosition' ? positions : calls).push([name, ...args]); },
   });
   const input = createInput({ engine, view, container, autoFocus });
   const wm = createWindowManager({ engine, view, input, container, ...wmOpts });
@@ -1898,6 +1901,251 @@ test('createWland: interactive, shortcuts, autoFocus and manageDisplay are passe
     });
     assert.deepEqual(told, []);
     wl2.dispose();
+  } finally {
+    dom.uninstall();
+  }
+});
+
+// --- touch: a finger on a client with a wl_touch is its touch point --------
+// (engine calls with their time left out: [name, conn, ...the rest])
+const TIMED = new Set(['touchDown', 'touchMotion', 'touchUp', 'pointerButton', 'pointerMotion']);
+const untimed = (calls: unknown[][]) => calls.splice(0).map(([n, ...a]) =>
+  TIMED.has(n as string) ? [n, a[0], ...a.slice(2, n === 'pointerMotion' ? 4 : undefined)] : [n, ...a]);
+const BTN_LEFT = 0x110;
+function touchRig(dom: ReturnType<typeof installFakeDom>, opts: Parameters<typeof wmRig>[1] = {}) {
+  const r = wmRig(dom, opts);
+  r.commit(1, 5);
+  r.commit(2, 5);
+  const c1 = r.view.canvas(1, 5) as any, c2 = r.view.canvas(2, 5) as any;
+  c1.getBoundingClientRect = () => ({ left: 24, top: 48, width: 40, height: 30 });
+  c2.getBoundingClientRect = () => ({ left: 100, top: 100, width: 40, height: 30 });
+  r.calls.length = 0;
+  const doc = dom.document;
+  // a finger's event (pointerType touch; a down holds button 0)
+  const ev = (type: string, target: any, pointerId: number, x: number, y: number, more: Record<string, unknown> = {}) =>
+    doc.dispatch(type, { target, pointerId, pointerType: 'touch', button: type === 'pointermove' || type === 'pointerover' ? -1 : 0,
+      buttons: type === 'pointerup' || type === 'pointerover' ? 0 : 1, clientX: x, clientY: y, ...more });
+  // the finger lifts: its up, then its pointerout
+  const lift = (target: any, pointerId: number, x: number, y: number) => { ev('pointerup', target, pointerId, x, y); ev('pointerout', target, pointerId, x, y); };
+  const mouse = (type: string, target: any, x: number, y: number, buttons = 0) =>
+    doc.dispatch(type, { target, pointerId: 1, pointerType: 'mouse', button: type === 'pointermove' ? -1 : 0, buttons, clientX: x, clientY: y });
+  return { ...r, c1, c2, doc, ev, lift, mouse, seen: () => untimed(r.calls) };
+}
+
+test('input touch: a finger on a client with a wl_touch is its touch point — down, motion, up, each framed, local to the surface it went down on (outside it too); ids the lowest free, reused; the tap focuses; nothing of it as a pointer. Without a wl_touch the finger is the pointer as before; a pen stays a pointer', async () => {
+  const dom = installFakeDom();
+  try {
+    const t = touchRig(dom, { touchBound: (conn) => conn === 1 });
+    const { c1, c2, ev, lift } = t;
+
+    // its pointerover (before the press) is nobody's; the press focuses
+    // the window and is touch point 0, at 10,10 in the surface
+    ev('pointerover', c1, 11, 34, 58);
+    assert.deepEqual(t.seen(), []);
+    ev('pointerdown', c1, 11, 34, 58);
+    assert.deepEqual(t.seen(), [['keyboardLeave', 2], ['keyboardEnter', 1, 5], ['touchDown', 1, 5, 0, 10, 10], ['touchFrame', 1]]);
+    assert.equal(c1.captured, 11, 'the finger is captured to its surface');
+    // a second finger: point 1
+    ev('pointerdown', c1, 12, 44, 68);
+    assert.deepEqual(t.seen(), [['touchDown', 1, 5, 1, 20, 20], ['touchFrame', 1]]);
+    // the first moves out of the surface: still its, in its coordinates
+    ev('pointermove', c1, 11, 4, 18);
+    assert.deepEqual(t.seen(), [['touchMotion', 1, 0, -20, -30], ['touchFrame', 1]]);
+    lift(c1, 11, 4, 18);
+    t.doc.dispatch('lostpointercapture', { target: c1, pointerId: 11 });
+    assert.deepEqual(t.seen(), [['touchUp', 1, 0], ['touchFrame', 1]], 'no pointer leave after it');
+    // a third finger takes the freed id
+    ev('pointerdown', c1, 13, 24, 48);
+    assert.deepEqual(t.seen(), [['touchDown', 1, 5, 0, 0, 0], ['touchFrame', 1]]);
+    lift(c1, 12, 44, 68);
+    lift(c1, 13, 24, 48);
+    assert.deepEqual(t.seen(), [['touchUp', 1, 1], ['touchFrame', 1], ['touchUp', 1, 0], ['touchFrame', 1]]);
+
+    // a client without a wl_touch: the finger is the pointer, its over
+    // entering at the press
+    ev('pointerover', c2, 21, 110, 110);
+    assert.deepEqual(t.seen(), []);
+    ev('pointerdown', c2, 21, 110, 110);
+    assert.deepEqual(t.seen(), [['pointerEnter', 2, 5, 10, 10], ['keyboardLeave', 1], ['keyboardEnter', 2, 5], ['pointerButton', 2, BTN_LEFT, true]]);
+    ev('pointermove', c2, 21, 120, 105);
+    lift(c2, 21, 120, 105);
+    assert.deepEqual(t.seen(), [['pointerMotion', 2, 20, 5], ['pointerButton', 2, BTN_LEFT, false], ['pointerLeave', 2]]);
+    c2.captured = null;
+    t.doc.dispatch('lostpointercapture', { target: c2, pointerId: 21 });
+
+    // a pen on the client with one: a pointer
+    ev('pointerdown', c1, 31, 30, 50, { pointerType: 'pen' });
+    ev('pointerup', c1, 31, 30, 50, { pointerType: 'pen' });
+    assert.deepEqual(t.seen(), [['keyboardLeave', 2], ['keyboardEnter', 1, 5], ['pointerButton', 1, BTN_LEFT, true], ['pointerButton', 1, BTN_LEFT, false]]);
+    t.dispose();
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('input touch: a pointercancel ends all of that client\'s points (touchCancel) and they are forgotten — another client\'s go on; so do the window blur and the capture taken away; a mouse beside the fingers keeps its pointer; a surface going stops the motion, its client going everything', async () => {
+  const dom = installFakeDom();
+  try {
+    const t = touchRig(dom, { touchBound: () => true });
+    const { c1, c2, ev, lift, mouse } = t;
+    const touchOnly = () => t.seen().filter((c) => String(c[0]).startsWith('touch'));
+
+    // the mouse hovers client 2; fingers on 1 (ids 0, 1) and 2 (its own 0)
+    mouse('pointerover', c2, 105, 105);
+    ev('pointerdown', c1, 11, 30, 50);
+    ev('pointerdown', c1, 12, 40, 50);
+    ev('pointerdown', c2, 21, 110, 110);
+    assert.deepEqual(t.seen().filter((c) => c[0] === 'touchDown' || String(c[0]).startsWith('pointer')), [
+      ['pointerEnter', 2, 5, 5, 5], ['touchDown', 1, 5, 0, 6, 2], ['touchDown', 1, 5, 1, 16, 2], ['touchDown', 2, 5, 0, 10, 10]]);
+    // the mouse goes on as the pointer beside them, pressing too
+    mouse('pointermove', c2, 106, 105);
+    ev('pointermove', c2, 21, 111, 110);
+    mouse('pointerdown', c2, 106, 105, 1);
+    mouse('pointerup', c2, 106, 105);
+    assert.deepEqual(t.seen(), [['pointerMotion', 2, 6, 5], ['touchMotion', 2, 0, 11, 10], ['touchFrame', 2],
+      ['pointerButton', 2, BTN_LEFT, true], ['pointerButton', 2, BTN_LEFT, false]]);
+    c2.captured = null;
+    t.doc.dispatch('lostpointercapture', { target: c2, pointerId: 1 });
+
+    // the browser takes finger 11's gesture: client 1's points all end
+    ev('pointercancel', c1, 11, 30, 50);
+    assert.deepEqual(t.seen(), [['touchCancel', 1]]);
+    ev('pointermove', c1, 12, 45, 50);
+    ev('pointercancel', c1, 12, 45, 50); // (the browser cancels each finger)
+    assert.deepEqual(t.seen(), [], 'forgotten');
+    ev('pointerout', c1, 11, 30, 50);
+    ev('pointerout', c1, 12, 45, 50);
+    ev('pointermove', c2, 21, 112, 110);
+    assert.deepEqual(touchOnly(), [['touchMotion', 2, 0, 12, 10], ['touchFrame', 2]], 'client 2\'s finger goes on');
+    ev('pointerdown', c1, 13, 24, 48);
+    assert.deepEqual(touchOnly(), [['touchDown', 1, 5, 0, 0, 0], ['touchFrame', 1]], 'its ids free again');
+    // the mouse still has its hover: a finger lifting left nothing
+    mouse('pointermove', c2, 107, 105);
+    assert.deepEqual(t.seen(), [['pointerMotion', 2, 7, 5]]);
+
+    // the window's blur: every client's points end
+    (globalThis as any).window.dispatch('blur');
+    assert.deepEqual(t.seen().sort(), [['touchCancel', 1], ['touchCancel', 2]]);
+    ev('pointermove', c1, 13, 30, 50);
+    lift(c1, 13, 30, 50);
+    lift(c2, 21, 112, 110);
+    assert.deepEqual(t.seen(), [], 'nothing of those fingers any more, nor as a pointer');
+
+    // its capture taken away (an embedder took the finger): cancelled
+    ev('pointerdown', c1, 14, 30, 50);
+    c1.captured = null;
+    t.doc.dispatch('lostpointercapture', { target: c1, pointerId: 14 });
+    assert.deepEqual(touchOnly(), [['touchDown', 1, 5, 0, 6, 2], ['touchFrame', 1], ['touchCancel', 1]]);
+    lift(c1, 14, 30, 50);
+    assert.deepEqual(t.seen(), []);
+
+    // the surface under a finger goes: no motion for it, its up still
+    ev('pointerdown', c2, 22, 110, 110);
+    t.feed({ type: 'destroy', conn: 2, surface: 5 });
+    t.seen();
+    ev('pointermove', c2, 22, 115, 110);
+    lift(c2, 22, 115, 110);
+    assert.deepEqual(touchOnly(), [['touchUp', 2, 0], ['touchFrame', 2]]);
+    // its client goes: nothing at all
+    ev('pointerdown', c1, 15, 30, 50);
+    t.feed({ type: 'disconnect', conn: 1 } as Ev);
+    t.seen();
+    ev('pointermove', c1, 15, 35, 50);
+    ev('pointercancel', c1, 15, 35, 50);
+    assert.deepEqual(touchOnly(), []);
+    t.dispose();
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
+  } finally {
+    dom.uninstall();
+  }
+});
+
+test('wm + touch: an app\'s move asked for from its touch point drags the window by that finger — not by a finger pressed since on another window, nor the mouse; nothing more of the finger reaches the app (its points cancelled; no pointer leave or enter) while the others go on; an embedder\'s grab of it is finger-only; a mouse grab cancels every touch point', async () => {
+  const dom = installFakeDom();
+  try {
+    const t = touchRig(dom, { touchBound: () => true });
+    const { c1, c2, ev, lift, mouse } = t;
+    const el = t.el(1, 5);
+    t.doc.elementFromPoint = () => c2; // what a pointer grab's end would enter
+
+    mouse('pointerover', c2, 150, 120);
+    ev('pointerdown', c1, 10, 34, 58);
+    ev('pointerdown', c2, 11, 110, 110); // pressed last, on the other window
+    t.seen();
+    t.feed({ type: 'move', conn: 1, surface: 5 });
+    assert.deepEqual(t.seen(), [['touchCancel', 1]], 'the app\'s points end; the pointer is not the grab\'s');
+    assert.equal(t.doc.body.style.cursor, 'grabbing');
+    ev('pointermove', c1, 10, 54, 58);
+    assert.equal(el.style.left, '20px', 'the finger on that window drags it');
+    assert.deepEqual(t.seen(), [], 'nothing of it to the app');
+    ev('pointermove', c2, 11, 120, 110);
+    mouse('pointermove', c2, 160, 120);
+    assert.equal(el.style.left, '20px', 'the other finger and the mouse leave it');
+    assert.deepEqual(t.seen(), [['touchMotion', 2, 0, 20, 10], ['touchFrame', 2], ['pointerMotion', 2, 60, 20]], 'and go on to their apps');
+    lift(c1, 10, 54, 58);
+    assert.ok(!t.doc.body.style.cursor, 'ended');
+    assert.deepEqual(t.seen(), [], 'no up, no enter');
+    lift(c2, 11, 120, 110);
+    assert.deepEqual(t.seen(), [['touchUp', 2, 0], ['touchFrame', 2]]);
+
+    // a mouse grab (a move from its press) holds off all: the fingers too
+    ev('pointerdown', c1, 12, 34, 58);
+    mouse('pointerdown', c2, 160, 120, 1);
+    t.seen();
+    t.feed({ type: 'move', conn: 2, surface: 5 });
+    assert.deepEqual(t.seen(), [['pointerLeave', 2], ['touchCancel', 1], ['pointerLeave', 2]], '(input\'s leave, then the wm\'s)');
+    ev('pointermove', c1, 12, 40, 58);
+    ev('pointerdown', c1, 13, 40, 58);
+    assert.deepEqual(t.seen(), [], 'a finger pressed meanwhile neither');
+    mouse('pointerup', c2, 160, 120);
+    assert.deepEqual(t.seen(), [['pointerEnter', 2, 5, 60, 20]]);
+    lift(c1, 12, 40, 58);
+    lift(c1, 13, 40, 58);
+    assert.deepEqual(t.seen(), [], 'held off till they lift');
+    t.dispose();
+
+    // the embedder takes the move: its grab of the finger takes the finger
+    // alone (the mouse hovering beside keeps the pointer)
+    let taken: PointerGrab | null = null;
+    const e = touchRig(dom, { touchBound: () => true, interactive: (_ev, press) => {
+      assert.equal(press.pointerType, 'touch');
+      taken = e.input.grab(press.pointerId);
+      return true;
+    } });
+    e.mouse('pointerover', e.c2, 150, 120);
+    e.ev('pointerdown', e.c1, 10, 34, 58);
+    e.seen();
+    e.feed({ type: 'move', conn: 1, surface: 5 });
+    assert.deepEqual([taken!.active, taken!.touch], [true, true]);
+    assert.deepEqual(e.seen(), [['touchCancel', 1]]);
+    e.ev('pointermove', e.c1, 10, 54, 58);
+    e.mouse('pointermove', e.c2, 151, 120);
+    e.lift(e.c1, 10, 54, 58);
+    assert.deepEqual(e.seen(), [['pointerMotion', 2, 51, 20]]);
+    assert.equal(taken!.active, false);
+    e.dispose();
+
+    // the embedder grabs the finger at its own press (an Alt+drag it takes,
+    // in the capture phase, the press not stopped): nothing of that finger
+    // reaches the app — no touchDown, no motion, no up
+    let alt: PointerGrab | null = null;
+    const a = touchRig(dom, { touchBound: () => true, interactive: (ev, press) => {
+      assert.equal(ev.type, 'alt-drag');
+      alt = a.input.grab(press.pointerId);
+      return true;
+    } });
+    a.ev('pointerdown', a.c1, 10, 34, 58, { altKey: true });
+    assert.deepEqual([alt!.active, alt!.touch], [true, true]);
+    a.ev('pointermove', a.c1, 10, 54, 58);
+    a.lift(a.c1, 10, 54, 58);
+    assert.deepEqual(a.seen().filter((c) => /^(touch|pointer)/.test(String(c[0]))), [], 'the grabbed finger is the embedder\'s alone');
+    assert.equal(alt!.active, false);
+    // the next finger, ungrabbed (no Alt), is the app's again
+    a.ev('pointerdown', a.c1, 11, 34, 58);
+    assert.deepEqual(a.seen().filter((c) => String(c[0]).startsWith('touch')), [['touchDown', 1, 5, 0, 10, 10], ['touchFrame', 1]]);
+    a.dispose();
+    await new Promise((res) => setTimeout(res, 0)); // the sink's blur checks
   } finally {
     dom.uninstall();
   }

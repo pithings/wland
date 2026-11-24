@@ -27,7 +27,10 @@ class Target {
   }
   dispatch(type: string, ev: Record<string, unknown> = {}) {
     const e = { type, target: this, preventDefault() {}, stopPropagation() {}, ...ev };
-    for (const [fn, o] of [...(this.listeners.get(type) || [])]) {
+    // capture listeners first, as a real dispatch runs them (the capture
+    // phase, then the bubble phase; at the target too, since Chrome 89)
+    const all = [...(this.listeners.get(type) || [])];
+    for (const [fn, o] of [...all.filter(([, o]) => o.capture), ...all.filter(([, o]) => !o.capture)]) {
       if (o.once) this.listeners.get(type)!.delete(fn);
       fn(e);
     }

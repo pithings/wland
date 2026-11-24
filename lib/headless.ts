@@ -12,13 +12,14 @@
 // It is client.ts's composition (view + input + wm) redone on plain numbers:
 // per-surface RGBA buffers instead of canvases, window positions and a
 // z-order instead of DOM boxes, a hit-tester instead of elementFromPoint,
-// method calls instead of pointer and keyboard events. The policy mirrors
+// method calls instead of pointer, touch and keyboard events. The policy mirrors
 // view.ts / input.ts / wm.ts (cascade placement of the window geometry's
 // box, click-to-focus-and-raise, focus forgotten silently with its surface
 // and handed to the topmost window left, popup dismiss on an outside press,
 // maximize snap, fullscreen filling the output centred on black and raised,
 // minimized windows hidden and skipped by focus, the Alt+F9/F10/F11
-// bindings) so a script sees what a page would show. The types below are
+// bindings, a finger as wl_touch for a client that has one and as the
+// pointer for any other) so a script sees what a page would show. The types below are
 // the contract.
 //
 // Runtime: no DOM and no Node built-in import (the engine's default wasm
@@ -335,6 +336,30 @@ export interface Headless {
   click(x: number, y: number, button?: Button): void;
   /** Wheel detents where the pointer is (positive: down / right). */
   scroll(deltaY: number, deltaX?: number): void;
+  /** Finger `id` (any number, unique among the fingers down) down at
+   *  (x, y), output logical px, hit-tested like a press: it raises and
+   *  focuses the window and dismisses the popups it misses. A client with
+   *  a wl_touch (Engine.touchBound) gets it as a touch point — wl_touch
+   *  down on that surface, motion local to that surface wherever the
+   *  finger goes (outside it too), up, each followed by a frame; the
+   *  point's id is the lowest the client has free, as on a page. Any other
+   *  client gets it as the pointer, as a browser emulates it: enter, the
+   *  left button, motion held by the implicit grab, release, leave — one
+   *  finger at a time, and not while a button is held (another reaches no
+   *  such client). Never both. A move/resize the app asks for naming the
+   *  finger's down follows that finger alone (the core cancelled the
+   *  app's points; the pointer is left as it is); while a pointer grab or
+   *  drag is on, nothing goes down. */
+  touchDown(id: number, x: number, y: number): void;
+  touchMove(id: number, x: number, y: number): void;
+  touchUp(id: number): void;
+  /** The browser took the gesture (pointercancel): wl_touch.cancel for
+   *  every client with a point down, a grab a finger drives ends, the
+   *  emulated finger's pointer leaves (no release); every finger is
+   *  forgotten. */
+  touchCancel(): void;
+  /** touchDown and touchUp at (x, y) (finger 0 unless given). */
+  tap(x: number, y: number, id?: number): void;
   /** The topmost surface at an output point: popups above subsurfaces above
    *  their toplevel, windows by z. Cursor, dnd-icon and role-less surfaces
    *  never hit, nor a surface where the point is outside its input region
@@ -451,10 +476,20 @@ interface Win {
   restore: { x: number; y: number } | null;
 }
 type Target = { key: string; conn: number; surface: number };
-/** An app-initiated move/resize, driven by the scripted pointer. */
+/** An app-initiated move/resize, driven by the scripted pointer — or by
+ *  the finger `finger` (touchDown's id): the request named its down. */
 interface Grab {
   win: Win; mode: 'move' | 'resize'; edges: number;
   px: number; py: number; x: number; y: number; w: number; h: number; lastW: number; lastH: number;
+  finger?: number;
+}
+/** A finger down on a client with a wl_touch (touchDown → touchUp): the
+ *  surface it went down on (the window's `root`), the client's point id
+ *  (`slot`), where it is, and `seq`, the order of presses (a move/resize
+ *  follows the latest on its window). `gone`: its surface was destroyed —
+ *  no motion; the up still goes (it names no surface). */
+interface Finger extends Target {
+  id: number; root: number; slot: number; x: number; y: number; seq: number; gone?: boolean;
 }
 
 function toLink(link: HeadlessOptions['link']): Link {
@@ -495,6 +530,10 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   let hover: Target | null = null;  // the surface holding pointer focus, as we told the engine
   let pressed: Target | null = null; // the implicit grab's surface while buttons are held
   const held = new Set<number>();
+  let mousePress: { seq: number; conn: number; root: number } | null = null; // the latest press, while `held`
+  const fingers = new Map<number, Finger>(); // touch points, by finger id
+  let emulated: number | null = null; // the finger the pointer stands in for (its client has no wl_touch)
+  let pressSeq = 0;
   let grab: Grab | null = null;
   let dnd: { conn: number; icon: number } | null = null;
   let cursor: HeadlessCursor | null = null; // the pointer image (CursorEvent)
@@ -713,12 +752,14 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
         popups.delete(key);
         regions.delete(key);
         forget((c, s) => c === ev.conn && s === ev.surface);
+        for (const f of fingers.values()) if (f.key === key) f.gone = true;
         changed();
         break;
       }
       case 'disconnect':
         dropConn(ev.conn);
         forget((c) => c === ev.conn);
+        for (const [id, f] of fingers) if (f.conn === ev.conn) fingers.delete(id); // (no calls for a dead conn)
         if (cursor && cursor.conn === ev.conn) cursor = null;
         if (lock && lock.conn === ev.conn) lock = null;
         changed();
@@ -726,8 +767,9 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       case 'close':
         // every conn got its 'disconnect' first; the next open is a fresh
         // compositor with no session state
-        hover = pressed = grab = dnd = cursor = lock = null;
+        hover = pressed = grab = dnd = cursor = lock = mousePress = emulated = null;
         held.clear();
+        fingers.clear();
         break;
       case 'pointer-lock':
         if (ev.surface) lock = { conn: ev.conn, surface: ev.surface, locked: !!lock && lock.locked && lock.conn === ev.conn && lock.surface === ev.surface };
@@ -873,16 +915,38 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       case 'move':
       case 'resize': {
         // the app asks for a grab after the press that started it: with the
-        // button still held, the scripted pointer drives it to release (like
-        // wm.ts); once released there is nothing to grab
+        // button still held (or the finger down), the scripted pointer (or
+        // that finger) drives it to release, like wm.ts; once released there
+        // is nothing to grab. The press: the latest on that window, else on
+        // that client, else any (wm.ts grabPointer).
         const win = wins.get(keyOf(ev.conn, ev.surface));
-        if (!win || !held.size || grab || dnd) break;
-        engine.pointerLeave(ev.conn); // ends the app's own gesture
-        hover = pressed = null;
+        const presses: { conn: number; root: number; seq: number; finger?: Finger }[] = [];
+        if (held.size && mousePress) presses.push(mousePress);
+        for (const f of fingers.values()) presses.push({ conn: f.conn, root: f.root, seq: f.seq, finger: f });
+        const rank = (p: { conn: number; root: number }) => (p.conn !== ev.conn ? 1 : p.root === ev.surface ? 3 : 2);
+        let press: (typeof presses)[number] | undefined;
+        for (const p of presses) if (!press || rank(p) > rank(press) || (rank(p) === rank(press) && p.seq > press.seq)) press = p;
+        // the window moves under the app's touch points: they end (the core
+        // cancelled them already if the request named one), as on a page
+        cancelFingers(ev.conn);
+        if (!win || !press || grab || dnd) break;
         const root = surfaces.get(win.key);
-        grab = { win, mode: ev.type, edges: ev.type === 'resize' ? ev.edges : 0, px: pointer.x, py: pointer.y,
+        const g: Grab = { win, mode: ev.type, edges: ev.type === 'resize' ? ev.edges : 0, px: pointer.x, py: pointer.y,
           x: win.x, y: win.y, w: win.gw || (root ? root.logicalWidth : 0), h: win.gh || (root ? root.logicalHeight : 0),
           lastW: 0, lastH: 0 };
+        if (press.finger) {
+          // a finger's: it alone drives the grab, its client's points end
+          // (input.ts PointerGrab.touch); the pointer is left as it is
+          g.finger = press.finger.id;
+          g.px = press.finger.x;
+          g.py = press.finger.y;
+          cancelFingers(press.finger.conn);
+        } else {
+          engine.pointerLeave(ev.conn); // ends the app's own gesture
+          hover = pressed = null;
+          cancelFingers(); // held off like the pointer from here
+        }
+        grab = g;
         raiseWin(win);
         break;
       }
@@ -973,7 +1037,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
   // enter/leave when the surface under the pointer changes (pointerover /
   // pointerout on a page), motion while it stays
   function track(motion: boolean, rel?: { dx: number; dy: number }) {
-    if (grab || dnd || pressed || (lock && lock.locked)) return;
+    if (pointerGrab() || dnd || pressed || (lock && lock.locked)) return;
     const hit = surfaceAt(pointer.x, pointer.y);
     const t = hit && { key: keyOf(hit.conn, hit.surface), conn: hit.conn, surface: hit.surface };
     if (t && hover && t.key === hover.key) {
@@ -990,9 +1054,14 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     engine.dragMotion(t ? t.conn : 0, t ? t.surface : 0, now(), t ? t.x : 0, t ? t.y : 0); // 0,0 = over nothing
   }
 
-  function grabMove() {
+  // a grab of the pointer's, not a finger's: it holds off the pointer and
+  // every finger (a finger's holds off that finger alone)
+  const pointerGrab = () => (grab && grab.finger === undefined ? grab : null);
+
+  // the grab's pointer (or finger) is at x, y
+  function grabMove(x: number, y: number) {
     const g = grab!;
-    const dx = pointer.x - g.px, dy = pointer.y - g.py;
+    const dx = x - g.px, dy = y - g.py;
     if (g.mode === 'move') {
       g.win.x = g.x + dx;
       g.win.y = Math.max(0, g.y + dy);
@@ -1070,7 +1139,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     }
     pointer = { x, y };
     if (dnd) dragTarget();
-    else if (grab) grabMove();
+    else if (pointerGrab()) grabMove(x, y);
     else if (pressed) {
       // the implicit grab: motion stays with the pressed surface, in its
       // local px even outside it
@@ -1079,29 +1148,38 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
     } else track(true, rel);
   }
 
-  function pointerDown(b?: Button) {
-    const code = button(b);
-    if (grab || dnd) { held.add(code); return; }
-    track(false); // the scene may have changed under a still pointer
-    const t = pressed || hover;
-    // fake popup grab: a press anywhere but on an open popup dismisses it
-    for (const [key, p] of popups) {
-      const s = surfaces.get(key);
-      if (!s || s.role !== ROLE_POPUP) { popups.delete(key); continue; }
-      if (!t || t.key !== key) {
-        popups.delete(key);
+  // fake popup grab: a press anywhere but on an open popup (`key`)
+  // dismisses it
+  function dismissPopups(key: string | undefined) {
+    for (const [k, p] of popups) {
+      const s = surfaces.get(k);
+      if (!s || s.role !== ROLE_POPUP) { popups.delete(k); continue; }
+      if (k !== key) {
+        popups.delete(k);
         engine.popupDismiss(p.conn, p.surface);
       }
     }
-    held.add(code);
-    if (!t) return;
-    // a press anywhere in a window raises it and focuses its toplevel
-    const s = surfaces.get(t.key);
-    const win = s && toplevel(keyOf(s.conn, s.root));
+  }
+  // a press anywhere in a window raises it and focuses its toplevel
+  function pressWindow(conn: number, root: number) {
+    const win = toplevel(keyOf(conn, root));
     if (win) {
       raiseWin(win);
       focusSurface(win.conn, win.surface);
     }
+  }
+
+  function pointerDown(b?: Button) {
+    const code = button(b);
+    if (pointerGrab() || dnd) { held.add(code); return; }
+    track(false); // the scene may have changed under a still pointer
+    const t = pressed || hover;
+    dismissPopups(t?.key);
+    held.add(code);
+    if (!t) return;
+    const s = surfaces.get(t.key);
+    if (s) pressWindow(s.conn, s.root);
+    mousePress = { seq: ++pressSeq, conn: t.conn, root: s ? s.root : t.surface };
     pressed = t;
     engine.pointerButton(t.conn, now(), code, true);
     // the press is the user gesture a page gets the lock with again
@@ -1120,8 +1198,8 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       track(false);
       return;
     }
-    if (grab) {
-      const g = grab;
+    if (pointerGrab()) {
+      const g = grab!;
       grab = null;
       held.clear();
       if (g.mode === 'resize' && g.lastW) engine.requestResize(g.win.conn, g.win.surface, g.lastW, g.lastH);
@@ -1134,6 +1212,99 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       pressed = null;
       track(false);
     }
+  }
+
+  // --- touch: a finger as its client's touch point when it has a wl_touch,
+  // else as the pointer (input.ts's routing) ---------------------------------
+
+  // wl_touch.cancel for that client's points (every client's: none given),
+  // forgotten here too
+  function cancelFingers(conn?: number) {
+    const conns = new Set<number>();
+    for (const [id, f] of fingers) {
+      if (conn !== undefined && f.conn !== conn) continue;
+      fingers.delete(id);
+      conns.add(f.conn);
+    }
+    for (const c of conns) engine.touchCancel(c);
+  }
+  // the emulated finger lifted (or was cancelled): its pointer leaves what
+  // it was over, as a page's pointerout after the up
+  function liftPointer() {
+    const t = pressed || hover;
+    if (t) engine.pointerLeave(t.conn);
+    hover = pressed = null;
+  }
+
+  function touchDown(id: number, x: number, y: number) {
+    if (fingers.has(id) || emulated === id || grab?.finger === id) throw new Error(`headless: finger ${id} is down already`);
+    if (pointerGrab() || dnd) return; // held off, like the pointer
+    const hit = surfaceAt(x, y);
+    if (!hit || !engine.touchBound(hit.conn)) {
+      // the browser's emulation: the finger is the pointer, one at a time
+      if (emulated !== null || held.size) return;
+      emulated = id;
+      pointerMove(x, y);
+      pointerDown();
+      return;
+    }
+    const key = keyOf(hit.conn, hit.surface);
+    dismissPopups(key);
+    pressWindow(hit.conn, hit.root);
+    // the lowest point id the client has free
+    const taken = new Set<number>();
+    for (const f of fingers.values()) if (f.conn === hit.conn) taken.add(f.slot);
+    let slot = 0;
+    while (taken.has(slot)) slot++;
+    fingers.set(id, { id, key, conn: hit.conn, surface: hit.surface, root: hit.root, slot, x, y, seq: ++pressSeq });
+    engine.touchDown(hit.conn, now(), hit.surface, slot, hit.x, hit.y);
+    engine.touchFrame(hit.conn);
+  }
+
+  function touchMove(id: number, x: number, y: number) {
+    if (grab && grab.finger === id) return grabMove(x, y);
+    if (emulated === id) return pointerMove(x, y);
+    const f = fingers.get(id);
+    if (!f) return;
+    f.x = x;
+    f.y = y;
+    // local to the surface it went down on, wherever it is now
+    const o = f.gone ? null : originOf(f);
+    if (!o) return;
+    engine.touchMotion(f.conn, now(), f.slot, x - o.x, y - o.y);
+    engine.touchFrame(f.conn);
+  }
+
+  function touchUp(id: number) {
+    if (grab && grab.finger === id) {
+      const g = grab;
+      grab = null;
+      if (g.mode === 'resize' && g.lastW) engine.requestResize(g.win.conn, g.win.surface, g.lastW, g.lastH);
+      return;
+    }
+    if (emulated === id) {
+      emulated = null;
+      pointerUp();
+      liftPointer();
+      return;
+    }
+    const f = fingers.get(id);
+    if (!f) return; // (cancelled: a grab took it, touchCancel)
+    fingers.delete(id);
+    engine.touchUp(f.conn, now(), f.slot);
+    engine.touchFrame(f.conn);
+  }
+
+  function touchCancel() {
+    cancelFingers();
+    if (grab && grab.finger !== undefined) grab = null;
+    if (emulated === null) return;
+    // the emulated finger: whatever it drove ends, no release
+    emulated = null;
+    if (dnd) engine.dragCancel();
+    grab = null;
+    held.clear();
+    liftPointer();
   }
 
   // --- screenshots ------------------------------------------------------------
@@ -1362,7 +1533,7 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       pointerUp(b);
     },
     scroll(deltaY, deltaX = 0) {
-      if (grab || dnd) return;
+      if (pointerGrab() || dnd) return;
       track(false);
       const t = pressed || hover;
       if (!t) return;
@@ -1375,6 +1546,14 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       };
       axis(0, deltaY);
       axis(1, deltaX);
+    },
+    touchDown,
+    touchMove,
+    touchUp,
+    touchCancel,
+    tap(x, y, id = 0) {
+      touchDown(id, x, y);
+      touchUp(id);
     },
     surfaceAt,
     cancelDrag() {
@@ -1408,7 +1587,8 @@ export async function createHeadless(options: HeadlessOptions): Promise<Headless
       acked.clear();
       popups.clear();
       regions.clear();
-      active = hover = pressed = grab = dnd = lock = null;
+      fingers.clear();
+      active = hover = pressed = grab = dnd = lock = mousePress = emulated = null;
     },
   };
 }

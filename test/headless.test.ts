@@ -98,6 +98,29 @@ function pressSerial(link: ScriptedLink, conn: number) {
   return serial;
 }
 
+// the events the engine sent to `object` of `conn`, as [opcode, ...the
+// first two arg words]
+function eventsTo(link: ScriptedLink, conn: number, object: number) {
+  const found: number[][] = [];
+  for (const bytes of link.sent) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let off = 0; off < bytes.length;) {
+      if (bytes[off] === 0x0b) { off += 9; continue; } // ACK
+      if (bytes[off] !== 0x01) break;
+      const c = dv.getUint32(off + 1, true), len = dv.getUint32(off + 5, true);
+      for (let m = off + 9; c === conn && m < off + 9 + len;) {
+        const word = dv.getUint32(m + 4, true), size = word >>> 16;
+        if (dv.getUint32(m, true) === object) {
+          found.push([word & 0xffff, ...(size >= 12 ? [dv.getUint32(m + 8, true)] : []), ...(size >= 16 ? [dv.getUint32(m + 12, true)] : [])]);
+        }
+        m += size;
+      }
+      off += 9 + len;
+    }
+  }
+  return found;
+}
+
 // [object, code] of each wl_display.error the engine sent to `conn`
 function displayErrors(link: ScriptedLink, conn: number) {
   const found: number[][] = [];
@@ -122,14 +145,15 @@ function displayErrors(link: ScriptedLink, conn: number) {
 // engine calls with the time argument dropped, e.g. ['pointerMotion', conn, x, y];
 // a motion's relative part goes to `rels` instead, as [dx, dy]
 type Call = [string, ...unknown[]];
-const TIMED: Record<string, number> = { pointerMotion: 1, pointerButton: 1, pointerAxis: 1, key: 1, dragMotion: 2 };
+const TIMED: Record<string, number> = { pointerMotion: 1, pointerButton: 1, pointerAxis: 1, key: 1, dragMotion: 2, touchDown: 1, touchMotion: 1, touchUp: 1 };
 function spy(engine: Engine, rels: number[][]): Call[] {
   const calls: Call[] = [];
   const e = engine as unknown as Record<string, (...a: unknown[]) => unknown>;
   for (const name of ['pointerEnter', 'pointerLeave', 'pointerMotion', 'pointerButton', 'pointerAxis',
     'keyboardEnter', 'keyboardLeave', 'key', 'textInputCommit', 'popupDismiss', 'requestResize',
     'dragMotion', 'dragDrop', 'dragCancel', 'pointerLockGranted', 'pointerLockLost', 'tick',
-    'setFullscreen', 'setMaximized', 'setMinimized', 'setVisible']) {
+    'setFullscreen', 'setMaximized', 'setMinimized', 'setVisible',
+    'touchDown', 'touchMotion', 'touchUp', 'touchFrame', 'touchCancel']) {
     const orig = e[name];
     e[name] = (...args) => {
       const shown = [...args];
@@ -1429,5 +1453,130 @@ test('place_above / place_below: applied at the parent\'s commit (\'position\' e
   ctx.link.sent.length = 0;
   a.send(msg(sa + 1, 2, other));
   assert.deepEqual(displayErrors(ctx.link, 1), [[sa + 1, 0]]);
+  hl.dispose();
+});
+
+// --- touch: a finger as the client's touch point (wl_touch), else the pointer
+// wl_touch events: down 0, up 1, motion 2, frame 3, cancel 4
+const TOUCH = 11;
+const [T_DOWN, T_UP, T_MOTION, T_FRAME, T_CANCEL] = [0, 1, 2, 3, 4];
+
+test('touch: a client with a wl_touch gets fingers as touch points — down hit-tested (focus, raise), motion local to the down\'s surface (outside it too), up, each framed; ids the lowest free; touchCancel; a client without one gets the finger as the pointer (enter, button, implicit grab, release, leave), one finger at a time', async () => {
+  const ctx = await setup();
+  const { hl, calls, events } = ctx;
+  const { a, ta, sub, tb } = desk(ctx, { popup: false }); // A's toplevel origin (24,48) 40×30, its subsurface above; B at (64,84), focused
+  a.send(msg(SEAT, 2, TOUCH)); // get_touch
+  assert.ok(events.some((e) => e.type === 'touch-bound' && e.conn === 1 && e.bound));
+  assert.equal(hl.engine.touchBound(1), true);
+  assert.equal(hl.engine.touchBound(2), false);
+  const sent = () => eventsTo(ctx.link, 1, TOUCH).map((e) => e[0]);
+  calls.length = 0;
+
+  hl.touchDown(0, 30, 60);
+  assert.deepEqual(calls.splice(0), [['keyboardLeave', 2], ['keyboardEnter', 1, ta.surface], ['touchDown', 1, ta.surface, 0, 6, 12], ['touchFrame', 1]]);
+  assert.ok(hl.window(`c1s${ta.surface}`)!.z > hl.window(`c2s${tb.surface}`)!.z, 'raised');
+  assert.throws(() => hl.touchDown(0, 30, 60), /finger 0 is down already/);
+  hl.touchDown(1, 40, 70);
+  hl.touchMove(0, 10, 10); // out of the window: still its coordinates
+  hl.touchUp(0);
+  assert.deepEqual(calls.splice(0), [['touchDown', 1, ta.surface, 1, 16, 22], ['touchFrame', 1],
+    ['touchMotion', 1, 0, -14, -38], ['touchFrame', 1], ['touchUp', 1, 0], ['touchFrame', 1]]);
+  // the freed id 0 again, on the subsurface (its own coordinates)
+  hl.touchDown(7, 30, 40);
+  assert.deepEqual(calls.splice(0), [['touchDown', 1, sub, 0, 6, 2], ['touchFrame', 1]]);
+  assert.deepEqual(sent(), [T_DOWN, T_FRAME, T_DOWN, T_FRAME, T_MOTION, T_FRAME, T_UP, T_FRAME, T_DOWN, T_FRAME]);
+  hl.touchCancel();
+  hl.touchMove(1, 41, 70);
+  hl.touchUp(7);
+  assert.deepEqual(calls.splice(0), [['touchCancel', 1]], 'forgotten: nothing more of them');
+  assert.equal(sent().at(-1), T_CANCEL);
+
+  // no wl_touch (B): the browser's emulation through the pointer
+  hl.tap(5, 5); // (nothing there: the pointer path, no client)
+  calls.length = 0;
+  hl.touchDown(3, 70, 90);
+  hl.touchDown(4, 80, 90); // a second finger: no second pointer
+  hl.touchMove(3, 80, 95);
+  hl.touchUp(4);
+  hl.touchUp(3);
+  assert.deepEqual(calls.splice(0), [['pointerEnter', 2, tb.surface, 6, 6], ['keyboardLeave', 1], ['keyboardEnter', 2, tb.surface],
+    ['pointerButton', 2, 0x110, true], ['pointerMotion', 2, 16, 11], ['pointerButton', 2, 0x110, false], ['pointerLeave', 2]]);
+  // an emulated finger's cancel: the pointer leaves, no release
+  hl.touchDown(3, 70, 90);
+  calls.length = 0;
+  hl.touchCancel();
+  hl.touchUp(3);
+  assert.deepEqual(calls.splice(0), [['pointerLeave', 2]]);
+  hl.pointerDown(); // (the button is not held any more: a fresh press)
+  assert.deepEqual(calls.splice(0), [['pointerEnter', 2, tb.surface, 6, 6], ['pointerButton', 2, 0x110, true]]);
+  hl.pointerUp();
+  hl.dispose();
+});
+
+test('touch: a move asked with a finger\'s down serial follows that finger (the app\'s points cancelled, the pointer left alone); a pointer grab cancels every finger; a minimized or hidden window\'s points are cancelled by the core; a destroyed surface\'s finger moves no more', async () => {
+  const ctx = await setup();
+  const { hl, calls, link } = ctx;
+  const { a, ta, sub, tb } = desk(ctx, { popup: false });
+  const key = `c1s${ta.surface}`;
+  a.send(msg(SEAT, 2, TOUCH));
+  const sent = () => eventsTo(link, 1, TOUCH);
+  const downSerial = () => sent().filter((e) => e[0] === T_DOWN).at(-1)![1];
+
+  hl.touchDown(0, 30, 60);
+  calls.length = 0;
+  a.send(msg(ta.toplevel, 5, SEAT, downSerial())); // move, naming the down
+  assert.equal(sent().at(-1)![0], T_CANCEL, 'the core cancelled the app\'s points');
+  assert.deepEqual(calls.splice(0), [['touchCancel', 1]], 'no pointer leave: the finger alone is the grab\'s');
+  hl.touchMove(0, 50, 70);
+  assert.deepEqual([hl.window(key)!.x, hl.window(key)!.y], [44, 48], 'the finger drags it');
+  hl.pointerMove(70, 90); // the mouse beside goes on reaching apps
+  assert.deepEqual(calls.splice(0), [['pointerEnter', 2, tb.surface, 6, 6]]);
+  hl.touchUp(0);
+  hl.touchMove(0, 90, 90);
+  assert.deepEqual([hl.window(key)!.x, calls.length], [44, 0], 'ended at its up, nothing to the app');
+  hl.move(key, 24, 38);
+
+  // a mouse press later than the finger, on the same window: the move is
+  // the pointer's, and a pointer grab holds every finger off
+  hl.touchDown(1, 30, 60);
+  hl.pointerMove(40, 70);
+  hl.pointerDown();
+  calls.length = 0;
+  a.send(msg(ta.toplevel, 5, SEAT, pressSerial(link, 1)));
+  assert.deepEqual(calls.splice(0), [['touchCancel', 1], ['pointerLeave', 1]]);
+  hl.touchDown(2, 30, 60); // held off while it lasts
+  hl.touchMove(1, 35, 60);
+  assert.deepEqual(calls.splice(0), []);
+  hl.pointerUp();
+  hl.move(key, 24, 38);
+
+  // minimized with a finger on it: the core cancels; the finger's calls
+  // are ignored there
+  hl.touchDown(3, 30, 60);
+  const n = sent().length;
+  a.send(msg(ta.toplevel, 13)); // set_minimized
+  assert.deepEqual(sent().slice(n).map((e) => e[0]), [T_CANCEL]);
+  hl.touchMove(3, 31, 60);
+  hl.touchUp(3);
+  assert.deepEqual(sent().slice(n).map((e) => e[0]), [T_CANCEL]);
+  hl.restore(key);
+  // hidden (setVisible false): cancelled too
+  hl.touchDown(4, 30, 60);
+  const m = sent().length;
+  hl.setVisible(key, false);
+  assert.deepEqual(sent().slice(m).map((e) => e[0]), [T_CANCEL]);
+  hl.touchUp(4);
+  hl.setVisible(key, true);
+
+  // the subsurface a finger is on goes: no motion for it; the up still
+  // goes out (the core drops it: the app hears nothing)
+  hl.touchDown(5, 30, 40);
+  a.send(msg(sub, 0)); // wl_surface.destroy
+  calls.length = 0;
+  const k = sent().length;
+  hl.touchMove(5, 31, 41);
+  hl.touchUp(5);
+  assert.deepEqual(calls.splice(0), [['touchUp', 1, 0], ['touchFrame', 1]]);
+  assert.equal(sent().length, k);
   hl.dispose();
 });

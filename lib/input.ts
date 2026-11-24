@@ -1,9 +1,10 @@
 // wland input: DOM events → engine calls. Pointer events on any surface
 // canvas (found through view.surfaceOf, so it works wherever windows are
-// mounted), keyboard through a hidden IME sink, browser composition → text
-// input. Motion is forwarded raw; the engine coalesces it next to the link
-// (that is where the backpressure signal lives). The types below are the
-// contract.
+// mounted) — a finger as the client's touch point when it has a wl_touch,
+// else as the pointer —, keyboard through a hidden IME sink, browser
+// composition → text input. Motion is forwarded raw; the engine coalesces
+// it next to the link (that is where the backpressure signal lives). The
+// types below are the contract.
 
 import { ROLE_POPUP, ROLE_TOPLEVEL, type Engine, type Event as WlandEvent } from './engine.ts';
 import type { View } from './view.ts';
@@ -129,6 +130,11 @@ export interface PointerGrab {
   /** False once it ended (or when it never started: its pointer was not
    *  down). */
   readonly active: boolean;
+  /** Its pointer is a finger its app gets as touch (wl_touch): the grab
+   *  takes that finger alone — the app's touch points are cancelled, the
+   *  pointer is left as it is (no leave at the start, no enter at the end,
+   *  a mouse beside goes on reaching the apps). */
+  readonly touch: boolean;
   /** Let go; idempotent. */
   end(): void;
 }
@@ -153,8 +159,10 @@ export interface Input {
   /** Take the pointer from the apps for a window manager's drag (a move or
    *  resize, the embedder's or wland's own) started by a press of pointer
    *  `pointerId`. While any grab is on, pointer events are not forwarded:
-   *  the implicit grab (pointer capture on the pressed surface) is let go
-   *  and the surface holding the pointer gets a leave. It ends at that
+   *  the implicit grab (pointer capture on the pressed surface) is let go,
+   *  the surface holding the pointer gets a leave and every touch point is
+   *  cancelled — unless the press is a finger its app gets as touch: that
+   *  grab takes the finger alone (PointerGrab.touch). It ends at that
    *  pointer's release (its pointerup, which is not forwarded either, or a
    *  move showing no button down), its pointercancel, a lostpointercapture
    *  for it (so a pointer capture you take for the drag ending any other
@@ -164,8 +172,9 @@ export interface Input {
    *  at once (`active` false, onEnd not called): a grab cannot outlive its
    *  press. */
   grab(pointerId: number, options?: GrabOptions): PointerGrab;
-  /** While on, pointer events are not forwarded. A grab (see grab()) of the
-   *  pointer pressed last while it is still down, else of no pointer;
+  /** While on, pointer events and touch are not forwarded. A grab (see
+   *  grab(); never a finger-only one) of the pointer pressed last while it
+   *  is still down, else of no pointer;
    *  suppress(false) ends it. It ends by itself like any grab: at that
    *  pointer's release, cancel, lost capture or the window's blur (a
    *  pointerless one at the blur only). Prefer grab(). */
@@ -535,11 +544,13 @@ export function createInput(options: InputOptions): Input {
   });
   // the window lost focus (another window, Alt/Cmd+Tab): DOM focus stays on
   // the sink and the app keeps its keyboard focus, but the releases of what
-  // is held now go to another window — pointer buttons too: every grab ends
+  // is held now go to another window — pointer buttons too: every grab ends,
+  // every touch point is cancelled
   const onWindowBlur = () => {
     releaseHeld();
     forgetBrowserKeys();
     down.clear();
+    cancelTouches();
     for (const g of [...grabs]) endGrab(g, 'blur');
   };
   window.addEventListener('blur', onWindowBlur);
@@ -585,7 +596,8 @@ export function createInput(options: InputOptions): Input {
   });
 
   // --- pointer: delegated, so windows can be mounted anywhere --------------
-  const target = (ev: UIEvent) => (grabs.size ? null : view.surfaceOf(ev.target));
+  // (a finger-only grab holds off its finger alone: touch points below)
+  const target = (ev: UIEvent) => (pointerGrabbed() ? null : view.surfaceOf(ev.target));
 
   // The implicit grab: while a button is held the pressed surface keeps the
   // pointer (a Wayland seat's rule; the browser would hand it to whatever is
@@ -623,9 +635,11 @@ export function createInput(options: InputOptions): Input {
   // that ended one is not forwarded (`swallow`; the app never saw the press
   // as its own: the grab sent it a leave).
   // `ignore`: the implicit grab's element at the start, whose capture may
-  // still be on its way out (a capture taken for the drag moved it there)
+  // still be on its way out (a capture taken for the drag moved it there).
+  // `touch`: a finger-only grab (PointerGrab.touch) — the pointer path goes
+  // on beside it, and is neither left nor entered for it.
   interface GrabState {
-    pointerId: number; active: boolean; x: number; y: number; ignore?: Element;
+    pointerId: number; active: boolean; touch: boolean; x: number; y: number; ignore?: Element;
     onEnd?: GrabOptions['onEnd'];
   }
   const down = new Map<number, { x: number; y: number }>();
@@ -635,22 +649,39 @@ export function createInput(options: InputOptions): Input {
   let lastAt = { x: 0, y: 0 }; // where any pointer was last seen
   let hovered = 0; // the conn the pointer was last entered into (0: none)
 
-  function startGrab(pointerId: number, options: GrabOptions = {}): PointerGrab {
+  // (fingerOnly false: suppress's, which holds off everything whatever it
+  // follows)
+  function startGrab(pointerId: number, options: GrabOptions = {}, fingerOnly = true): PointerGrab {
     const at = pointerId < 0 ? lastAt : down.get(pointerId);
-    const g: GrabState = { pointerId, active: !!at, x: at ? at.x : 0, y: at ? at.y : 0, onEnd: options.onEnd };
+    const touch = fingerOnly && touchPath.has(pointerId);
+    const g: GrabState = { pointerId, active: !!at, touch, x: at ? at.x : 0, y: at ? at.y : 0, onEnd: options.onEnd };
     const handle: PointerGrab = {
       pointerId,
+      touch,
       get active() { return g.active; },
       end: () => endGrab(g, 'end'),
     };
     if (!g.active) return handle; // released already: nothing to hold
+    if (touch) {
+      // a touch point's finger: its app's points end (the core cancelled
+      // them already when the app's move/resize named it) and nothing more
+      // of the finger is forwarded; its element's capture may move for the
+      // drag (Alt+drag's box, an embedder's frame)
+      g.ignore = touchPath.get(pointerId);
+      const p = points.get(pointerId);
+      if (p) cancelTouches(p.conn);
+      grabs.add(g);
+      return handle;
+    }
     // whatever had the pointer lets go: the implicit grab, and the app
-    // under the pointer gets its leave (ends its own gesture)
+    // under the pointer gets its leave (ends its own gesture); touch points
+    // are cancelled, held off like the pointer from here
     const left = new Set([captured?.conn, hovered]);
     g.ignore = captured?.el;
     release();
     for (const conn of left) if (conn) engine.pointerLeave(conn);
     hovered = 0;
+    cancelTouches();
     grabs.add(g);
     return handle;
   }
@@ -663,18 +694,24 @@ export function createInput(options: InputOptions): Input {
       g.onEnd?.(reason, ev);
     } finally {
       // the pointer goes back to whatever surface is under it (not under a
-      // lock: no boundary events there, it stays on its surface)
-      if (!grabs.size && !locked) {
+      // lock: no boundary events there, it stays on its surface); a
+      // finger-only grab never took it
+      if (!g.touch && !pointerGrabbed() && !locked) {
         const t = view.surfaceAt(g.x, g.y);
         if (t) { engine.pointerEnter(t.conn, t.surface, t.x, t.y); hovered = t.conn; }
       }
     }
   }
   const grabsOf = (id: number) => [...grabs].filter((g) => g.pointerId === id);
+  const pointerGrabbed = () => {
+    for (const g of grabs) if (!g.touch) return true;
+    return false;
+  };
   on('pointerdown', (ev) => {
     down.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
     lastPressed = ev.pointerId;
     lastAt = { x: ev.clientX, y: ev.clientY };
+    routeTouch(ev);
   }, true);
   on('pointermove', (ev) => {
     lastAt = { x: ev.clientX, y: ev.clientY };
@@ -712,13 +749,112 @@ export function createInput(options: InputOptions): Input {
       suppressing?.end();
       suppressing = null;
     } else if (!suppressing?.active) {
-      suppressing = startGrab(down.has(lastPressed) ? lastPressed : -1);
+      suppressing = startGrab(down.has(lastPressed) ? lastPressed : -1, {}, false);
     }
   }
   const local = (ev: MouseEvent) => {
     const r = (ev.target as Element).getBoundingClientRect();
     return [ev.clientX - r.left, ev.clientY - r.top];
   };
+
+  // --- touch (wl_touch): a finger on a client that has a wl_touch ---------
+  // Decided per finger at its pointerdown (capture phase, so a grab the
+  // window manager starts from the press — Alt+drag — knows it): a touch
+  // pointer pressed on a surface whose client has a wl_touch is that
+  // client's touch point until its release; pen, mouse and a finger on any
+  // other client stay pointers (the emulation every app that works by
+  // finger relied on). Never both ways: nothing of a touch-path pointer
+  // reaches the pointer path, its boundary events included — `touchPath`
+  // lasts until its pointerout (after the up), and a finger's pointerover,
+  // which comes before its press decides, waits for it (`overHeld`: the
+  // pointer path's press enters then).
+  // `points`: the ones forwarded, pointerId → point; a point is bound to
+  // the surface it went down on (coordinates local to it all along, also
+  // outside it: the press's element captures the finger). Gone at the up,
+  // or with all its client's points at a touchCancel: the browser took the
+  // gesture (pointercancel), the window's blur, the capture taken away, a
+  // grab (a window move took the finger; a pointer grab holds off all).
+  // `gone`: its surface was destroyed — no motion, the up still goes (it
+  // names no surface) and the id stays taken until then.
+  interface TouchPoint { conn: number; surface: number; id: number; el: Element; gone?: boolean }
+  const touchPath = new Map<number, Element>(); // pointerId → the element it went down on
+  const points = new Map<number, TouchPoint>();
+  const overHeld = new Set<number>();
+  let enterOwed = -1; // a pointer-path finger whose pointerover was held: its press enters
+  function routeTouch(ev: PointerEvent) {
+    const id = ev.pointerId;
+    enterOwed = overHeld.delete(id) ? id : -1;
+    touchPath.delete(id);
+    if (ev.pointerType !== 'touch') return;
+    for (const t of touchPath.keys()) if (!down.has(t)) touchPath.delete(t); // their pointerout went missing
+    const s = view.surfaceOf(ev.target);
+    if (s && engine.touchBound(s.conn)) {
+      touchPath.set(id, ev.target as Element);
+      enterOwed = -1;
+    }
+  }
+  // the lowest id none of the client's points has (browser pointerIds grow
+  // without bound)
+  function touchSlot(conn: number) {
+    const taken = new Set<number>();
+    for (const p of points.values()) if (p.conn === conn) taken.add(p.id);
+    let id = 0;
+    while (taken.has(id)) id++;
+    return id;
+  }
+  // from the surface's hit target as it is now (an input region coming or
+  // going swaps it; the press's element may be gone)
+  const touchLocal = (p: TouchPoint, ev: MouseEvent) => {
+    const r = (view.hitTarget(p.conn, p.surface) ?? p.el).getBoundingClientRect();
+    return [ev.clientX - r.left, ev.clientY - r.top];
+  };
+  // touchCancel for that client's points (every client's: none given),
+  // forgotten here too; their fingers stay the touch path's till they lift
+  function cancelTouches(conn?: number) {
+    const conns = new Set<number>();
+    for (const [id, p] of points) {
+      if (conn !== undefined && p.conn !== conn) continue;
+      points.delete(id);
+      conns.add(p.conn);
+    }
+    for (const c of conns) engine.touchCancel(c);
+  }
+  function touchDown(ev: PointerEvent, s: { conn: number; surface: number }) {
+    const el = ev.target as Element;
+    try { el.setPointerCapture(ev.pointerId); } catch { /* not an active pointer */ }
+    const p: TouchPoint = { conn: s.conn, surface: s.surface, id: touchSlot(s.conn), el };
+    points.set(ev.pointerId, p);
+    const [x, y] = touchLocal(p, ev);
+    engine.touchDown(p.conn, now(), p.surface, p.id, x, y);
+    engine.touchFrame(p.conn);
+  }
+  on('pointermove', (ev) => {
+    const p = points.get(ev.pointerId);
+    if (!p || p.gone) return;
+    const [x, y] = touchLocal(p, ev);
+    engine.touchMotion(p.conn, now(), p.id, x, y);
+    engine.touchFrame(p.conn);
+  });
+  on('pointerup', (ev) => {
+    const p = points.get(ev.pointerId);
+    if (!p) return;
+    points.delete(ev.pointerId);
+    engine.touchUp(p.conn, now(), p.id);
+    engine.touchFrame(p.conn);
+    ev.preventDefault();
+  });
+  on('pointercancel', (ev) => {
+    const p = points.get(ev.pointerId);
+    if (p) cancelTouches(p.conn);
+  });
+  // the press's element lost the capture while the finger is down: taken
+  // (an embedder's setPointerCapture) — the finger is someone else's now.
+  // An element removed from the document has its loss at the document:
+  // the point goes on (its surface may live; 'destroy' says if not).
+  on('lostpointercapture', (ev) => {
+    const p = points.get(ev.pointerId);
+    if (p && ev.target === p.el) cancelTouches(p.conn);
+  });
 
   // --- pointer lock (zwp_pointer_constraints_v1.lock_pointer) -------------
   // The core decides when a lock applies and names its surface in a
@@ -781,8 +917,11 @@ export function createInput(options: InputOptions): Input {
     if (s) document.exitPointerLock();
   });
 
-  // (no boundary events while the pointer is locked: it stays on its surface)
+  // (no boundary events while the pointer is locked: it stays on its
+  // surface; none for a touch point's finger)
   on('pointerover', (ev) => {
+    if (touchPath.has(ev.pointerId)) return;
+    if (ev.pointerType === 'touch' && !down.has(ev.pointerId)) { overHeld.add(ev.pointerId); return; } // (routeTouch)
     const s = locked ? null : target(ev);
     if (!s) return;
     const [x, y] = local(ev);
@@ -790,6 +929,11 @@ export function createInput(options: InputOptions): Input {
     hovered = s.conn;
   });
   on('pointerout', (ev) => {
+    if (touchPath.has(ev.pointerId)) {
+      if (!down.has(ev.pointerId)) touchPath.delete(ev.pointerId); // lifted: its last event
+      return;
+    }
+    if (overHeld.delete(ev.pointerId)) return; // never entered
     const s = locked ? null : target(ev);
     if (!s) return;
     engine.pointerLeave(s.conn);
@@ -799,7 +943,7 @@ export function createInput(options: InputOptions): Input {
   // movementX/Y, which goes on under Pointer Lock while clientX/Y freeze
   // (so does the position: the lock froze it)
   on('pointermove', (ev) => {
-    const s = target(ev);
+    const s = touchPath.has(ev.pointerId) ? null : target(ev);
     if (!s) return;
     const [x, y] = local(ev);
     engine.pointerMotion(s.conn, now(), x, y, { dx: ev.movementX || 0, dy: ev.movementY || 0, time: ev.timeStamp * 1000 });
@@ -808,15 +952,29 @@ export function createInput(options: InputOptions): Input {
     readLocks(ev); // what a focus this press makes tells the app
     if (clipboard && !container.contains(ev.target as Node) && !view.surfaceOf(ev.target)) clipboard.outside();
     // (an Alt+drag taken by the window manager or the embedder is a grab
-    // by now, or stopped before it got here)
-    const s = target(ev);
+    // by now, or stopped before it got here; a finger-only grab holds off
+    // just its finger, so target() doesn't know of it)
+    const s = grabsOf(ev.pointerId).length ? null : target(ev);
     if (!s) return;
+    const touch = touchPath.has(ev.pointerId);
+    // a finger whose pointerover was held for this decision: entered now,
+    // as the over would have (before the keyboard's enter)
+    if (!touch && enterOwed === ev.pointerId && !locked) {
+      const [x, y] = local(ev);
+      engine.pointerEnter(s.conn, s.surface, x, y);
+      hovered = s.conn;
+    }
+    enterOwed = -1;
     // a click anywhere in a window focuses its toplevel (autoFocus: else the
     // embedder's call); preventDefault keeps decoration clicks from moving
     // DOM focus off the sink
     const root = view.surfaceOf(view.canvas(s.conn, s.root));
     if (autoFocus && root && root.role === ROLE_TOPLEVEL) focus(s.conn, s.root);
     clipboard?.gesture();
+    if (touch) {
+      ev.preventDefault();
+      return touchDown(ev, s);
+    }
     const btn = BTN[ev.button];
     if (btn !== undefined) engine.pointerButton(s.conn, now(), btn, true);
     ev.preventDefault();
@@ -838,7 +996,8 @@ export function createInput(options: InputOptions): Input {
     if (captured && ev.pointerId === captured.id) captured = null;
   });
   on('pointerup', (ev) => {
-    const s = swallow.has(ev) ? null : target(ev); // (a grab's release is the grab's)
+    // (a grab's release is the grab's; a touch point's, the touch path's)
+    const s = swallow.has(ev) || touchPath.has(ev.pointerId) ? null : target(ev);
     if (!s) return;
     const btn = BTN[ev.button];
     if (btn !== undefined) engine.pointerButton(s.conn, now(), btn, false);
@@ -882,7 +1041,14 @@ export function createInput(options: InputOptions): Input {
         // a popup grab replaces the implicit grab (see `captured`)
         if (ev.role === ROLE_POPUP && captured && captured.conn === ev.conn && captured.surface !== ev.surface) release();
         break;
-      case 'destroy': forget((a) => a.conn === ev.conn && a.surface === ev.surface); break;
+      case 'destroy':
+        for (const p of points.values()) if (p.conn === ev.conn && p.surface === ev.surface) p.gone = true;
+        forget((a) => a.conn === ev.conn && a.surface === ev.surface);
+        break;
+      // the window moves or resizes under the app's touch points: they end
+      // (the core cancelled them already if the request named one of them;
+      // nothing more of them is forwarded either way)
+      case 'move': case 'resize': cancelTouches(ev.conn); break;
       // minimized: the core already sent its keyboard leave (the one here
       // is then a no-op) and its pointer leave; focus passes on, and a
       // press held on it lets go
@@ -899,6 +1065,7 @@ export function createInput(options: InputOptions): Input {
       case 'disconnect':
         textInput.delete(ev.conn);
         if (hovered === ev.conn) hovered = 0;
+        for (const [id, p] of points) if (p.conn === ev.conn) points.delete(id); // (no calls for a dead conn)
         forget((a) => a.conn === ev.conn);
         if (lockWant && lockWant.conn === ev.conn) { lockWant = null; releaseLock(); }
         break;
@@ -941,6 +1108,9 @@ export function createInput(options: InputOptions): Input {
       for (const g of grabs) g.active = false;
       grabs.clear();
       down.clear();
+      points.clear();
+      touchPath.clear();
+      overHeld.clear();
       release();
       lockWant = null;
       if (locked) releaseLock();

@@ -210,15 +210,12 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   const browserFs = { wanted: false, requested: false, ours: false };
   const swallowed = new Set<string>(); // key codes whose keyup is ours too
   // pointers with a button down (pointerdown → pointerup/cancel; a window
-  // blur forgets them), each with its press: a grab or drag the app asks
-  // for after the release never starts (see beginGrab), and `interactive`
-  // is handed the press
-  const held = new Map<number, PointerPress>();
-  // the pointer pressed last, while it is held: the press a grab or drag the
-  // app asks for came from, so the one that pointer's events drive and end
-  // (another pointer — a hovering pen, a mouse beside a touch — does nothing
-  // to it)
-  let lastPressed = -1;
+  // blur forgets them), in press order, each with its press, the client
+  // and window it pressed (0: none) and where it was last seen down: a grab
+  // or drag the app asks for after the release never starts (see
+  // beginGrab), `interactive` is handed the press, and a grab starts from
+  // its pointer's place
+  const held = new Map<number, { press: PointerPress; conn: number; root: number; x: number; y: number }>();
   // document listeners (and the window's blur), kept for dispose()
   const listening: Listener[] = [];
   const on = <K extends keyof DocumentEventMap>(type: K, fn: (ev: DocumentEventMap[K]) => void,
@@ -317,26 +314,31 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   // the release would follow a pointer with no button down. It ends at
   // the release — a pointerup, a pointercancel, a move that shows no
   // button down (a release the page didn't see), or the window's blur:
-  // input's grab sees each first and ends it (endGrab).
+  // input's grab sees each first and ends it (endGrab). A finger the app
+  // has as a touch point (its request named the touch-down) is a press
+  // like any: the core cancelled the app's points, input's grab takes the
+  // finger alone.
   function beginGrab(ev: MoveEvent | ResizeEvent) {
     const { conn, surface } = ev, mode = ev.type, edges = ev.type === 'resize' ? ev.edges : 0;
     const win = view.window(conn, surface);
     if (!win || grab || dnd) return;
-    const pointer = grabPointer(), press = held.get(pointer);
-    if (!press) {
+    const pointer = grabPointer(conn, surface), h = held.get(pointer);
+    if (!h) {
       log(`${mode} for c${conn}s${surface} after the release — ignored`);
       return;
     }
-    if (options.interactive?.(ev, press)) return; // the embedder's drag
+    if (options.interactive?.(ev, h.press)) return; // the embedder's drag
     const el = win.element;
     const g: Grab = { el, conn, surface, mode, edges, pointer,
-      startX: lastPointer.x, startY: lastPointer.y,
+      startX: h.x, startY: h.y,
       startL: el.offsetLeft, startT: el.offsetTop,
       startW: el.offsetWidth, startH: el.offsetHeight,
       lastW: el.offsetWidth, lastH: el.offsetHeight, queued: false,
       hold: input.grab(pointer, { onEnd: () => { if (grab === g) endGrab(g); } }) };
     if (!g.hold.active) return; // (input saw the release go by)
-    engine.pointerLeave(conn); // ends the app's own gesture (the grab left whoever had the pointer)
+    // ends the app's own gesture (the grab left whoever had the pointer); a
+    // touch point's finger: the cancel did (the pointer is not the grab's)
+    if (!g.hold.touch) engine.pointerLeave(conn);
     grab = g;
     view.raise(conn, surface);
     document.body.style.cursor = mode === 'move' ? 'grabbing' : (EDGE_CURSORS[edges] || 'default');
@@ -385,7 +387,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   // its frame sees it, and input forwards it unless the embedder grabbed)
   let alt: PointerGrab | null = null;
   function altDrag(ev: PointerEvent, win: ViewWindow) {
-    if (options.interactive?.({ type: 'alt-drag', conn: win.conn, surface: win.surface }, held.get(ev.pointerId) ?? pressOf(ev))) {
+    if (options.interactive?.({ type: 'alt-drag', conn: win.conn, surface: win.surface }, held.get(ev.pointerId)?.press ?? pressOf(ev))) {
       ev.preventDefault();
       return;
     }
@@ -508,9 +510,18 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
     return null;
   }
 
-  // the pointer a grab or drag starting now follows: the last one pressed
-  // (still held: beginGrab and drag-start check held)
-  const grabPointer = () => (held.has(lastPressed) ? lastPressed : held.keys().next().value ?? -1);
+  // the pointer a grab or drag the app asks for now follows (-1: none held;
+  // beginGrab and drag-start check held): the latest press on that window,
+  // else on that client, else the latest one — a second finger or the mouse
+  // pressed elsewhere since does not take the window's drag
+  function grabPointer(conn: number, surface?: number): number {
+    let best = -1, rank = 0;
+    for (const [id, h] of held) {
+      const r = h.conn !== conn ? 1 : h.root === surface ? 3 : 2;
+      if (r >= rank) { best = id; rank = r; }
+    }
+    return best;
+  }
   const ours = (ev: PointerEvent) => {
     const p = grab ? grab.pointer : dnd ? dnd.pointer : null;
     return p !== null && ev.pointerId === p;
@@ -558,12 +569,14 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   }
 
   // While a grab or drag is on, only its own pointer moves it; the others'
-  // events are left alone (and don't move lastPointer, the grab's
-  // position). Its own pointer's release, cancel, or a move that shows no
+  // events are left alone (and don't move lastPointer, the drag icon's
+  // place). Its own pointer's release, cancel, or a move that shows no
   // button down ended it already: input's grab listeners run first (input
   // is created before this module), and its release is not forwarded.
   on('pointermove', (ev) => {
+    const h = held.get(ev.pointerId);
     if (ev.buttons === 0) held.delete(ev.pointerId); // its release went unseen
+    else if (h) { h.x = ev.clientX; h.y = ev.clientY; }
     if ((grab || dnd) && !ours(ev)) return;
     lastPointer = { x: ev.clientX, y: ev.clientY };
     if (dnd) dndMove(ev);
@@ -578,15 +591,15 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
   }, true);
 
   on('pointerdown', (ev) => {
-    // a grab starts from here: a touch has no hover moves before its press,
-    // so without this lastPointer is where the previous touch ended
+    // a drag's icon starts from here: a touch has no hover moves before its
+    // press, so without this lastPointer is where the previous touch ended
     if (!grab && !dnd) lastPointer = { x: ev.clientX, y: ev.clientY };
-    held.set(ev.pointerId, pressOf(ev));
-    lastPressed = ev.pointerId;
+    const pressed = view.surfaceOf(ev.target);
+    held.delete(ev.pointerId); // (to the end: the latest press)
+    held.set(ev.pointerId, { press: pressOf(ev), conn: pressed?.conn ?? 0, root: pressed?.root ?? 0, x: ev.clientX, y: ev.clientY });
     // fake popup grab: a press anywhere but on an open popup dismisses it
     // (its canvas or, with an input region, its hit element: a press in a
     // popover's shadow misses it)
-    const pressed = view.surfaceOf(ev.target);
     for (const [key, p] of popups) {
       const canvas = view.canvas(p.conn, p.surface);
       if (!canvas || !canvas.isConnected) { popups.delete(key); continue; }
@@ -713,7 +726,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
         if (!held.size && !dnd && !grab) { engine.dragCancel(); break; }
         if (dnd || grab) break;
         {
-          const d: Dnd = { conn: ev.conn, icon: ev.icon, queued: false, last: null, pointer: grabPointer() };
+          const d: Dnd = { conn: ev.conn, icon: ev.icon, queued: false, last: null, pointer: grabPointer(ev.conn) };
           d.hold = input.grab(d.pointer, { onEnd: (reason, pev) => dndEnd(d, reason, pev) });
           if (!d.hold.active) { engine.dragCancel(); break; } // (input saw the release go by)
           engine.pointerLeave(ev.conn); // the drag grab steals the pointer
