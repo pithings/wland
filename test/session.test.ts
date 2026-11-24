@@ -301,7 +301,7 @@ test('input and window calls are CALL frames with the contract\'s bytes', async 
     call(32, u32(7, 10, 5), i32(300, 200), u32(4)),
     call(32, u32(7, 10, 0), i32(0, 0), u32(5)),
     call(24, u32(7, 10, 105), i32(fx(1), fx(2))),
-    call(25),
+    call(25, u32(0)),
     call(26),
     call(3, i32(3, 300)),
     call(4, i32(800, 600)),
@@ -376,6 +376,37 @@ test('clipboard: set_selection packs entries, read_selection is answered by EVEN
   link.cb!.onMessage(msg(event(11, u32(id, 0), bytes('pasted'))));
   assert.deepEqual(await read, enc.encode('pasted'));
   assert.ok(events.some((e) => e.type === 'selection' && e.conn === 7));
+});
+
+test('the embedder\'s own drag: drag_begin is CALL 39 (mimes NUL-separated, actions), drag_data CALL 40 (set_selection\'s packing), motion/drop the drag CALLs; EVENT 20 is drag-action, dragAction() follows it until the link goes', async () => {
+  const { link, events, engine, take } = await setup();
+  link.cb!.onMessage(msg(feature(4, u64(SID)), connOpen(7), event(13)));
+  take();
+  const fx = (v: number) => Math.round(v * 256);
+  assert.equal(engine.dragBegin([]), false, 'no types: nothing sent');
+  assert.equal(engine.dragBegin(['text/plain'], 4), false, 'no action it can take');
+  assert.equal(engine.dragBegin(['text/plain', 'text/uri-list'], 3), true);
+  engine.dragMotion(7, 10, 105, 1, 2);
+  assert.equal(engine.dragData({ 'text/plain': 'hi', 'text/uri-list': 'https://x/\r\n' }), true);
+  engine.dragDrop();
+  assert.deepEqual(take(), [
+    call(39, bytes('text/plain\0text/uri-list'), u32(3)),
+    call(24, u32(7, 10, 105), i32(fx(1), fx(2))),
+    call(40, bytes(cat(u32(10), enc.encode('text/plain'), u32(2), enc.encode('hi'), u32(13), enc.encode('text/uri-list'), u32(12), enc.encode('https://x/\r\n')))),
+    call(25, u32(0)),
+  ].map(hex));
+  assert.equal(engine.dragData(null), true);
+  assert.deepEqual(take(), [call(40, bytes(new Uint8Array(0)))].map(hex));
+  // a drop whose bytes come after it (files): drag_drop's `later` word
+  engine.dragDrop(true);
+  assert.deepEqual(take(), [call(25, u32(1))].map(hex));
+
+  events.length = 0;
+  link.cb!.onMessage(msg(event(20, u32(2))));
+  assert.deepEqual(events, [{ type: 'drag-action', action: 2 }]);
+  assert.equal(engine.dragAction(), 2);
+  link.cb!.onClose({ takenOver: false });
+  assert.equal(engine.dragAction(), 0);
 });
 
 test('link close in session: disconnects stay local (session() null), nothing sent; the next link is passthrough unless it says session', async () => {

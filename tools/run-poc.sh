@@ -25,6 +25,8 @@
 #   cursor       weston-flower: a cursor surface as the pointer image (fixture: cursor)
 #   constraints  weston-constraints: confine, Pointer Lock, relative motion
 #                (fixture: constraints)
+#   pagednd      an HTML drag from outside the page (a link; files only) over
+#                the desktop is the app's drag (fixture only: files)
 #   touch        weston-simple-touch: browser fingers as wl_touch, a move by
 #                finger; weston-flower gets them as the pointer (fixtures:
 #                touch, cursor)
@@ -39,7 +41,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_GROUPS=(foot gtk cursor constraints touch states embedder retina takeover handle-demo relay)
+ALL_GROUPS=(foot gtk pagednd cursor constraints touch states embedder retina takeover handle-demo relay)
 DEMO=0
 ONLY=()
 for arg in "$@"; do
@@ -281,6 +283,11 @@ fi
 if want constraints; then
 echo "== pointer constraints: weston-constraints confined + locked through Pointer Lock =="
 $E2E constraints $CDP          # spawns the app itself (it reads its WAYLAND_DEBUG)
+fi
+
+if want pagednd && [[ $REAL == 0 ]]; then
+echo "== page dnd: an HTML drag from outside the page dropped into an app (fixture files) =="
+$E2E pagednd $CDP              # spawns the fixture itself (it reads its stdout)
 fi
 
 if want touch; then

@@ -415,6 +415,7 @@ const Ctx = struct {
         ctx.dnd_offer = 0;
         const uri = std.mem.trim(u8, ctx.drop_data.items, "\r\n ");
         wl.print("DROPPED {s} ON folder", .{uri});
+        ctx.drop_data.clearRetainingCapacity(); // (the next drop reads afresh)
         ctx.file_moved = true;
         ctx.win.setTitle(&ctx.app, "moved file.txt");
         ctx.redraw();

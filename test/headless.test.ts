@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { crc32, inflateSync } from 'node:zlib';
-import { createHeadless, EDGE_LEFT, encodePNG, type Headless, type HeadlessOptions } from '../lib/headless.ts';
+import { createHeadless, DND_COPY, EDGE_LEFT, encodePNG, TEXT_MIMES, type Headless, type HeadlessOptions } from '../lib/headless.ts';
 import { stackOrder, type BufferHandle, type Engine, type Event, type HandleSource, type Link, type LinkCallbacks } from '../lib/engine.ts';
 
 // --- STREAM frames + wayland wire ------------------------------------------
@@ -731,6 +731,148 @@ test('drag-start: the core ignores one whose serial is no press held (nothing st
   assert.deepEqual(calls, [['dragCancel']]);
   hl.pointerUp();
   hl.dispose();
+});
+
+// FDMSG frames the engine sent: [conn, kind, wire length, aux]
+function fdmsgsSent(link: ScriptedLink) {
+  const found: [number, number, number, Uint8Array][] = [];
+  for (const bytes of link.sent) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let off = 0; off < bytes.length;) {
+      const t = bytes[off];
+      if (t === 0x0b) { off += 9; continue; }
+      if (t === 0x01) { off += 9 + dv.getUint32(off + 5, true); continue; }
+      if (t !== 0x05) break;
+      const wl = dv.getUint32(off + 9, true), al = dv.getUint32(off + 13 + wl, true);
+      found.push([dv.getUint32(off + 1, true), dv.getUint32(off + 5, true), wl, bytes.slice(off + 17 + wl, off + 17 + wl + al)]);
+      off += 17 + wl + al;
+    }
+  }
+  return found;
+}
+
+test('dragIn: a page\'s drag, scripted — refused without the relay\'s selection_cache; begun with no button (the app under the pointer gets its leave), moved by the pointer; the app\'s accept is engine.dragAction(); an early read waits; drop() hands the data over and drops; Escape cancels; a drop over nothing cancels', async () => {
+  {
+    const ctx = await setup();
+    desk(ctx, { popup: false });
+    assert.equal(ctx.hl.dragIn(70, 90, { 'text/plain': 'x' }), false, 'no FEATURE selection_cache');
+    ctx.hl.dispose();
+  }
+  const ctx = await setup();
+  ctx.deliver(frame(0x0c, u32s(3, 0))); // the relay bridges (FEATURE selection_cache)
+  const { hl, calls, link } = ctx;
+  const { b, tb } = desk(ctx, { popup: false });
+  const DD = b.id();
+  b.send(msg(DDM, 1, DD, SEAT));
+  hl.pointerMove(70, 90); // hovering B
+  assert.equal(hl.dragIn(70, 90, { Files: '' }), false, 'nothing offerable');
+  calls.length = 0;
+  link.sent.length = 0;
+  assert.equal(hl.dragIn(70, 90, { 'text/plain': 'from the page', 'text/html': '<b>page</b>' }), true);
+  assert.deepEqual(calls, [['pointerLeave', 2], ['dragMotion', 2, tb.surface, 6, 6]]);
+  assert.equal(hl.dragIn(70, 90, { 'text/plain': 'again' }), false, 'one at a time');
+  const offer = eventsTo(link, 2, DD).find((e) => e[0] === 0)![1];
+  assert.equal(eventsTo(link, 2, offer).filter((e) => e[0] === 0).length, TEXT_MIMES.length + 1, 'the text types and text/html');
+  // pointer input is the drag's meanwhile: a press goes nowhere
+  calls.length = 0;
+  hl.pointerDown();
+  hl.pointerUp();
+  assert.deepEqual(calls, []);
+
+  // the app accepts; it reads before the drop (FDMSG pipe, token 9): it waits
+  b.send(msg(offer, 0, 0, 'text/plain;charset=utf-8'));
+  assert.equal(hl.engine.dragAction(), DND_COPY);
+  hl.pointerMove(72, 91);
+  assert.deepEqual(calls.at(-1), ['dragMotion', 2, tb.surface, 8, 7]);
+  const recv = msg(offer, 1, 'text/plain;charset=utf-8');
+  link.sent.length = 0;
+  ctx.deliver(frame(0x05, u32s(2, 3, recv.length), recv, u32s(4, 9)));
+  assert.deepEqual(fdmsgsSent(link), []);
+
+  calls.length = 0;
+  assert.equal(await hl.drop(), true);
+  assert.deepEqual(calls, [['dragMotion', 2, tb.surface, 8, 7], ['dragDrop'], ['pointerEnter', 2, tb.surface, 8, 7]]);
+  const written = fdmsgsSent(link);
+  assert.equal(written.length, 1);
+  assert.deepEqual(written[0].slice(0, 3), [2, 3, 0], 'a pipe answer with no wire message');
+  assert.equal(new DataView(written[0][3].buffer).getUint32(0, true), 9);
+  assert.equal(new TextDecoder().decode(written[0][3].subarray(4)), 'from the page');
+  assert.equal(eventsTo(link, 2, DD).filter((e) => e[0] === 4).length, 1, 'wl_data_device.drop');
+  assert.equal(hl.engine.dragAction(), 0);
+
+  // Escape cancels one
+  assert.equal(hl.dragIn(70, 90, { 'text/uri-list': 'https://example.org/' }), true);
+  calls.length = 0;
+  hl.keyDown('Escape');
+  assert.deepEqual(calls, [['dragCancel'], ['pointerEnter', 2, tb.surface, 6, 6]]);
+  // dropped over nothing: cancelled, false
+  assert.equal(hl.dragIn(5, 5, { 'text/plain': 'x' }), true);
+  calls.length = 0;
+  assert.equal(await hl.drop(), false);
+  assert.deepEqual(calls, [['dragMotion', 0, 0, 0, 0], ['dragCancel']]);
+  hl.dispose();
+});
+
+test('dragIn with files: with the dnd.files hook they are text/uri-list, the drop made at once and the app\'s read (before and after it) answered when the hook placed them; without a hook a file is its content under its type; one over the cap cancels', async () => {
+  let release!: (uris: string[]) => void;
+  const ctx = await setup({ dnd: { files: (files) => new Promise((r) => { release = (uris) => r(uris); void files; }) } });
+  ctx.deliver(frame(0x0c, u32s(3, 0)));
+  const { hl, calls, link } = ctx;
+  const { b, tb } = desk(ctx, { popup: false });
+  const DD = b.id();
+  b.send(msg(DDM, 1, DD, SEAT));
+  const png = new File(['png bytes'], 'shot.png', { type: 'image/png' });
+  link.sent.length = 0;
+  assert.equal(hl.dragIn(70, 90, {}, { files: [png], actions: 3 }), true);
+  const offer = eventsTo(link, 2, DD).find((e) => e[0] === 0)![1];
+  assert.equal(eventsTo(link, 2, offer).filter((e) => e[0] === 0).length, 1, 'text/uri-list alone');
+  b.send(msg(offer, 0, 0, 'text/uri-list'));
+  assert.equal(hl.engine.dragAction(), DND_COPY, 'copy (files are never moved)');
+  const recv = (token: number) => {
+    const m = msg(offer, 1, 'text/uri-list');
+    ctx.deliver(frame(0x05, u32s(2, 3, m.length), m, u32s(4, token)));
+  };
+  recv(11); // before the drop: waits
+  calls.length = 0;
+  link.sent.length = 0;
+  const dropped = hl.drop();
+  assert.deepEqual(calls.map((c) => c[0]), ['dragMotion', 'dragDrop', 'pointerEnter'], 'the drop at once');
+  assert.equal(eventsTo(link, 2, DD).filter((e) => e[0] === 4).length, 1, 'wl_data_device.drop');
+  recv(12); // after it, on the drop's offer: waits too
+  assert.deepEqual(fdmsgsSent(link), []);
+  await new Promise((r) => setTimeout(r, 0)); // (the hook is asked from a microtask)
+  release(['/srv/up/shot.png']);
+  assert.equal(await dropped, true);
+  const written = fdmsgsSent(link);
+  assert.deepEqual(written.map((w) => new DataView(w[3].buffer).getUint32(0, true)), [11, 12]);
+  for (const w of written) assert.equal(new TextDecoder().decode(w[3].subarray(4)), 'file:///srv/up/shot.png\r\n');
+  hl.dispose();
+
+  // no hook: the file's content under its own type; over the cap, cancelled
+  const ctx2 = await setup();
+  ctx2.deliver(frame(0x0c, u32s(3, 0)));
+  const d2 = desk(ctx2, { popup: false });
+  const DD2 = d2.b.id();
+  d2.b.send(msg(DDM, 1, DD2, SEAT));
+  ctx2.link.sent.length = 0;
+  assert.equal(ctx2.hl.dragIn(70, 90, {}, { files: [png] }), true);
+  const offer2 = eventsTo(ctx2.link, 2, DD2).find((e) => e[0] === 0)![1];
+  d2.b.send(msg(offer2, 0, 0, 'image/png'));
+  assert.equal(await ctx2.hl.drop(), true);
+  const m = msg(offer2, 1, 'image/png');
+  ctx2.link.sent.length = 0;
+  ctx2.deliver(frame(0x05, u32s(2, 3, m.length), m, u32s(4, 21)));
+  const w2 = fdmsgsSent(ctx2.link);
+  assert.equal(new TextDecoder().decode(w2[0][3].subarray(4)), 'png bytes');
+  const huge = new File([new Uint8Array(4 * 1024 * 1024 + 1)], 'huge.png', { type: 'image/png' });
+  assert.equal(ctx2.hl.dragIn(70, 90, {}, { files: [huge] }), true, 'offered: its size is known only at the drop');
+  const offer3 = eventsTo(ctx2.link, 2, DD2).filter((e) => e[0] === 0).at(-1)![1];
+  d2.b.send(msg(offer3, 0, 0, 'image/png'));
+  ctx2.calls.length = 0;
+  assert.equal(await ctx2.hl.drop(), false);
+  assert.ok(ctx2.calls.some((c) => c[0] === 'dragCancel'));
+  void tb;
+  ctx2.hl.dispose();
 });
 
 test('move/resize requests: a scripted grab while the button is held, nothing once released; maximize snaps and restores', async () => {

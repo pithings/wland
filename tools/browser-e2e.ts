@@ -47,6 +47,14 @@
 //                finger as the pointer
 //   dnd          fixture `files` only: its file dragged onto its folder (the
 //                browser's pointer → wm dnd → wl_data_device) arrives
+//   pagednd      spawns fixture `files` (stdout read back): an HTML drag from
+//                outside the page (CDP Input.dispatchDragEvent: a link) over
+//                its folder is the app's drag (lib/dnd.ts) — dropEffect none
+//                until it accepts, then its preferred move; the drop reaches it (`DROPPED
+//                <uri> ON folder`); a dropped file with no files hook is
+//                its content (text/plain), after the drop, and does not
+//                navigate the page; reloaded with ?dndfiles=1 (the page's
+//                hook) a dropped file reaches the app as the hook's URI
 //   gtk          nautilus: popup opens below its button, outside click
 //                dismisses, navigation; the fixture's right-click menu
 //                lands at the pointer (positioners from the window geometry);
@@ -83,6 +91,8 @@
 //   drag x1 y1 x2 y2   slow drag, px relative to nautilus's main canvas
 //   shot <file.png>    page screenshot      log [grep]   window.wlandLog tail
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { app as appFor, realApps, type AppRole } from "../test/support/apps.ts";
 import { isolatedMirror } from "../test/support/isolated.ts";
 import { moveRequests, pointerEvents, touchEvents, touchLines } from "../test/support/touch-log.ts";
@@ -1176,6 +1186,132 @@ const phases: Record<string, () => Promise<void>> = {
     }
     if (!title.startsWith("moved file.txt")) fail(`the drop never arrived (title "${title}")`);
     console.log("dnd ok: file.txt dragged onto the folder through the browser");
+  },
+
+  async pagednd() {
+    const dir = mkdtempSync(`${tmpdir()}/wland-pagednd.`);
+    mkdirSync(`${dir}/folder`);
+    let out = "";
+    const spawnFiles = () => {
+      const a = appFor("files", [dir]);
+      const p = Bun.spawn([a.cmd, ...a.args], { stdout: "pipe", stderr: "ignore", env: { ...process.env, ...a.env } });
+      (async () => { for await (const c of p.stdout) out += new TextDecoder().decode(c); })();
+      return p;
+    };
+    let app = spawnFiles();
+    // every engine call the bridge makes (dragBegin with its types and
+    // actions, dragDrop with `later`, dragData with its types), and the
+    // dropEffect it answers
+    const instrument = () => evalJs(`(() => {
+      const e = window.wland.engine;
+      window.dndSeen = [];
+      const show = { dragBegin: (m, a) => ':' + m.join('|') + ':' + a, dragDrop: (l) => l ? ':true' : '', dragData: (d) => ':' + Object.keys(d || {}).join('|') };
+      for (const n of ['dragBegin', 'dragData', 'dragDrop', 'dragCancel']) {
+        e['_' + n] = e[n];
+        e[n] = (...a) => { window.dndSeen.push(n + (show[n] ? show[n](...a) : '')); return e['_' + n](...a); };
+      }
+      window.dndEffects = [];
+      document.addEventListener('dragover', (ev) => window.dndEffects.push(ev.dataTransfer.dropEffect));
+    })()`);
+    const dragEvent = (type: string, x: number, y: number, data: unknown) => call("Input.dispatchDragEvent", { type, x, y, data });
+    const TEXT_TYPES = "text/plain;charset=utf-8|UTF8_STRING|text/plain|TEXT|STRING";
+    try {
+      const mainKey = await waitWide(900);
+      await sleep(500);
+      const r = await evalJs(`(() => {
+        window.scrollTo(0, 0);
+        const r = document.querySelector('[data-wland="${mainKey}"]').getBoundingClientRect();
+        return { l: r.left, t: r.top };
+      })()`);
+      await instrument();
+      const uri = "https://example.org/dragged-into-wland";
+      // copy | move (DragOperation bits: Copy 1, Link 2, Move 16)
+      const link = { items: [{ mimeType: "text/uri-list", data: uri }, { mimeType: "text/plain", data: uri }], dragOperationsMask: 1 | 16 };
+      const folder: [number, number] = [r.l + 307, r.t + 145], start: [number, number] = [r.l + 427, r.t + 145];
+      await dragEvent("dragEnter", start[0], start[1], link);
+      for (let i = 1; i <= 10; i++) {
+        await dragEvent("dragOver", start[0] + ((folder[0] - start[0]) * i) / 10, folder[1], link);
+        await sleep(50);
+      }
+      for (let i = 0; i < 40 && !(await evalJs("window.wland.engine.dragAction()")); i++) {
+        await dragEvent("dragOver", folder[0], folder[1], link);
+        await sleep(50);
+      }
+      await dragEvent("dragOver", folder[0], folder[1], link); // answered with the app's action now
+      // the fixture accepts at its enter and prefers move (set_actions(copy |
+      // move, move)): none until its answer arrived (it may beat the first
+      // dragover), move after
+      const effects: string[] = await evalJs("window.dndEffects");
+      if (effects.some((e) => e !== "none" && e !== "move")) fail(`dropEffects: ${effects.join()}`);
+      if (effects.at(-1) !== "move") fail(`the dropEffect once the app accepted: ${effects.at(-1)} (${effects.join()})`);
+      await dragEvent("drop", folder[0], folder[1], link);
+      for (let i = 0; i < 50 && !/DROPPED (\S+) ON folder/.test(out); i++) await sleep(100);
+      const got = /DROPPED (\S+) ON folder/.exec(out)?.[1];
+      if (got !== uri) fail(`the app read ${got ?? "nothing"} (stdout: ${out.trim()}; engine calls ${await evalJs("window.dndSeen.join()")})`);
+      const seen: string[] = await evalJs("window.dndSeen");
+      // (the types in the browser's order: Chromium lists text/plain first)
+      const want = [...TEXT_TYPES.split("|"), "text/uri-list"].sort().join("|");
+      const typesOf = (call: string) => call.split(":").slice(1, -1).join(":").split("|").sort().join("|");
+      if (seen.length !== 3 || !seen[0].startsWith("dragBegin:") || !seen[0].endsWith(":3") || typesOf(seen[0]) !== want ||
+          !seen[1].startsWith("dragData:") || [...seen[1].slice(9).split("|")].sort().join("|") !== want || seen[2] !== "dragDrop") {
+        fail(`engine calls: ${seen.join()}`);
+      }
+      console.log(`pagednd ok: a link dragged in from outside (dropEffect ${effects[0]} → ${effects.at(-1)}) dropped onto the folder: ${got}`);
+
+      // a file, no files hook (the default page): offered as its content
+      // under its type (Chromium names a .txt text/plain), the drop made at
+      // once and its bytes after; the page stays where it was
+      writeFileSync(`${dir}/dropped.txt`, "dropped from the page\n");
+      const href: string = await evalJs("location.href");
+      const files = { items: [], files: [`${dir}/dropped.txt`], dragOperationsMask: 1 | 16 };
+      await evalJs("window.dndSeen = []");
+      const fileDrag = async () => {
+        await dragEvent("dragEnter", folder[0], folder[1], files);
+        for (let i = 0; i < 40 && !(await evalJs("window.wland.engine.dragAction()")); i++) {
+          await dragEvent("dragOver", folder[0], folder[1], files);
+          await sleep(50);
+        }
+        await dragEvent("dragOver", folder[0], folder[1], files);
+        await dragEvent("drop", folder[0], folder[1], files);
+      };
+      await fileDrag();
+      for (let i = 0; i < 25 && !(await evalJs("window.dndSeen.includes('dragData')")); i++) await sleep(100);
+      const fileSeen: string[] = await evalJs("window.dndSeen");
+      if (fileSeen.join() !== "dragBegin:text/plain:1,dragDrop:true,dragData:text/plain") fail(`a dropped file without a hook: engine calls ${fileSeen.join()}`);
+      if ((await evalJs("location.href")) !== href) fail("a dropped file navigated the page");
+      console.log("pagednd ok: a dropped file without a hook is its content (text/plain, copy only), handed over after the drop; the page stays");
+
+      // ?dndfiles=1: the page's hook places dropped files; the app reads
+      // their URIs (a reload drops the app: spawned again)
+      app.kill();
+      await call("Page.enable");
+      await call("Page.navigate", { url: `${await evalJs("location.origin")}/?dndfiles=1` });
+      await sleep(1000);
+      await waitOnline();
+      app = spawnFiles();
+      const key2 = await waitWide(900);
+      await sleep(500);
+      const r2 = await evalJs(`(() => {
+        window.scrollTo(0, 0);
+        const r = document.querySelector('[data-wland="${key2}"]').getBoundingClientRect();
+        return { l: r.left, t: r.top };
+      })()`);
+      folder[0] = r2.l + 307;
+      folder[1] = r2.t + 145;
+      await instrument();
+      const before = out.length;
+      await fileDrag();
+      for (let i = 0; i < 50 && !/DROPPED (\S+) ON folder/.test(out.slice(before)); i++) await sleep(100);
+      const hooked = /DROPPED (\S+) ON folder/.exec(out.slice(before))?.[1];
+      if (hooked !== "file:///hooked/dropped.txt") fail(`with the hook the app read ${hooked ?? "nothing"} (engine calls ${await evalJs("window.dndSeen.join()")})`);
+      if ((await evalJs("window.wlandDropped.join()")) !== "dropped.txt") fail(`the hook was handed ${await evalJs("window.wlandDropped.join()")}`);
+      console.log(`pagednd ok: with the page's files hook a dropped file reaches the app as its URI: ${hooked}`);
+    } finally {
+      app.kill();
+      // back to the default page for the groups after this one
+      await call("Page.navigate", { url: `${await evalJs("location.origin")}/` }).catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
   },
 
   // CSD window management: dragging nautilus's headerbar MOVES the window

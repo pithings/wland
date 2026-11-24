@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createEngine, EDGE_LEFT, EDGE_TOP, type Link, type LinkCallbacks } from '../lib/engine.ts';
+import { createEngine, DND_COPY, DND_MOVE, EDGE_LEFT, EDGE_TOP, type Link, type LinkCallbacks } from '../lib/engine.ts';
 
 const wasm = await readFile(new URL('../lib/wland.wasm', import.meta.url));
 
@@ -759,4 +759,120 @@ test('presentation feedback: the tick presents, as a PRESENTED frame after its s
   assert.equal(r.age, 0);
   assert.equal(r.event[5], 0); // refresh not known yet
   assert.equal(r.event[8], 1);
+});
+
+// every frame of the engine's output: WIRE events [conn, object, opcode,
+// ...words] and FDMSG [conn, kind, wire bytes, aux bytes]
+function engineOut(sent: Uint8Array[]) {
+  const wire: number[][] = [], fdmsgs: { conn: number; kind: number; wire: Uint8Array; aux: Uint8Array }[] = [];
+  for (const bytes of sent) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let off = 0; off < bytes.length;) {
+      const t = bytes[off], conn = dv.getUint32(off + 1, true);
+      if (t === 1) {
+        const len = dv.getUint32(off + 5, true);
+        for (let m = off + 9; m < off + 9 + len;) {
+          const word = dv.getUint32(m + 4, true), size = word >>> 16;
+          const ev = [conn, dv.getUint32(m, true), word & 0xffff];
+          for (let a = m + 8; a < m + size; a += 4) ev.push(dv.getUint32(a, true));
+          wire.push(ev);
+          m += size;
+        }
+        off += 9 + len;
+      } else if (t === 5) {
+        const kind = dv.getUint32(off + 5, true), wl = dv.getUint32(off + 9, true);
+        const al = dv.getUint32(off + 13 + wl, true);
+        fdmsgs.push({ conn, kind, wire: bytes.slice(off + 13, off + 13 + wl), aux: bytes.slice(off + 17 + wl, off + 17 + wl + al) });
+        off += 17 + wl + al;
+      } else throw new Error(`frame type ${t} in the engine's output`);
+    }
+  }
+  return { wire, fdmsgs };
+}
+
+test('the embedder\'s own drag through the engine: refused without FEATURE selection_cache; begun with no button, offered to the toplevel under it, an early receive held until dragData, accept/set_actions are drag-action events, the drop; no drag-start/drag-end', async () => {
+  // a relay without selection_cache (wlandr 0.1.0): nothing begins, nothing is offered
+  {
+    const link = scriptedLink();
+    const engine = await createEngine({ wasm, link, onEvent: () => {} });
+    engine.start();
+    link.cb!.onOpen();
+    link.cb!.onMessage(pack(connOpen(CONN), wireFrame(CONN, msg(1, 1, 2))));
+    link.sent.length = 0;
+    assert.equal(engine.selectionBridged(), false);
+    assert.equal(engine.dragBegin(['text/plain']), false);
+    assert.deepEqual(link.sent, []);
+    engine.dispose();
+  }
+
+  const link = scriptedLink();
+  const events: any[] = [];
+  const engine = await createEngine({ wasm, link, onEvent: (ev) => { if (ev.type !== 'log') events.push(ev); } });
+  engine.start();
+  link.cb!.onOpen();
+  assert.equal(engine.dragBegin(['text/plain']), false, 'not known yet whether the relay bridges');
+  link.cb!.onMessage(pack(frame(0x0c, u32s(3, 0)), connOpen(CONN), wireFrame(CONN, msg(1, 1, 2))));
+  const g = globals(link.sent, 2);
+  // wl_compositor 4, xdg_wm_base 5, wl_seat 9, wl_data_device_manager 12 (v3);
+  // surface 6 → xdg_surface 7 → toplevel 8, committed; data device 13
+  link.cb!.onMessage(pack(wireFrame(CONN, new Uint8Array([
+    ...msg(2, 0, g.wl_compositor.name, 'wl_compositor', 4, 4),
+    ...msg(2, 0, g.xdg_wm_base.name, 'xdg_wm_base', 1, 5),
+    ...msg(2, 0, g.wl_seat.name, 'wl_seat', 5, 9),
+    ...msg(2, 0, g.wl_data_device_manager.name, 'wl_data_device_manager', 3, 12),
+    ...msg(4, 0, 6), ...msg(5, 2, 7, 6), ...msg(7, 1, 8), ...msg(6, 6),
+    ...msg(12, 1, 13, 9),
+  ]))));
+  events.length = 0;
+  link.sent.length = 0;
+
+  assert.equal(engine.dragBegin(['text/plain', 'text/html'], DND_COPY | DND_MOVE), true);
+  assert.equal(engine.dragBegin(['text/plain']), false, 'one drag at a time');
+  engine.dragMotion(CONN, 6, 10, 5, 5);
+  const { wire } = engineOut(link.sent.splice(0));
+  // data_offer(new id), offer ×2, source_actions(copy|move), enter
+  assert.deepEqual(wire.map((e) => [e[1] === 13 ? 'device' : 'offer', e[2]]),
+    [['device', 0], ['offer', 0], ['offer', 0], ['offer', 1], ['device', 1]]);
+  const offer = wire[0][3];
+  assert.ok(offer >= 0xff000000);
+  assert.deepEqual(wire[3].slice(3), [DND_COPY | DND_MOVE]);
+  assert.equal(wire[4][4], 6, 'the enter names the surface');
+
+  // the app reads at once (FDMSG pipe from the relay: receive(mime, fd), token 77): held
+  const recv = (mime: string, token: number) => {
+    const m = msg(offer, 1, mime);
+    link.cb!.onMessage(pack(frame(5, u32s(CONN, 3, m.length), m, u32s(4, token))));
+  };
+  recv('text/plain', 77);
+  assert.deepEqual(link.sent, [], 'held: the bytes are not known yet');
+
+  // accept, then set_actions(copy|move, preferred move): drag-action events
+  link.cb!.onMessage(pack(wireFrame(CONN, msg(offer, 0, 1, 'text/plain'))));
+  assert.deepEqual(events, [{ type: 'drag-action', action: DND_COPY }]);
+  link.cb!.onMessage(pack(wireFrame(CONN, msg(offer, 4, DND_COPY | DND_MOVE, DND_MOVE))));
+  assert.deepEqual(events.at(-1), { type: 'drag-action', action: DND_MOVE });
+  assert.equal(engine.dragAction(), DND_MOVE);
+  link.sent.length = 0;
+
+  // the bytes: the held receive is answered (FDMSG pipe, no wire message, token ++ bytes)
+  assert.equal(engine.dragData({ 'text/plain': 'héllo', 'text/html': '<b>x</b>' }), true);
+  assert.equal(engine.dragData(null), false, 'once');
+  const answered = engineOut(link.sent.splice(0)).fdmsgs;
+  assert.equal(answered.length, 1);
+  assert.equal(answered[0].kind, 3);
+  assert.equal(answered[0].wire.length, 0);
+  assert.equal(new DataView(answered[0].aux.buffer).getUint32(0, true), 77);
+  assert.equal(new TextDecoder().decode(answered[0].aux.subarray(4)), 'héllo');
+
+  // the drop: wl_data_device.drop, the action back to 0, no drag events
+  engine.dragDrop();
+  const dropped = engineOut(link.sent.splice(0)).wire;
+  assert.deepEqual(dropped.map((e) => e.slice(1, 3)), [[13, 4]]);
+  assert.equal(engine.dragAction(), 0);
+  assert.deepEqual(events.map((e) => e.type), ['drag-action', 'drag-action', 'drag-action']);
+  // a receive after it: answered from the bytes
+  recv('text/html', 78);
+  const late = engineOut(link.sent.splice(0)).fdmsgs;
+  assert.equal(new TextDecoder().decode(late[0].aux.subarray(4)), '<b>x</b>');
+  engine.dispose();
 });

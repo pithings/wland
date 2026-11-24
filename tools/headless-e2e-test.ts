@@ -60,7 +60,8 @@
 //     focused; a double click navigates (title change); a resize storm
 //     leaves it alive and drawing (the double-release regression: GTK's
 //     commits without attach). The fixture also drags its file onto its
-//     folder (wl_data_device dnd, one client).
+//     folder (wl_data_device dnd, one client), and a link dragged in from
+//     the page (dragIn: the embedder's own drag) lands on the folder.
 //  6. x11 (real apps only, and only with xwayland-satellite, Xwayland and
 //     xeyes installed): the relay claimed an X display; an X client
 //     connecting to it starts satellite and gets a window.
@@ -96,7 +97,7 @@ import { fileURLToPath } from 'node:url';
 import type { GpuRef } from '../lib/engine.ts';
 import {
   createHeadless, EDGE_BOTTOM, EDGE_LEFT, EDGE_TOP, NO_SELECTION_BRIDGE, ROLE_POPUP, ROLE_SUBSURFACE,
-  type ConfigureEvent, type Headless, type HeadlessWindow, type RgbaImage,
+  type ConfigureEvent, type DropFilesHook, type Headless, type HeadlessWindow, type RgbaImage,
 } from '../lib/headless.ts';
 import { xDisplayOf } from '../lib/index.ts';
 import { app, appHome, appSet, available, realApps, type AppRole, type AppSpec } from '../test/support/apps.ts';
@@ -998,6 +999,54 @@ async function nautilus() {
     check(true, 'the drag ended: the source moved its file');
     await stop(dnd.p);
     await noWindows();
+
+    // a page's drag (Headless.dragIn: what lib/dnd.ts makes of an HTML
+    // drag): a link from outside onto the folder — no app is the source;
+    // the core offers it, the relay writes the page's bytes into the
+    // fixture's receive pipe
+    if (hl.engine.selectionBridged() === true) {
+      mkdirSync(`${dir}/files3`, { recursive: true });
+      const pd = runLogged(need('files', [`${dir}/files3`])!);
+      const w3 = await oneWindow('files');
+      const link = 'https://example.org/dragged-from-the-page';
+      const start = [w3.originX + 427, w3.originY + 145] as const, end = [w3.originX + 307, w3.originY + 145] as const;
+      check(hl.dragIn(start[0], start[1], { 'text/uri-list': link, 'text/plain': link }), 'dragIn: a link dragged in from the page');
+      for (let i = 1; i <= 10; i++) {
+        hl.pointerMove(start[0] + ((end[0] - start[0]) * i) / 10, start[1]);
+        await sleep(30);
+      }
+      await until(() => hl.engine.dragAction() !== 0, 3000, 'the fixture to accept the page\'s drag');
+      const action = hl.engine.dragAction();
+      check(await hl.drop(), `dropped into the app (action ${action === 1 ? 'copy' : action})`);
+      await until(() => /DROPPED (\S+) ON folder/.test(pd.text()), 5000, 'the page\'s drop');
+      const got = /DROPPED (\S+) ON folder/.exec(pd.text())![1];
+      check(got === link, `the page's link dropped onto the folder: the app read ${got}`);
+
+      // a file dropped from the page: the embedder's hook places it (here:
+      // written next to the fixture's files, as an upload to a shared
+      // directory would) and names it; the app reads its file:// URI
+      placeFiles = async (files) => Promise.all(files.map(async (f) => {
+        const path = `${dir}/files3/${f.name}`;
+        writeFileSync(path, new Uint8Array(await f.arrayBuffer()));
+        return path;
+      }));
+      const before = pd.text().length;
+      const dropped = new File(['dropped from the page\n'], 'page file.txt', { type: 'text/plain' });
+      check(hl.dragIn(start[0], start[1], {}, { files: [dropped] }), 'dragIn: a file dragged in from the page');
+      for (let i = 1; i <= 10; i++) {
+        hl.pointerMove(start[0] + ((end[0] - start[0]) * i) / 10, start[1]);
+        await sleep(30);
+      }
+      await until(() => hl.engine.dragAction() !== 0, 3000, 'the fixture to accept the file');
+      check(await hl.drop(), 'the file dropped (the hook placed it)');
+      await until(() => /DROPPED (\S+) ON folder/.test(pd.text().slice(before)), 5000, 'the file\'s drop');
+      const fileUri = /DROPPED (\S+) ON folder/.exec(pd.text().slice(before))![1];
+      check(fileUri === `file://${dir}/files3/page%20file.txt`, `the app read the hook's URI: ${fileUri}`);
+      check(existsSync(`${dir}/files3/page file.txt`), 'the file is where the hook put it');
+      placeFiles = null;
+      await stop(pd.p);
+      await noWindows();
+    } else console.log('  skipped: a page\'s drag (the relay sent no FEATURE selection_cache)');
   }
 }
 
@@ -1071,11 +1120,15 @@ async function scale2() {
   hl.setOutput(hl.output.width, hl.output.height, 1);
 }
 
+/** Where the scene's dropped files go (its dnd.files hook): a phase sets it. */
+let placeFiles: DropFilesHook | null = null;
+
 /** A scene on the main relay's link (the page; again after a "reload"). */
 function attach(decorations: 'client' | 'server' = 'client'): Promise<Headless> {
   const seen = new Set<string>(); // surfaces with a commit in this scene
   return createHeadless({
     link: `ws://127.0.0.1:${PORT}/ws`, width: 1280, height: 800, decorations,
+    dnd: { files: (files) => (placeFiles ? placeFiles(files) : null) },
     onEvent(ev) {
       if (ev.type === 'decoration') order.push(`decoration c${ev.conn}s${ev.surface} ${ev.decorated}`);
       else if (ev.type === 'commit' && !seen.has(`c${ev.conn}s${ev.surface}`)) {

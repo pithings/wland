@@ -21,6 +21,10 @@
 //   ?altdrag=0           shortcuts { drag: false } (Alt+F9/F10/F11 stay)
 //   ?autofocus=0         createWland's autoFocus: false (the embedder phase)
 //   ?display=0           createWland's manageDisplay: false (the embedder phase)
+//   ?dndfiles=1          createWland's dnd.files hook (the pagednd phase): a
+//                        dropped file is "placed" as file:///hooked/<name>
+//                        (nothing is written); window.wlandDropped lists
+//                        the names it was handed
 import { createWland, type CursorEvent, type InteractiveEvent, type PointerPress, type Wland } from '../../lib/client.ts';
 
 /** One request the ?embedder=1 window manager took: `moves` counts its
@@ -33,13 +37,14 @@ interface EmbedderDrag {
 declare global {
   interface Window {
     wland?: Wland; wlandStatus: Record<string, boolean>; wlandLog: string[]; wlandCursor?: CursorEvent;
-    wlandEmbedder: EmbedderDrag[];
+    wlandEmbedder: EmbedderDrag[]; wlandDropped: string[];
   }
 }
 
 window.wlandStatus = {};
 window.wlandLog = [];
 window.wlandEmbedder = [];
+window.wlandDropped = [];
 const status = document.getElementById('status')!;
 function report(name: string, ok: boolean, detail: string) {
   window.wlandStatus[name] = ok;
@@ -81,6 +86,10 @@ try {
     shortcuts: query.get('altdrag') === '0' ? { drag: false } : true,
     autoFocus: query.get('autofocus') !== '0',
     manageDisplay: query.get('display') !== '0',
+    dnd: query.get('dndfiles') === '1' ? { files: (files) => files.map((f) => {
+      window.wlandDropped.push(f.name);
+      return `file:///hooked/${encodeURIComponent(f.name)}`;
+    }) } : true,
     onEvent(ev) {
       switch (ev.type) {
         case 'log': window.wlandLog.push(ev.line); break;
