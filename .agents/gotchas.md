@@ -458,8 +458,25 @@ with it. New findings go in the matching section.
   sync's `done` share a link message; release is written later by the app
   thread). Assert after `loop.settle` or `until`.
 
+- **A pinned scale has to arrive before the app's first request**: the
+  relay puts CONN_SCALE in the same `link.send` as CONN_OPEN
+  (`serveAppScaled`). Sent later, a client that bound wl_output or made a
+  v6 surface first would be told the page's scale and then the pin's (the
+  core resends, but satellite has already set `Xft.dpi` by then).
+- **xwayland-satellite that dies at startup leaves its X client queued**
+  on the listener (Xwayland never accepted it), so poll fires again at
+  once: a respawn loop. `Launcher.refuseWaiting` accepts and closes what a
+  quick exit (< 3 s) left. Don't go back to "give up after N": an
+  Xwayland installed later (unkernel: `apt-get install xwayland`) would
+  never be used.
+
 ## Compositor (`core/`)
 
+- **Every scale an app is told goes through `scaleOf`/`scaleOfId`**
+  (its `Conn.scale_pin`, else the page's `output_scale`/`scale_120`):
+  wl_output scale and mode, preferred_buffer_scale, preferred_scale. Code
+  that reads `self.output_scale` directly to tell a client something
+  breaks `--lodpi`. `setScale` skips pinned conns.
 - **Input is role-gated**: keyboard focus only to toplevels, pointer never to
   cursor or dnd-icon surfaces, cursor canvases never shown in place (foot
   SIGSEGVs if its cursor surface gets focus). **And focus-gated**: motion/button/axis dropped

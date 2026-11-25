@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // wland CLI:
-//   wland [serve] [--port N] [--host ADDR] [--display NAME] [--runtime-dir DIR] [--xwayland MODE] [--web-root DIR]
-//   wland run [--display NAME] <app> [args...]   launch a wayland app against the server
+//   wland [serve] [--port N] [--host ADDR] [--display NAME] [--runtime-dir DIR] [--xwayland MODE] [--xwayland-display N] [--lodpi] [--web-root DIR]
+//   wland run [--display NAME] [--lodpi] <app> [args...]   launch a wayland app against the server
 import { existsSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
@@ -12,9 +12,10 @@ const HELP = `wland — a Wayland compositor that renders in your browser
 
 usage:
   wland [serve] [options]     start the server, then open the printed URL
-  wland run [--display NAME] <app> [args...]
+  wland run [--display NAME] [--lodpi] <app> [args...]
                               launch a wayland app against the server
-                              (e.g. wland run foot)
+                              (e.g. wland run foot); --lodpi: on the
+                              server's lodpi socket (see below)
 
 options (serve):
   --port N           HTTP port for the compositor page (default 8080)
@@ -25,6 +26,13 @@ options (serve):
   --runtime-dir DIR  socket directory (default $XDG_RUNTIME_DIR or /tmp/wland-run)
   --xwayland MODE    X11 apps through xwayland-satellite: auto (the default:
                      if it is installed), off, or the binary's path
+  --xwayland-display N
+                     claim exactly X display :N (default: the first free);
+                     if a live X server has it, X11 apps are off
+  --lodpi            also listen on <display>-lodpi: apps there are shown
+                     output scale 1 whatever the page's devicePixelRatio, so
+                     the page upscales them (the right size on HiDPI, softer)
+                     — for apps that don't scale themselves
   --web-root DIR     serve a different client build (advanced)
 
 wland run finds the server like any wayland app does: $XDG_RUNTIME_DIR and
@@ -55,6 +63,8 @@ async function serve() {
       'runtime-dir': { type: 'string' },
       'web-root': { type: 'string' },
       xwayland: { type: 'string' },
+      'xwayland-display': { type: 'string' },
+      lodpi: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -69,6 +79,8 @@ async function serve() {
       runtimeDir: values['runtime-dir'],
       webRoot: values['web-root'],
       xwayland: values.xwayland === undefined || values.xwayland === 'auto' ? undefined : values.xwayland === 'off' ? false : values.xwayland,
+      xwaylandDisplay: values['xwayland-display'] !== undefined ? Number(values['xwayland-display'].replace(/^:/, '')) : undefined,
+      lodpi: values.lodpi,
     });
   } catch (err) {
     console.error(`wland: ${(err as Error).message}`);
@@ -82,7 +94,7 @@ async function serve() {
   compositor page:  ${info.url}   ← open this in a browser
   wayland socket:   ${info.socketPath}
   launch apps:      ${prefix}wland run foot     (any wayland app works${plain ? '; plain `foot` too' : ''})
-${info.xDisplay ? `  X11 apps:         ${prefix}wland run xterm    (DISPLAY=${info.xDisplay}, via xwayland-satellite)\n` : ''}
+${info.xDisplay ? `  X11 apps:         ${prefix}wland run xterm    (DISPLAY=${info.xDisplay}, via xwayland-satellite)\n` : ''}${info.lodpiDisplay ? `  at scale 1:       ${prefix}wland run --lodpi APP    (WAYLAND_DISPLAY=${info.lodpiDisplay})\n` : ''}
   Ctrl-C stops the server.
 `);
   // the child keeps the event loop alive; its exit is ours
@@ -95,15 +107,24 @@ ${info.xDisplay ? `  X11 apps:         ${prefix}wland run xterm    (DISPLAY=${in
 
 async function run() {
   let display = process.env.WAYLAND_DISPLAY || 'wayland-0';
-  if (argv[0] === '--display' && argv[1]) {
-    display = argv[1];
-    argv.splice(0, 2);
+  let lodpi = false;
+  for (;;) {
+    if (argv[0] === '--display' && argv[1]) {
+      display = argv[1];
+      argv.splice(0, 2);
+    } else if (argv[0] === '--lodpi') {
+      lodpi = true;
+      argv.shift();
+    } else break;
   }
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
     console.log(HELP);
     process.exit(argv.length === 0 ? 2 : 0);
   }
   const runtimeDir = process.env.XDG_RUNTIME_DIR ?? '/tmp/wland-run';
+  const mainPath = join(runtimeDir, display);
+  // the server's --lodpi socket (DISPLAY still comes from the main one's note)
+  if (lodpi) display += '-lodpi';
   const socketPath = join(runtimeDir, display);
 
   // fail fast with a useful message instead of GTK's cryptic "Failed to open
@@ -115,11 +136,11 @@ async function run() {
   });
   if (!live) {
     console.error(`wland run: no compositor listening at ${socketPath}`);
-    console.error('  start one with: wland   (then open the printed URL in a browser)');
+    console.error(lodpi ? '  start one with: wland --lodpi   (then open the printed URL in a browser)' : '  start one with: wland   (then open the printed URL in a browser)');
     process.exit(1);
   }
 
-  const child = runApp({ runtimeDir, display, xDisplay: xDisplayOf(socketPath) }, argv, { stdio: 'inherit' });
+  const child = runApp({ runtimeDir, display, xDisplay: xDisplayOf(mainPath) }, argv, { stdio: 'inherit' });
   child.on('error', (err) => {
     console.error(`wland run: ${err.message}`);
     process.exit(1);

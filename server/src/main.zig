@@ -28,16 +28,16 @@ const Session = @import("session.zig").Session;
 
 // The usage text matches the build: a -Dhttp=false relay has no HTTP options.
 const usage_synopsis = if (build_options.http)
-    \\usage: wlandr [--port N] [--host ADDR] [--web-root DIR] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--profile MODE] [--external-buffers]
+    \\usage: wlandr [--port N] [--host ADDR] [--web-root DIR] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--xwayland-display N] [--profile MODE] [--external-buffers] [--lodpi]
     \\                 serve the browser compositor (HTTP + /ws)
-    \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE] [--external-buffers]
+    \\       wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--xwayland-display N] [--link-on-demand] [--profile MODE] [--external-buffers] [--lodpi]
     \\                 serve one engine over a byte stream, no HTTP
     \\       wlandr --version
     \\                 print the version and this build's features (below), exit 0
     \\
     \\
 else
-    \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE] [--external-buffers]
+    \\usage: wlandr --link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--xwayland-display N] [--link-on-demand] [--profile MODE] [--external-buffers] [--lodpi]
     \\                 serve one engine over a byte stream (this build has no HTTP server: --link is required)
     \\       wlandr --version
     \\                 print the version and this build's features (below), exit 0
@@ -47,6 +47,13 @@ else
 const usage_display =
     \\  --display NAME   wayland socket name in $XDG_RUNTIME_DIR; fails if another compositor has it
     \\                   (default: the first free wayland-N — usually wayland-0)
+    \\  --lodpi          also listen on <display>-lodpi (e.g. wayland-0-lodpi; logged as `lodpi socket:
+    \\                   PATH`): its apps are shown output scale 1 whatever the page's devicePixelRatio
+    \\                   (wl_output.scale 1, preferred_scale 1.0, preferred_buffer_scale 1), so the page
+    \\                   upscales their buffers: the right size on HiDPI, if softer. For apps that draw
+    \\                   at the scale they're told and don't scale themselves, like X11 apps under an
+    \\                   xwayland-satellite run with WAYLAND_DISPLAY=<display>-lodpi. wlandr's own
+    \\                   satellite (--xwayland) then connects there too: every X window at scale 1
     \\
 ;
 const usage_http = if (build_options.http)
@@ -117,6 +124,8 @@ const usage_tail =
     \\                   PATH    that xwayland-satellite binary
     \\                   The X display is the first free :N in /tmp; `x11 display: :N` is logged and
     \\                   written to <socket>.x11.
+    \\  --xwayland-display N  claim exactly X display :N instead (0…65535); if a live X server has it,
+    \\                   X11 apps are off (logged) — no other number is tried. Needs --xwayland on
     \\
     \\The wayland socket is $XDG_RUNTIME_DIR/<display> ($XDG_RUNTIME_DIR unset: /tmp/wland-run), held
     \\with <display>.lock like libwayland's own compositors; `wayland socket: PATH` is logged once bound.
@@ -128,7 +137,7 @@ const usage_tail =
     \\--version prints `wlandr VERSION`, then `features:` and space-separated tokens, one per thing
     \\this build supports (tokens are only ever added): http, link:fd, link:unix, link:vsock,
     \\buffers:MODE and dmabuf:MODE per mode above, no-fence-wait, selection_cache, xwayland,
-    \\link-on-demand, profile:session, external-buffers.
+    \\link-on-demand, profile:session, external-buffers, lodpi, xwayland-display.
     \\
 ;
 const usage = usage_synopsis ++ usage_display ++ usage_http ++ usage_link ++ usage_xwayland_default ++ usage_tail;
@@ -146,8 +155,8 @@ const features = blk: {
     // --no-fence-wait; STREAM FEATURE selection_cache (the clipboard
     // bridge); --xwayland; --link-on-demand (with --link-timeout);
     // --profile session (-Dsession=false builds lack it);
-    // --external-buffers
-    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand" ++ (if (build_options.session) " profile:session" else "") ++ " external-buffers";
+    // --external-buffers; --lodpi; --xwayland-display
+    break :blk f ++ " no-fence-wait selection_cache xwayland link-on-demand" ++ (if (build_options.session) " profile:session" else "") ++ " external-buffers lodpi xwayland-display";
 };
 const version_text = "wlandr " ++ build_options.version ++ "\nfeatures: " ++ features ++ "\n";
 
@@ -188,6 +197,8 @@ const Options = struct {
     display: ?[]const u8 = null,
     buffer_mode: buffers.Kind = .copy,
     xwayland: ?[]const u8 = null,
+    /// --xwayland-display: claim exactly this X display (null: the first free)
+    xwayland_display: ?u32 = null,
     dmabuf: ?DmabufMode = null,
     /// false: --no-fence-wait (virtgpu COMMITs skip the write-fence wait)
     fence_wait: bool = true,
@@ -200,6 +211,8 @@ const Options = struct {
     profile: Profile = .passthrough,
     /// --external-buffers: track wland_external_buffer_manager_v1 buffers
     external_buffers: bool = false,
+    /// --lodpi: a second socket, <display>-lodpi, whose apps see scale 1
+    lodpi: bool = false,
     http_address: Io.net.IpAddress = undefined,
 };
 
@@ -263,6 +276,8 @@ fn parseArgs(args: anytype, out: anytype) !Options {
             o.on_demand = true;
         } else if (std.mem.eql(u8, arg, "--external-buffers")) {
             o.external_buffers = true;
+        } else if (std.mem.eql(u8, arg, "--lodpi")) {
+            o.lodpi = true;
         } else if (std.mem.eql(u8, arg, "--link-timeout")) {
             const ms = args.next() orelse return error.MissingLinkTimeoutValue;
             o.link_timeout_ms = std.fmt.parseInt(u32, ms, 10) catch 0;
@@ -281,6 +296,13 @@ fn parseArgs(args: anytype, out: anytype) !Options {
             return error.Version;
         } else if (std.mem.eql(u8, arg, "--xwayland")) {
             o.xwayland = args.next() orelse return error.MissingXwaylandValue;
+        } else if (std.mem.eql(u8, arg, "--xwayland-display")) {
+            const v = args.next() orelse return error.MissingXwaylandDisplayValue;
+            const text = if (v.len > 0 and v[0] == ':') v[1..] else v;
+            o.xwayland_display = std.fmt.parseInt(u16, text, 10) catch {
+                out.print("--xwayland-display takes a display number (0…65535, e.g. 1 or :1), not {s}\n\n" ++ usage, .{v});
+                return error.BadXwaylandDisplay;
+            };
         } else if (std.mem.eql(u8, arg, "--buffers")) {
             const mode = args.next() orelse return error.MissingBuffersValue;
             o.buffer_mode = std.meta.stringToEnum(buffers.Kind, mode) orelse {
@@ -342,6 +364,14 @@ fn parseArgs(args: anytype, out: anytype) !Options {
             // the next viewer; an external buffer has none to keep
             out.print("--profile session does not take --external-buffers (a session keeps pixels; an external buffer has none)\n\n" ++ usage, .{});
             return error.SessionNoExternalBuffers;
+        }
+    }
+    if (o.xwayland_display != null) {
+        // X is off by default with --link, and "off" is off
+        const off = if (o.xwayland) |m| std.mem.eql(u8, m, "off") else o.link_spec != null;
+        if (off) {
+            out.print("--xwayland-display needs X11 on: --xwayland auto or --xwayland PATH\n\n" ++ usage, .{});
+            return error.XwaylandDisplayNeedsXwayland;
         }
     }
     if (!o.fence_wait and (o.dmabuf == null or o.dmabuf.?.tag != .virtgpu)) {
@@ -428,12 +458,30 @@ pub fn main(init: std.process.Init) !void {
     defer claimed.remove();
     const socket_path = claimed.path();
     const display_name = claimed.name();
+    // --lodpi: its name follows the main one's; held, and removed, with it
+    var lodpi_claim: socket.Claim = undefined;
+    const lodpi_path: ?[]const u8 = if (opts.lodpi) blk: {
+        var name_buf: [128]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{s}-lodpi", .{display_name}) catch "";
+        lodpi_claim = socket.claim(runtime_dir, name) catch |err| {
+            switch (err) {
+                error.InUse => std.log.err("--lodpi: wayland socket {s}/{s} is in use by another compositor", .{ runtime_dir, name }),
+                error.NameTooLong => std.log.err("--lodpi: wayland socket path too long for AF_UNIX: {s}/{s}", .{ runtime_dir, name }),
+                else => std.log.err("--lodpi: cannot lock {s}/{s}: {t}", .{ runtime_dir, name, err }),
+            }
+            return err;
+        };
+        socket.removeAtExit(lodpi_claim.path());
+        socket.removeAtExit(std.mem.span(lodpi_claim.lockPath()));
+        break :blk lodpi_claim.path();
+    } else null;
 
     // the relay lives as long as the process; threads keep its address
     const relay = try gpa.create(relay_mod.Relay);
     relay.* = .{ .io = io, .gpa = gpa, .backend = backend, .dmabuf = dmabuf_config, .external = opts.external_buffers };
     if (opts.on_demand) relay.on_demand = .{ .link_text = link_text };
     var wayland = try relay_mod.listenWayland(io, socket_path);
+    var wayland_lodpi: ?Io.net.Server = if (lodpi_path) |p| try relay_mod.listenWayland(io, p) else null;
     // session: the compositor runs here, on the relay's one lifelong link,
     // before any app can connect (apps then never wait for an engine)
     // (comptime: -Dsession=false never compiles the host or its compositor)
@@ -446,7 +494,7 @@ pub fn main(init: std.process.Init) !void {
 
     // X11 apps: on by default where a person runs apps by hand (the HTTP
     // server), off for a --link relay (scripts, tests, a guest) unless asked
-    const x11_display = startXwayland(gpa, init.environ_map, xwayland_arg orelse if (link_spec == null) "auto" else "off", runtime_dir, socket_path, display_name) catch |err| {
+    const x11_display = startXwayland(gpa, init.environ_map, xwayland_arg orelse if (link_spec == null) "auto" else "off", runtime_dir, socket_path, if (lodpi_path != null) lodpi_claim.name() else display_name, opts.xwayland_display) catch |err| {
         std.log.err("--xwayland {s}: {t}", .{ xwayland_arg orelse "auto", err });
         return err;
     };
@@ -458,11 +506,11 @@ pub fn main(init: std.process.Init) !void {
     // for the "wayland socket:" line as its ready signal
     if (link_spec) |spec| {
         if (x11_display) |n| std.log.info("x11 display: :{d}", .{n});
+        if (lodpi_path) |p| std.log.info("lodpi socket: {s} (its apps are shown output scale 1)", .{p});
         std.log.info("wayland socket: {s}", .{socket_path});
         std.log.info("buffers: {t}", .{buffer_mode});
         if (opts.on_demand) std.log.info("link {s}: on demand (dialed when an app connects, within {d} ms)", .{ link_text, opts.link_timeout_ms });
-        const thread = try std.Thread.spawn(.{}, relay_mod.serveWayland, .{ relay, &wayland });
-        thread.detach();
+        try serveSockets(relay, &wayland, &wayland_lodpi);
         return serveStreamLink(relay, spec, link_text, .{
             .timeout_ms = opts.link_timeout_ms,
             .dmabuf = dmabuf_later,
@@ -478,12 +526,23 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         if (x11_display) |n| std.log.info("x11 display: :{d} (X11 apps: xwayland-satellite starts with the first one)", .{n});
+        if (lodpi_path) |p| std.log.info("lodpi socket: {s} (its apps are shown output scale 1)", .{p});
         std.log.info("wayland socket: {s}", .{socket_path});
         std.log.info("launch apps: wland run <app> — or plain, from a shell where XDG_RUNTIME_DIR={s} and WAYLAND_DISPLAY={s} (or unset, for wayland-0)", .{ runtime_dir, display_name });
-        const thread = try std.Thread.spawn(.{}, relay_mod.serveWayland, .{ relay, &wayland });
-        thread.detach();
+        try serveSockets(relay, &wayland, &wayland_lodpi);
         srv.serve();
     } else unreachable; // rejected above
+}
+
+/// The accept loops: the socket's, and --lodpi's (its apps pinned to
+/// scale 1).
+fn serveSockets(relay: *relay_mod.Relay, wayland: *Io.net.Server, lodpi: *?Io.net.Server) !void {
+    if (lodpi.*) |*l| {
+        const t = try std.Thread.spawn(.{}, relay_mod.serveWayland, .{ relay, l, @as(u32, 1) });
+        t.detach();
+    }
+    const thread = try std.Thread.spawn(.{}, relay_mod.serveWayland, .{ relay, wayland, @as(u32, 0) });
+    thread.detach();
 }
 
 fn logDmabuf(cfg: dmabuf.Config) void {
@@ -567,7 +626,11 @@ fn startXwayland(
     mode: []const u8,
     runtime_dir: []const u8,
     socket_path: []const u8,
+    /// the socket satellite connects to: the main one, or --lodpi's (then
+    /// every X window is shown at scale 1)
     display_name: []const u8,
+    /// --xwayland-display: that X display or none; null: the first free
+    exact: ?u32,
 ) !?u32 {
     var note_buf: [128]u8 = undefined;
     const note = try std.fmt.bufPrintZ(&note_buf, "{s}.x11", .{socket_path});
@@ -583,9 +646,13 @@ fn startXwayland(
         if (linux.errno(linux.access(p, linux.X_OK)) != .SUCCESS) return error.SatelliteNotExecutable;
         break :blk p;
     };
-    const display = xwayland.claim("/tmp", true) catch |err| {
+    const claimed: xwayland.Error!?xwayland.Display = if (exact) |n| xwayland.claimExact("/tmp", n, true) else if (xwayland.claim("/tmp", true)) |d| d else |e| e;
+    const display = claimed catch |err| {
         if (!auto) return err;
         std.log.info("x11: no X display to claim in /tmp ({t}); running without X11 apps", .{err});
+        return null;
+    } orelse {
+        std.log.warn("x11: display :{d} belongs to a live X server (--xwayland-display); running without X11 apps", .{exact.?});
         return null;
     };
 
@@ -968,7 +1035,7 @@ test "the usage text matches the build" {
     try std.testing.expectEqual(build_options.http, has("--host ADDR"));
     try std.testing.expectEqual(build_options.http, has("--web-root DIR"));
     // the synopsis names every mode flag
-    try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--link-on-demand] [--profile MODE] [--external-buffers]"));
+    try std.testing.expect(has("--link SPEC [--buffers MODE] [--display NAME] [--dmabuf MODE] [--xwayland MODE] [--xwayland-display N] [--link-on-demand] [--profile MODE] [--external-buffers]"));
     try std.testing.expect(has("--external-buffers  offer wland_external_buffer_manager_v1"));
     try std.testing.expect(has("--profile MODE   who runs the compositor"));
     try std.testing.expect(has("--link-timeout MS  with --link-on-demand"));
@@ -995,7 +1062,7 @@ test "--version: the build's version, then one token per feature of this build" 
         }
     }.f;
     try std.testing.expectEqual(build_options.http, has(line, "http"));
-    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand", "external-buffers" }) |t|
+    for ([_][]const u8{ "link:fd", "link:unix", "link:vsock", "buffers:copy", "buffers:procfd", "buffers:kwshm", "dmabuf:readback", "dmabuf:virtgpu", "no-fence-wait", "selection_cache", "xwayland", "link-on-demand", "external-buffers", "lodpi", "xwayland-display" }) |t|
         try std.testing.expect(has(line, t));
     try std.testing.expectEqual(build_options.session, has(line, "profile:session"));
     try std.testing.expect(std.mem.indexOf(u8, line, "@fake") == null); // test-only, never offered

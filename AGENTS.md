@@ -187,7 +187,16 @@ any of them (update this list when it does).
 - X11 apps: wlandr claims an X display and starts `xwayland-satellite` (not
   shipped) for the first X client, handing it only the listeners
   (`server/src/xwayland.zig`); `x11 display: :N` is logged before the ready
-  line and left in `<socket>.x11`.
+  line and left in `<socket>.x11`; `--xwayland-display N` claims exactly
+  :N or none (a live server on it: no X, never another number). A start that dies at once refuses the
+  X clients left queued, so it never spins and never gives up.
+- Per-app output scale: `wlandr --lodpi` also listens on `<display>-lodpi`
+  (`lodpi socket:` logged before the ready line); its apps get a CONN_SCALE
+  1 in their CONN_OPEN's message, and the core pins them (`Conn.scale_pin`):
+  every scale an app is told (wl_output scale/mode, preferred_buffer_scale,
+  preferred_scale) goes through `scaleOf`, and dpr changes skip pinned
+  conns. Everything else stays logical. wlandr's own satellite connects
+  there when both are on.
 - Headless chromium: `env -u WAYLAND_DISPLAY` (our socket is often the
   default `wayland-0`).
 - E2E apps are `wland-fixture` modes (`test/fixture/`, Zig on core's wire

@@ -59,7 +59,7 @@ The commands:
 
 ```sh
 wland [serve] [options]                     # start the server
-wland run [--display NAME] <app> [args...]  # launch an app against it
+wland run [--display NAME] [--lodpi] <app> [args...]  # launch an app against it
 ```
 
 Server options:
@@ -72,6 +72,12 @@ Server options:
 - `--xwayland auto|off|PATH` — X11 apps through
   [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite).
   `auto` uses it when installed.
+- `--xwayland-display N` — claim exactly X display `:N` instead of the
+  first free one. If a live X server has it, X11 apps are off.
+- `--lodpi` — also listen on `<display>-lodpi`, for apps that should be
+  shown at scale 1 on a HiDPI screen (see
+  [X11 apps on HiDPI](#x11-apps-on-hidpi---lodpi)). `wland run --lodpi APP`
+  starts an app there.
 - `--web-root DIR` — serve your own page instead of the bundled one.
 
 `wland run` sets everything an app needs: `WAYLAND_DISPLAY`, `DISPLAY` for
@@ -810,18 +816,69 @@ returns `transferToImageBitmap()`: in headless Chrome without
 unkernel, 2026-11). Probe for it once and leave `resolveExternal` out
 when it fails, so apps are not offered buffers the page can't show.
 
+### X11 apps on HiDPI (`--lodpi`)
+
+`--xwayland auto|off|PATH` runs X11 apps through
+[xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite) (not
+shipped; it starts `Xwayland` from `PATH`). The relay claims the first free
+X display in `/tmp` the way an X server does (`/tmp/.X<n>-lock`,
+`/tmp/.X11-unix/X<n>` and its abstract twin), logs `x11 display: :N` before
+the ready line and writes it to `<socket>.x11`. `--xwayland-display N`
+claims exactly `:N` instead, for a machine where a lower number belongs to
+an X server that starts later. If a live X server has `:N`, the relay logs
+it and runs without X11 apps; it never tries another number. Nothing runs until an X
+client connects: then it starts `satellite :N -listenfd 3 [-listenfd 4]`,
+which hands the listeners to Xwayland, so that first client is accepted by
+Xwayland itself. Satellite's output goes to the relay's log; it is killed
+with the relay, and the display is given back. When satellite exits, the
+next X client starts it again. One that exits at startup (no Xwayland, a
+crash; the log says so, with a hint for exit code 127) has the X clients
+that were waiting refused, so each new client gets one new start and
+nothing spins: an Xwayland installed later is picked up by the next client.
+It's on by default for the HTTP server and off with `--link`.
+
+On a HiDPI page (devicePixelRatio 2), satellite asks X apps to draw at 2×
+(`Xft.dpi` 192) and shows their windows at half that size. Apps that scale
+themselves (GTK, Qt) come out crisp; apps that don't (xclock, xeyes, Athena
+and SDL apps, Wine) come out half-size. `--lodpi` fixes the size:
+
+```sh
+wlandr --link vsock:2:PORT --buffers kwshm --xwayland /path/to/xwayland-satellite --lodpi --xwayland-display 1
+```
+
+The relay also listens on `<display>-lodpi` (`wayland-0-lodpi`; logged as
+`lodpi socket: PATH` before the ready line). Apps there are shown output
+scale 1 whatever the page's devicePixelRatio: `wl_output.scale` 1 (its
+mode in logical px), `wp_fractional_scale_v1.preferred_scale` 120 and
+`wl_surface.preferred_buffer_scale` 1. Positions, sizes, input regions and
+pointer coordinates are logical px as for every app, so nothing else
+changes; the page upscales their buffers, so they are the right size but
+softer. Other apps keep the page's scale. With `--xwayland`, the relay's own
+satellite connects there, so every X window is shown at scale 1. To run your
+own satellite there instead, set `WAYLAND_DISPLAY=wayland-0-lodpi`. The
+socket is held and removed with the main one, and `--lodpi` works with every
+`--link`, `--buffers` and `--profile` mode. The relay tells the page with a
+CONN_SCALE frame, which pages older than this feature skip: there, those apps
+see the page's scale. From Node: `startServer({ lodpi: true })` and
+`startRelay({ lodpi: true })`, whose result has `lodpiDisplay`, and
+`xwaylandDisplay: N` for `--xwayland-display`. Both are in releases after
+v0.1.0-261124-3c987e5 (`wlandr --version` lists `lodpi` and
+`xwayland-display`).
+Those releases also drop the old policy that turned X off after three quick
+satellite exits.
+
 `wlandr --version` prints two lines:
 
 ```
 wlandr 0.1.0
-features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland link-on-demand profile:session external-buffers
+features: http link:fd link:unix link:vsock buffers:copy buffers:procfd buffers:kwshm dmabuf:readback dmabuf:virtgpu no-fence-wait selection_cache xwayland link-on-demand profile:session external-buffers lodpi xwayland-display
 ```
 
 The first is the package version the binary was built from. The second
 has one space-separated token per thing this build supports: `http` (the
 HTTP server; absent from the `--link`-only build), each `--link` kind,
 each `--buffers` and `--dmabuf` mode, `no-fence-wait`, `selection_cache`
-(the page clipboard bridge), `xwayland`, `link-on-demand` and `external-buffers`. A token keeps its spelling once
+(the page clipboard bridge), `xwayland`, `link-on-demand`, `external-buffers`, `lodpi` and `xwayland-display`. A token keeps its spelling once
 listed and new ones are only added, so a script can test for a whole
 token, e.g. `case " $(wlandr --version | sed -n 's/^features: //p') " in
 *" dmabuf:virtgpu "*)`. Releases up to v0.1.0-261122-f36330a have no
@@ -897,7 +954,9 @@ authentication.
   neither has run on real GPU hardware yet). Otherwise GL apps render in
   software.
 - X11 apps need xwayland-satellite and Xwayland installed. They can't be
-  maximized.
+  maximized. On HiDPI, X apps that don't scale themselves come out
+  half-size unless the relay runs with `--lodpi`, which shows every X
+  window at scale 1 (upscaled).
 - Drag and drop works between wland apps, not with the host page.
 - The page clipboard bridge carries plain text only, not the middle-click
   (primary) selection, and has not run in Safari. The macOS/iOS keyboard

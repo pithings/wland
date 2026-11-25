@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHeadless } from '../lib/headless.ts';
 import { startRelay, xDisplayOf } from '../lib/index.ts';
-import { app, available } from './support/apps.ts';
+import { app, available, realApps } from './support/apps.ts';
 
 async function until(cond: () => unknown, ms: number, what: string) {
   for (const end = Date.now() + ms; !cond();) {
@@ -123,6 +123,103 @@ exec sleep 60
     rmSync(dir, { recursive: true, force: true });
   }
   assert.ok(!existsSync(`/tmp/.X${n}-lock`) && !existsSync(`/tmp/.X11-unix/X${n}`), 'the X display is given back');
+});
+
+test('startRelay lodpi: apps on <display>-lodpi are shown scale 1 on a scale-2 page, the others scale 2', async () => {
+  const relay = await startRelay({ lodpi: true, onLog() {} });
+  let hl;
+  try {
+    assert.equal(relay.lodpiDisplay, `${relay.display}-lodpi`);
+    assert.ok(existsSync(join(relay.runtimeDir, relay.lodpiDisplay!)), 'bound when startRelay resolves');
+    let opened = false;
+    const h = hl = await createHeadless({ link: relay.link, scale: 2, onEvent(ev) { if (ev.type === 'open') opened = true; } });
+    await until(() => opened, 5000, 'the link to open');
+    // the fixture draws at its preferred_buffer_scale (real weston-fullscreen
+    // doesn't follow it)
+    const full = app('fullscreen');
+    if (realApps || !available(full)) return;
+    const env = { ...process.env, ...relay.env, ...full.env };
+    delete env.DISPLAY;
+    const crisp = spawn(full.cmd, full.args, { env, stdio: 'ignore' });
+    const soft = spawn(full.cmd, full.args, { env: { ...env, WAYLAND_DISPLAY: relay.lodpiDisplay! }, stdio: 'ignore' });
+    try {
+      const tops = () => h.windows().map((w) => h.surfaces().find((s) => s.conn === w.conn && s.surface === w.surface)!).filter((s) => s?.width > 0);
+      await until(() => tops().length === 2, 10000, 'both windows');
+      const [a, b] = tops().sort((x, y) => y.width - x.width);
+      // same logical size; the lodpi one's buffer is 1:1, the page upscales it
+      assert.deepEqual([a.width, a.height, a.logicalWidth, a.logicalHeight], [800, 600, 400, 300]);
+      assert.deepEqual([b.width, b.height, b.logicalWidth, b.logicalHeight], [400, 300, 400, 300]);
+    } finally {
+      crisp.kill();
+      soft.kill();
+    }
+  } finally {
+    if (hl) hl.dispose();
+    await relay.close();
+  }
+  assert.ok(!existsSync(relay.runtimeDir));
+});
+
+test('startRelay xwayland + lodpi: satellite connects to the lodpi socket; one that dies at startup refuses its X client and starts again for the next', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wland-fakesat-'));
+  const out = join(dir, 'started');
+  const fake = join(dir, 'xwayland-satellite');
+  // no Xwayland: it records how it was run, then exits 127 at once
+  writeFileSync(fake, `#!/bin/sh\necho "$WAYLAND_DISPLAY" >> ${out}\nexit 127\n`);
+  chmodSync(fake, 0o755);
+  let log = '';
+  const relay = await startRelay({ xwayland: fake, lodpi: true, onLog(t) { log += t; } });
+  const n = relay.xDisplay!.slice(1);
+  const starts = () => (existsSync(out) ? readFileSync(out, 'utf8').trim().split('\n') : []);
+  // an X client: resolves when the relay refuses it (EOF)
+  const refused = () => new Promise<void>((done) => {
+    const c = connect(`/tmp/.X11-unix/X${n}`);
+    c.on('error', () => done());
+    c.on('close', () => done());
+    c.resume();
+  });
+  try {
+    await refused();
+    assert.deepEqual(starts(), [relay.lodpiDisplay], 'started once, on the lodpi socket');
+    await until(() => /refused 1 waiting X client/.test(log), 5000, 'the refusal to be logged');
+    assert.match(log, /exited at startup \(code 127\): is Xwayland installed\?/);
+    await refused();
+    await refused();
+    await until(() => starts().length === 3, 5000, 'a start per client');
+    assert.ok(existsSync(`/tmp/.X11-unix/X${n}`), 'X stays on');
+  } finally {
+    await relay.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('startRelay xwaylandDisplay: exactly that X display; taken by a live server, no X at all (no other number)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wland-fakesat-'));
+  const fake = join(dir, 'xwayland-satellite');
+  writeFileSync(fake, '#!/bin/sh\nexec sleep 60\n');
+  chmodSync(fake, 0o755);
+  const free = (n: number) => !existsSync(`/tmp/.X${n}-lock`) && !existsSync(`/tmp/.X11-unix/X${n}`);
+  let n = 40;
+  while (!free(n)) n++;
+  let log = '';
+  const a = await startRelay({ xwayland: fake, xwaylandDisplay: n, onLog() {} });
+  try {
+    assert.equal(a.xDisplay, `:${n}`);
+    assert.equal(xDisplayOf(a.socketPath), `:${n}`);
+    const b = await startRelay({ xwayland: fake, xwaylandDisplay: n, onLog(t) { log += t; } });
+    try {
+      assert.equal(b.xDisplay, undefined, 'no fallback to another display');
+      assert.equal(xDisplayOf(b.socketPath), undefined);
+      assert.match(log, new RegExp(`display :${n} belongs to a live X server`));
+    } finally {
+      await b.close();
+    }
+    assert.ok(existsSync(`/tmp/.X11-unix/X${n}`), "the second relay left the first's display alone");
+  } finally {
+    await a.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.ok(free(n), 'given back');
 });
 
 test('startRelay: no X display unless asked', async () => {

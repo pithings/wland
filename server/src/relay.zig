@@ -308,15 +308,17 @@ pub fn listenWayland(io: Io, socket_path: []const u8) !Io.net.Server {
     return uaddr.listen(io, .{});
 }
 
-/// Wayland accept loop (blocks forever), one thread per app.
-pub fn serveWayland(relay: *Relay, listener: *Io.net.Server) void {
+/// Wayland accept loop (blocks forever), one thread per app. `scale`: the
+/// output scale this socket's apps are shown, whatever the page's (a
+/// CONN_SCALE after each CONN_OPEN; `--lodpi`: 1), 0 = the page's.
+pub fn serveWayland(relay: *Relay, listener: *Io.net.Server, scale: u32) void {
     const io = relay.io;
     while (true) {
         const app = listener.accept(io) catch |err| {
             std.log.err("wayland accept failed: {t}", .{err});
             continue;
         };
-        const thread = std.Thread.spawn(.{}, serveApp, .{ relay, app }) catch |err| {
+        const thread = std.Thread.spawn(.{}, serveAppScaled, .{ relay, app, scale }) catch |err| {
             std.log.err("spawn failed: {t}", .{err});
             app.close(io);
             continue;
@@ -647,6 +649,12 @@ const SurfaceState = struct {
 /// if needed), then relay until either side goes away. Public so tests can
 /// drive a conn over a socketpair without a listener.
 pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
+    serveAppScaled(relay, app_stream, 0);
+}
+
+/// serveApp for an app shown output scale `scale` (0: the page's); see
+/// serveWayland.
+pub fn serveAppScaled(relay: *Relay, app_stream: Io.net.Stream, scale: u32) void {
     const io = relay.io;
     const gpa = relay.gpa;
     const app = gpa.create(AppLink) catch {
@@ -697,8 +705,13 @@ pub fn serveApp(relay: *Relay, app_stream: Io.net.Stream) void {
 
     var conn: AppConn = .init(relay, conn_id, app, link);
     std.log.info("app conn {d} attached", .{conn_id});
-    const open_frame = stream.encodeConnFrame(.conn_open, conn_id);
-    link.send(&open_frame) catch {};
+    // a pinned scale rides in the same message, before the app's first
+    // request (an engine that predates CONN_SCALE drops just that frame:
+    // the app then sees the page's scale)
+    var open_frame: [5 + stream.conn_scale_len]u8 = undefined;
+    open_frame[0..5].* = stream.encodeConnFrame(.conn_open, conn_id);
+    open_frame[5..].* = stream.encodeConnScale(conn_id, scale);
+    link.send(open_frame[0 .. if (scale != 0) open_frame.len else 5]) catch {};
 
     if (conn.objects.put(gpa, 1, core.protocol.find("wl_display").?, 1)) {
         appReadLoop(&conn) catch |err| switch (err) {

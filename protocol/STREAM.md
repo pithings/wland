@@ -150,6 +150,7 @@ Behavioural differences from the WS transport:
 | 0x0c | FEATURE | relay→engine | all |
 | 0x0d | DMABUF_CREATED | engine→relay | all (dmabuf) |
 | 0x0e | PRESENTED | engine→relay | all |
+| 0x12 | CONN_SCALE | relay→engine | all |
 
 ### 0x01 WIRE — wayland wire bytes (either direction)
 
@@ -234,6 +235,30 @@ server→browser: the app hung up; browser drops all state for conn_id,
 including closing every handle of that conn (no HANDLE_CLOSE is sent for
 them). browser→server: compositor wants the app gone (fatal protocol error);
 server closes the unix socket.
+
+### 0x12 CONN_SCALE — the output scale one app is shown (server→browser)
+
+```
+u8  type = 0x12
+u32 conn_id
+u32 scale             ← integer output scale, 0 = the page's again
+```
+
+The compositor shows app `conn_id` output scale `scale` (clamped to 1…4)
+whatever the page's devicePixelRatio: `wl_output.scale` and its mode
+(desktop × scale hardware px), `wl_surface.preferred_buffer_scale`, and
+`wp_fractional_scale_v1.preferred_scale` (scale × 120). The page's dpr
+changes pass it by, and 0 makes it follow them again. What it was already
+told is sent again when the scale it sees changes. Nothing else does:
+positions, sizes, input and the app's buffer scale stay what they are, so
+a scale-1 app on a dpr-2 page has its buffers drawn upscaled, at the right
+size. wlandr sends it for an app of its `--lodpi` socket (scale 1), in the
+same message as the app's CONN_OPEN and right after it, before any of the
+app's frames. A conn that isn't open is ignored. An engine that predates
+the frame can't frame it and drops what follows in that message (nothing
+does). The CONN_OPEN before it is applied, and the app sees the page's
+scale. With `--profile session` the relay's own compositor applies it and
+viewers are not sent it.
 
 ### 0x05 FDMSG — fd-carrying wire message (M3+)
 

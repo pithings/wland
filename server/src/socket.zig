@@ -42,7 +42,8 @@ pub const Claim = struct {
         return self.path_buf[self.name_start..self.path_len];
     }
 
-    fn lockPath(self: *const Claim) [*:0]const u8 {
+    /// `<path>.lock`.
+    pub fn lockPath(self: *const Claim) [*:0]const u8 {
         return @ptrCast(&self.lock_buf);
     }
 
@@ -94,13 +95,13 @@ pub fn removeOnSignal(c: *const Claim) void {
 }
 
 /// Other files of this process that go at exit, with the socket (the X11
-/// display's lock and socket, the `.x11` note): NUL-terminated, in static
-/// memory for the signal handler.
-var extras: [4][128]u8 = @splat(@splat(0));
+/// display's lock and socket, the `.x11` note, the --lodpi socket and its
+/// lock): NUL-terminated, in static memory for the signal handler.
+var extras: [8][128]u8 = @splat(@splat(0));
 var extras_len: std.atomic.Value(usize) = .init(0);
 
 /// Remove `path` too when the claim is removed (a normal return or a
-/// terminating signal). At most 4, each under 128 bytes; more are ignored.
+/// terminating signal). At most 8, each under 128 bytes; more are ignored.
 pub fn removeAtExit(path: []const u8) void {
     const i = extras_len.load(.seq_cst);
     if (i >= extras.len or path.len >= extras[i].len) return;

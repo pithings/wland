@@ -568,6 +568,24 @@ approach shows up.
     container. X windows still can't maximize (satellite advertises only
     `_NET_WM_STATE_FULLSCREEN`); whether satellite turns an X iconify
     request into `set_minimized` is unknown (unverified either way).
+  - HiDPI, `--lodpi` (2026-11-25, asked for by unkernel): satellite gives
+    X the device pixels (`Xft.dpi` = 96 × scale, viewport dest = size /
+    scale), so X apps that don't scale themselves (xclock, Xaw, SDL, Wine)
+    came out half-size at dpr 2. With `--lodpi` the relay listens on
+    `<display>-lodpi` too and pins that socket's apps to scale 1 (STREAM
+    CONN_SCALE → core `Conn.scale_pin`, `scaleOf`), and its own satellite
+    connects there: every X window is upscaled to the right size. A side
+    effect is that the X screen is the desk's logical size, which settles
+    the fractional-dpr mode question above for that mode. The launcher
+    no longer gives up after 3 quick exits: it refuses the X clients a
+    failed start leaves queued, so the next client starts it again (an
+    Xwayland installed later works). Checked with the fixtures and a
+    stand-in satellite only; real satellite + xclock on a dpr-2 page is
+    unkernel's to confirm. `--xwayland-display N` came with it: unkernel's
+    `:0` is a KMS Xorg started later, only when X0 is absent, so the relay
+    (up at boot) must not take it; exactly :N or no X. A page-side API (pin a conn from the embedder)
+    would be a small addition: `setConnScale` exists; there's no export
+    or CALL yet.
   - no xdg_activation → `_NET_ACTIVE_WINDOW` requests are dropped (inferred).
   - untested: X ⇄ Wayland dnd, INCR-sized transfers, pointer-lock apps
     (satellite's own relative-pointer / constraints use).

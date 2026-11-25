@@ -103,12 +103,18 @@ pub const Loop = struct {
 
     /// A new app connection (the relay sends CONN_OPEN once it registers).
     pub fn connect(self: *Loop) !*Client {
+        return self.connectScaled(0);
+    }
+
+    /// connect, as an app of a socket whose apps are shown output scale
+    /// `scale` (0: the page's; `--lodpi`: 1).
+    pub fn connectScaled(self: *Loop, scale: u32) !*Client {
         std.debug.assert(self.n_clients < max_clients);
         const fds = try socketpair();
         const c = &self.clients[self.n_clients];
         c.* = .{ .gpa = self.gpa, .fd = fds[1] };
         const app: Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = undefined } };
-        self.app_threads[self.n_clients] = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &self.relay, app });
+        self.app_threads[self.n_clients] = try std.Thread.spawn(.{}, relay_mod.serveAppScaled, .{ &self.relay, app, scale });
         self.n_clients += 1;
         return c;
     }
@@ -636,6 +642,7 @@ pub const Engine = struct {
             rest = rest[p.consumed..];
             switch (p.frame) {
                 .conn_open => |id| try self.comp.connOpen(id),
+                .conn_scale => |c| self.comp.setConnScale(c.conn_id, c.scale),
                 .conn_close => |id| {
                     self.comp.connClose(id);
                     self.dropConn(id);

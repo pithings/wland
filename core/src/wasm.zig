@@ -583,6 +583,7 @@ export fn wland_on_frame(ptr: [*]const u8, len: usize) void {
         if (p.frame != .feature) features_settled = true;
         switch (p.frame) {
             .conn_open => |conn_id| compositor.connOpen(conn_id) catch |err| logf("conn_open: {t}", .{err}),
+            .conn_scale => |c| compositor.setConnScale(c.conn_id, c.scale),
             .conn_close => |conn_id| {
                 compositor.connClose(conn_id);
                 js_conn_close(conn_id);

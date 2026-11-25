@@ -261,6 +261,9 @@ pub const Session = struct {
                 c.connOpen(conn_id) catch |err| std.log.err("session: conn_open {d}: {t}", .{ conn_id, err });
                 self.forward(bytes);
             },
+            // the compositor is here: a viewer is sent the scene it makes,
+            // not the pin
+            .conn_scale => |cs| c.setConnScale(cs.conn_id, cs.scale),
             .conn_close => |conn_id| {
                 c.connClose(conn_id);
                 self.forward(bytes);

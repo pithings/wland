@@ -889,6 +889,10 @@ const Drag = struct {
 const Conn = struct {
     objects: objects.ObjectMap = .{},
     serial: u32 = 0,
+    /// The output scale this app is shown, pinned (1…4) whatever the page's
+    /// (`setConnScale`; a CONN_SCALE: wlandr `--lodpi` pins 1); 0 = the
+    /// page's (`output_scale`, `scale_120`). See `scaleOf`.
+    scale_pin: i32 = 0,
     surfaces: std.AutoHashMapUnmanaged(u32, Surface) = .empty,
     /// a subsurface's current stack (z), parent or role changed since the
     /// cached ranks (`Surface.z_rank`) were computed (restacked)
@@ -3807,7 +3811,7 @@ pub const Compositor = struct {
             });
             self.sendOutputMode(conn_id, id);
             if (version >= 2) {
-                self.sendEvent(conn_id, id, "wl_output", "scale", &.{.{ .int = self.output_scale }});
+                self.sendEvent(conn_id, id, "wl_output", "scale", &.{.{ .int = self.scaleOf(conn).int }});
                 if (version >= 4) {
                     // name/description precede done (v4); name is stable, so
                     // it's only ever sent here, not on the live-mode resend
@@ -3857,9 +3861,10 @@ pub const Compositor = struct {
     /// wl_output.mode = the real desktop size in hardware px (logical × scale),
     /// current | preferred. Sent on bind and re-sent on desktop resize.
     fn sendOutputMode(self: *Compositor, conn_id: u32, output_id: u32) void {
+        const scale = self.scaleOfId(conn_id).int;
         self.sendEvent(conn_id, output_id, "wl_output", "mode", &.{
             .{ .uint = 0x1 | 0x2 }, // current | preferred
-            .{ .int = self.desk_w *| self.output_scale }, .{ .int = self.desk_h *| self.output_scale },
+            .{ .int = self.desk_w *| scale }, .{ .int = self.desk_h *| scale },
             .{ .int = 60000 },
         });
     }
@@ -5482,8 +5487,53 @@ pub const Compositor = struct {
 
     fn sendPreferredScale(self: *Compositor, conn_id: u32, frac_id: u32) void {
         self.sendEvent(conn_id, frac_id, "wp_fractional_scale_v1", "preferred_scale", &.{
-            .{ .uint = @intCast(@max(1, self.scale_120)) },
+            .{ .uint = @intCast(self.scaleOfId(conn_id).s120) },
         });
+    }
+
+    /// The scale an app is shown: the integer one (wl_output.scale, its
+    /// mode's hardware px, preferred_buffer_scale) and the fractional one in
+    /// 120ths (preferred_scale) — its pin's, else the page's.
+    const ConnScale = struct { int: i32, s120: i32 };
+    fn scaleOf(self: *const Compositor, conn: *const Conn) ConnScale {
+        if (conn.scale_pin != 0) return .{ .int = conn.scale_pin, .s120 = conn.scale_pin * fractional_scale_denom };
+        return .{ .int = self.output_scale, .s120 = @max(1, self.scale_120) };
+    }
+    fn scaleOfId(self: *const Compositor, conn_id: u32) ConnScale {
+        const conn = self.conns.get(conn_id) orelse return .{ .int = self.output_scale, .s120 = @max(1, self.scale_120) };
+        return self.scaleOf(conn);
+    }
+
+    /// Embedder (a CONN_SCALE): show app `conn_id` output scale `scale`
+    /// (clamped 1…4) whatever the page's devicePixelRatio, or the page's
+    /// again (0). Its buffers are then drawn like any app's at that scale
+    /// (a scale-1 app on a HiDPI page: upscaled, the right size); positions,
+    /// sizes and input stay logical. What it was already told is resent
+    /// when the scale it sees changed, as on a dpr change.
+    pub fn setConnScale(self: *Compositor, conn_id: u32, scale: u32) void {
+        const conn = self.conns.get(conn_id) orelse return;
+        const before = self.scaleOf(conn);
+        conn.scale_pin = if (scale == 0) 0 else @intCast(@min(scale, 4));
+        const after = self.scaleOf(conn);
+        if (before.int == after.int and before.s120 == after.s120) return;
+        self.resendScale(conn_id, conn, before.int != after.int);
+    }
+
+    /// What tells one app its scale, sent again: preferred_scale to every
+    /// fractional object, preferred_buffer_scale/transform to every v6
+    /// surface, and (`int_changed`) the wl_output scale + mode.
+    fn resendScale(self: *Compositor, conn_id: u32, conn: *Conn, int_changed: bool) void {
+        var fit = conn.frac_scales.keyIterator();
+        while (fit.next()) |frac_id| self.sendPreferredScale(conn_id, frac_id.*);
+        self.sendPreferredBufferScaleAll(conn_id, conn);
+        if (int_changed) {
+            const scale = self.scaleOf(conn).int;
+            for (conn.output_ids.items) |oid| {
+                self.sendEvent(conn_id, oid, "wl_output", "scale", &.{.{ .int = scale }});
+                self.sendOutputMode(conn_id, oid);
+                self.sendEvent(conn_id, oid, "wl_output", "done", &.{});
+            }
+        }
     }
 
     /// Embedder: the browser devicePixelRatio changed (matchMedia resolution
@@ -5491,8 +5541,9 @@ pub const Compositor = struct {
     /// `scale_120` the fractional preferred scale (round(dpr × 120)). Resend
     /// wp_fractional_scale preferred_scale to every fractional object,
     /// wl_compositor v6 preferred_buffer_scale/transform to every v6 surface,
-    /// and (when the integer scale changed) the wl_output scale + mode. This
-    /// is what removes the reload-on-dpr-change limit.
+    /// and (when the integer scale changed) the wl_output scale + mode —
+    /// to every app but a pinned one (`setConnScale`). This is what removes
+    /// the reload-on-dpr-change limit.
     pub fn setScale(self: *Compositor, output_scale: i32, scale_120: i32) void {
         const os = std.math.clamp(output_scale, 1, 4);
         const s120 = @max(1, scale_120);
@@ -5502,18 +5553,9 @@ pub const Compositor = struct {
         self.scale_120 = s120;
         var it = self.conns.iterator();
         while (it.next()) |kv| {
-            const conn_id = kv.key_ptr.*;
-            const conn = kv.value_ptr.*;
-            var fit = conn.frac_scales.keyIterator();
-            while (fit.next()) |frac_id| self.sendPreferredScale(conn_id, frac_id.*);
-            self.sendPreferredBufferScaleAll(conn_id, conn);
-            if (scale_changed) {
-                for (conn.output_ids.items) |oid| {
-                    self.sendEvent(conn_id, oid, "wl_output", "scale", &.{.{ .int = self.output_scale }});
-                    self.sendOutputMode(conn_id, oid);
-                    self.sendEvent(conn_id, oid, "wl_output", "done", &.{});
-                }
-            }
+            // a pinned app's scale didn't change
+            if (kv.value_ptr.*.scale_pin != 0) continue;
+            self.resendScale(kv.key_ptr.*, kv.value_ptr.*, scale_changed);
         }
     }
 
@@ -5521,7 +5563,7 @@ pub const Compositor = struct {
     /// non-fractional clients) + preferred_buffer_transform (normal) for one
     /// surface. Sent at creation and on dpr change.
     fn sendPreferredBuffer(self: *Compositor, conn_id: u32, surface_id: u32) void {
-        self.sendEvent(conn_id, surface_id, "wl_surface", "preferred_buffer_scale", &.{.{ .int = self.output_scale }});
+        self.sendEvent(conn_id, surface_id, "wl_surface", "preferred_buffer_scale", &.{.{ .int = self.scaleOfId(conn_id).int }});
         self.sendEvent(conn_id, surface_id, "wl_surface", "preferred_buffer_transform", &.{.{ .uint = 0 }}); // normal
     }
 
@@ -7291,6 +7333,82 @@ test "wl_compositor v6: preferred_buffer_scale/transform on create + dpr resend"
     sink.events.clearRetainingCapacity();
     try comp.onWire(1, wire.encodeMessage(&buf, 4, 0, &.{.{ .new_id = 7 }})); // create_surface on v5
     try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+}
+
+test "setConnScale: a pinned app sees its scale everywhere, dpr changes pass it by, unpinning resends" {
+    var sink: TestSink = undefined;
+    var comp = testSetup(&sink);
+    defer comp.deinit();
+    defer sink.events.deinit(sink.gpa);
+    comp.output_scale = 2;
+    comp.scale_120 = 240; // a retina page
+
+    const output_scale_op = comptime protocol.find("wl_output").?.eventIndex("scale").?;
+    const mode_op = comptime protocol.find("wl_output").?.eventIndex("mode").?;
+    const pbs_op = comptime protocol.find("wl_surface").?.eventIndex("preferred_buffer_scale").?;
+    const H = struct {
+        /// conn's last wl_output.scale, mode width, preferred_buffer_scale
+        /// and preferred_scale in the sink (-1: none)
+        const Seen = struct { scale: i32 = -1, mode_w: i32 = -1, pbs: i32 = -1, frac: i64 = -1 };
+        fn seen(s: *TestSink, conn: u32) !Seen {
+            var r: Seen = .{};
+            var vals: [wire.max_args]wire.Value = undefined;
+            for (s.events.items) |ev| {
+                if (ev.conn_id != conn) continue;
+                const body = ev.bytes[wire.header_size..ev.len];
+                if (ev.object_id == 4 and ev.opcode == output_scale_op) {
+                    r.scale = (try wire.decodeArgs(body, &.{.int}, &vals))[0].int;
+                } else if (ev.object_id == 4 and ev.opcode == mode_op) {
+                    r.mode_w = (try wire.decodeArgs(body, &.{ .uint, .int, .int, .int }, &vals))[1].int;
+                } else if (ev.object_id == 6 and ev.opcode == pbs_op) {
+                    r.pbs = (try wire.decodeArgs(body, &.{.int}, &vals))[0].int;
+                } else if (ev.object_id == 7 and ev.opcode == 0) {
+                    r.frac = (try wire.decodeArgs(body, &.{.uint}, &vals))[0].uint;
+                }
+            }
+            return r;
+        }
+    };
+
+    var buf: [128]u8 = undefined;
+    // conn 1 pinned to 1 before its first request (as a CONN_SCALE does);
+    // conn 2 follows the page. Both: wl_compositor v6, wl_output v4, the
+    // fractional manager, a surface (6) and its fractional object (7).
+    try comp.connOpen(1);
+    comp.setConnScale(1, 1);
+    comp.setConnScale(99, 1); // no such conn: nothing
+    try comp.connOpen(2);
+    sink.events.clearRetainingCapacity();
+    for ([_]u32{ 1, 2 }) |c| {
+        try comp.onWire(c, wire.encodeMessage(&buf, 1, 1, &.{.{ .new_id = 2 }})); // get_registry
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 1 }, .{ .new_id_dynamic = .{ .interface = "wl_compositor", .version = 6, .id = 3 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 5 }, .{ .new_id_dynamic = .{ .interface = "wl_output", .version = 4, .id = 4 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 2, 0, &.{ .{ .uint = 11 }, .{ .new_id_dynamic = .{ .interface = "wp_fractional_scale_manager_v1", .version = 1, .id = 5 } } }));
+        try comp.onWire(c, wire.encodeMessage(&buf, 3, 0, &.{.{ .new_id = 6 }})); // create_surface
+        try comp.onWire(c, wire.encodeMessage(&buf, 5, 1, &.{ .{ .new_id = 7 }, .{ .object = 6 } })); // get_fractional_scale
+    }
+    try std.testing.expectEqual(H.Seen{ .scale = 1, .mode_w = output_width, .pbs = 1, .frac = 120 }, try H.seen(&sink, 1));
+    try std.testing.expectEqual(H.Seen{ .scale = 2, .mode_w = output_width * 2, .pbs = 2, .frac = 240 }, try H.seen(&sink, 2));
+    // sizes stay logical: what it attaches at scale 1 is its logical size
+    try std.testing.expectEqual(@as(i32, 1), comp.surfaceScale(1, 6));
+
+    // the page goes to dpr 3: conn 2 is told, conn 1 hears nothing
+    sink.events.clearRetainingCapacity();
+    comp.setScale(3, 360);
+    try std.testing.expectEqual(H.Seen{}, try H.seen(&sink, 1));
+    try std.testing.expectEqual(H.Seen{ .scale = 3, .mode_w = output_width * 3, .pbs = 3, .frac = 360 }, try H.seen(&sink, 2));
+
+    // pinning to what it already sees resends nothing; unpinning tells it
+    // the page's scale; a pin above 4 is 4
+    sink.events.clearRetainingCapacity();
+    comp.setConnScale(1, 1);
+    try std.testing.expectEqual(@as(usize, 0), sink.events.items.len);
+    comp.setConnScale(1, 0);
+    try std.testing.expectEqual(H.Seen{ .scale = 3, .mode_w = output_width * 3, .pbs = 3, .frac = 360 }, try H.seen(&sink, 1));
+    try std.testing.expectEqual(H.Seen{}, try H.seen(&sink, 2));
+    sink.events.clearRetainingCapacity();
+    comp.setConnScale(2, 9);
+    try std.testing.expectEqual(H.Seen{ .scale = 4, .mode_w = output_width * 4, .pbs = 4, .frac = 480 }, try H.seen(&sink, 2));
 }
 
 test "wp_fractional_scale: preferred_scale on bind, resend on dpr change, exists error" {

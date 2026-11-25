@@ -2449,6 +2449,7 @@ function frameLen(dv: DataView, off: number, total: number): number {
     case FRAME_HANDLE_OPEN: return room < 17 ? -1 : 17 + u32(off + 13);
     case 0x09: case 0x0b: return 9;                                      // HANDLE_CLOSE, ACK
     case 0x0c: return room < 9 ? -1 : 9 + u32(off + 5);                  // FEATURE
+    case 0x12: return 9;                                                 // CONN_SCALE
     case FRAME_CALL: case FRAME_EVENT: return room < 7 ? -1 : 7 + u32(off + 3);
     case FRAME_SURFACE: return SURFACE_LEN;
     case FRAME_COMMIT: return room < 25 ? -1 : 25 + u32(off + 21) + u32(off + 13) * 16;

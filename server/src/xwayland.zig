@@ -72,6 +72,12 @@ pub fn claim(root: []const u8, abstract: bool) Error!Display {
     return error.NoFreeDisplay;
 }
 
+/// Claim exactly display `n` under `root` (`--xwayland-display`); null:
+/// a live X server has it (no other number is tried).
+pub fn claimExact(root: []const u8, n: u32, abstract: bool) Error!?Display {
+    return tryClaim(root, n, abstract);
+}
+
 /// null: display `n` is someone's.
 fn tryClaim(root: []const u8, n: u32, abstract: bool) Error!?Display {
     var d: Display = .{ .n = n, .unix_fd = -1 };
@@ -193,18 +199,15 @@ pub const Launcher = struct {
     }
 
     /// Thread body: wait for an X client, run satellite until it exits,
-    /// repeat. A satellite that keeps dying at once (3 runs under 3 s each)
-    /// is given up on, and the display released: X clients are then refused
-    /// instead of left hanging.
+    /// repeat — for as long as wlandr runs. A satellite that exits at
+    /// startup (under 3 s: no Xwayland, a crash) leaves the X clients that
+    /// started it unaccepted; they are refused (accepted and closed here),
+    /// so the next start is the next client's: one start per connection,
+    /// never a spin, and an Xwayland installed later is picked up then.
     pub fn run(self: *Launcher) void {
-        var quick_exits: u32 = 0;
         while (true) {
-            var fds = [2]linux.pollfd{
-                .{ .fd = self.display.unix_fd, .events = linux.POLL.IN, .revents = 0 },
-                .{ .fd = self.display.abstract_fd, .events = linux.POLL.IN, .revents = 0 },
-            };
-            const nfds: usize = if (self.display.abstract_fd >= 0) 2 else 1;
-            switch (linux.errno(linux.poll(&fds, nfds, -1))) {
+            var fds = self.pollFds();
+            switch (linux.errno(linux.poll(&fds, self.nfds(), -1))) {
                 .SUCCESS => {},
                 .INTR => continue,
                 else => |e| {
@@ -220,20 +223,53 @@ pub const Launcher = struct {
             std.log.info("x11: an X client connected to :{d}; started xwayland-satellite (pid {d})", .{ self.display.n, pid });
             var status: u32 = 0;
             while (linux.errno(linux.wait4(pid, &status, 0, null)) == .INTR) {}
+            const quick = monotonicMs() - started < 3000;
             if (status & 0x7f == 0) {
-                std.log.info("x11: xwayland-satellite exited (code {d})", .{(status >> 8) & 0xff});
+                const code = (status >> 8) & 0xff;
+                if (quick) {
+                    std.log.warn("x11: xwayland-satellite exited at startup (code {d}){s}", .{ code, if (code == 127) ": is Xwayland installed?" else "" });
+                } else std.log.info("x11: xwayland-satellite exited (code {d})", .{code});
             } else {
                 std.log.info("x11: xwayland-satellite killed (signal {d})", .{status & 0x7f});
             }
-            if (monotonicMs() - started < 3000) {
-                quick_exits += 1;
-                if (quick_exits >= 3) {
-                    std.log.err("x11: xwayland-satellite keeps exiting at startup; X11 apps are off (is Xwayland installed?)", .{});
-                    return self.display.release();
-                }
-                sleepMs(500);
-            } else quick_exits = 0;
+            if (quick) {
+                const n = self.refuseWaiting();
+                if (n > 0) std.log.info("x11: refused {d} waiting X client(s); the next one starts it again", .{n});
+                sleepMs(200);
+            }
         }
+    }
+
+    fn pollFds(self: *const Launcher) [2]linux.pollfd {
+        return .{
+            .{ .fd = self.display.unix_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = self.display.abstract_fd, .events = linux.POLL.IN, .revents = 0 },
+        };
+    }
+
+    fn nfds(self: *const Launcher) usize {
+        return if (self.display.abstract_fd >= 0) 2 else 1;
+    }
+
+    /// Accept and close every connection queued on the listeners (each
+    /// client reads EOF: refused). How many.
+    fn refuseWaiting(self: *Launcher) u32 {
+        var n: u32 = 0;
+        while (n < 1024) {
+            var fds = self.pollFds();
+            if (linux.errno(linux.poll(&fds, self.nfds(), 0)) != .SUCCESS) return n;
+            var any = false;
+            for (fds[0..self.nfds()]) |f| {
+                if (f.revents & linux.POLL.IN == 0) continue;
+                const rc = linux.accept4(f.fd, null, null, linux.SOCK.CLOEXEC);
+                if (linux.errno(rc) != .SUCCESS) continue;
+                _ = linux.close(@intCast(rc));
+                n += 1;
+                any = true;
+            }
+            if (!any) return n;
+        }
+        return n;
     }
 
     /// fork + exec; the child's pid, or null if fork failed.
@@ -350,6 +386,21 @@ test "claim: a dead owner's lock is replaced; a live socket without a lock is le
     try testing.expectEqual(@as(u32, 2), b.n);
     var lock1: [96]u8 = undefined;
     try testing.expect(!exists(try std.fmt.bufPrintZ(&lock1, "{s}/.X1-lock", .{root}))); // backed off without a trace
+}
+
+test "claimExact: that display or none, never another" {
+    var buf: [64]u8 = undefined;
+    const root = try tmpRoot(&buf);
+    defer rmRoot(root);
+
+    var a = (try claimExact(root, 2, false)).?;
+    defer a.release();
+    try testing.expectEqual(@as(u32, 2), a.n);
+    try testing.expect(socket.answers(std.mem.span(a.sockPath())));
+    // :2 is live now: null, and :0/:1 stay untouched
+    try testing.expect((try claimExact(root, 2, false)) == null);
+    var lock0: [96]u8 = undefined;
+    try testing.expect(!exists(try std.fmt.bufPrintZ(&lock0, "{s}/.X0-lock", .{root})));
 }
 
 test "claim: an unusable root is Unavailable" {

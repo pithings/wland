@@ -15,7 +15,10 @@ Where things live and which file owns what. Details are in the code.
 ## `server/src/` — the relay
 
 - `main.zig` CLI (`--port/--host/--web-root` = HTTP+WS; `--link fd:|unix:|vsock:`;
-  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `--no-fence-wait`; `--external-buffers`;
+  `--buffers copy|procfd|kwshm`; `--dmabuf readback|virtgpu[:NODE]`; `--no-fence-wait`; `--external-buffers`; `--lodpi` (a second socket `<display>-lodpi` served by
+  `serveWayland(…, 1)`: CONN_SCALE after each CONN_OPEN; wlandr's own satellite
+  connects there); `--xwayland-display N` (exactly that X display, else no X:
+  `xwayland.claimExact`);
   `--link-on-demand [--link-timeout MS]` (the dial loop `serveStreamLink`, bounded `dialWithin`;
   its state is relay.zig `OnDemand`);
   `--version` (version from package.json via `build.zig`, + a features line);

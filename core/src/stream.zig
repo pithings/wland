@@ -44,6 +44,9 @@ pub const FrameType = enum(u8) {
     /// relay→viewer (session profile): a surface's synchronous state
     /// (`SurfaceFrame`).
     surface = 0x11,
+    /// relay→engine, right after a CONN_OPEN: the output scale that app is
+    /// shown, whatever the page's (wlandr `--lodpi`: 1).
+    conn_scale = 0x12,
 };
 
 /// A damage rect, buffer px.
@@ -588,6 +591,8 @@ pub const Frame = union(FrameType) {
     call: OpFrame,
     event: OpFrame,
     surface: SurfaceFrame,
+    /// `scale` raw: 0 follows the page again; the core clamps the rest.
+    conn_scale: struct { conn_id: u32, scale: u32 },
 };
 
 pub const ParseError = error{ Truncated, UnknownType, BadLength };
@@ -612,7 +617,7 @@ fn u32At(bytes: []const u8, off: usize) u32 {
 pub fn parseNext(bytes: []const u8) ParseError!Parsed {
     if (bytes.len < 1) return error.Truncated;
     const frame_type: FrameType = switch (bytes[0]) {
-        0x01...0x11 => @enumFromInt(bytes[0]),
+        0x01...0x12 => @enumFromInt(bytes[0]),
         else => return error.UnknownType,
     };
     switch (frame_type) {
@@ -777,6 +782,13 @@ pub fn parseNext(bytes: []const u8) ParseError!Parsed {
         .surface => {
             _ = try have(bytes, SurfaceFrame.len);
             return .{ .frame = .{ .surface = SurfaceFrame.decode(bytes[0..SurfaceFrame.len]) }, .consumed = SurfaceFrame.len };
+        },
+        .conn_scale => {
+            _ = try have(bytes, conn_scale_len);
+            return .{ .frame = .{ .conn_scale = .{
+                .conn_id = u32At(bytes, 1),
+                .scale = u32At(bytes, 5),
+            } }, .consumed = conn_scale_len };
         },
     }
 }
@@ -1111,6 +1123,19 @@ pub fn encodeConnFrame(frame_type: FrameType, conn_id: u32) [5]u8 {
     return out;
 }
 
+/// CONN_SCALE: type, conn_id, scale.
+pub const conn_scale_len = 9;
+
+/// CONN_SCALE: app `conn_id` is shown output scale `scale` (an integer;
+/// 0 = the page's again), whatever the page's devicePixelRatio says.
+pub fn encodeConnScale(conn_id: u32, scale: u32) [conn_scale_len]u8 {
+    var out: [conn_scale_len]u8 = undefined;
+    out[0] = @intFromEnum(FrameType.conn_scale);
+    std.mem.writeInt(u32, out[1..5], conn_id, .little);
+    std.mem.writeInt(u32, out[5..9], scale, .little);
+    return out;
+}
+
 /// HANDLE_OPEN fixed part: type, conn_id, handle_id, kind, len.
 pub const handle_open_header_len = 17;
 
@@ -1354,6 +1379,12 @@ test "conn frames" {
     try std.testing.expectEqual(@as(u32, 7), (try parse(&open)).conn_open);
     const close = encodeConnFrame(.conn_close, 7);
     try std.testing.expectEqual(@as(u32, 7), (try parse(&close)).conn_close);
+    const scale = encodeConnScale(7, 1);
+    const p = try parseNext(&scale);
+    try std.testing.expectEqual(@as(usize, conn_scale_len), p.consumed);
+    try std.testing.expectEqual(@as(u32, 7), p.frame.conn_scale.conn_id);
+    try std.testing.expectEqual(@as(u32, 1), p.frame.conn_scale.scale);
+    try std.testing.expectError(error.Truncated, parseNext(scale[0 .. conn_scale_len - 1]));
 }
 
 test "buffer frame roundtrip" {
@@ -1759,7 +1790,7 @@ test "hostile lengths are Truncated, never wrapped" {
     // a call with a huge len
     try std.testing.expectError(error.Truncated, parse(&.{ 0x0f, 1, 0, 0xfc, 0xff, 0xff, 0xff }));
     // the type space ends at 0x11
-    try std.testing.expectError(error.UnknownType, parse(&.{0x12}));
+    try std.testing.expectError(error.UnknownType, parse(&.{0x13}));
     try std.testing.expectError(error.UnknownType, parse(&.{0x00}));
 }
 

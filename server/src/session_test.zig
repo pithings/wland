@@ -125,11 +125,16 @@ const Rig = struct {
     }
 
     fn connect(self: *Rig) !*Client {
+        return self.connectScaled(0);
+    }
+
+    /// An app of a socket whose apps are shown scale `scale` (`--lodpi`).
+    fn connectScaled(self: *Rig, scale: u32) !*Client {
         const fds = try harness.socketpair();
         const c = &self.clients[self.n_clients];
         c.* = .{ .gpa = self.gpa, .fd = fds[1] };
         const app: Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = undefined } };
-        self.app_threads[self.n_clients] = try std.Thread.spawn(.{}, relay_mod.serveApp, .{ &self.relay, app });
+        self.app_threads[self.n_clients] = try std.Thread.spawn(.{}, relay_mod.serveAppScaled, .{ &self.relay, app, scale });
         self.n_clients += 1;
         return c;
     }
@@ -466,6 +471,31 @@ test "session: FEATURE session first, nothing before init, init replays the scen
     try rig.synced(b);
     try expectReplay(gpa, b, 1, conn, w, 0x60);
     try rig.roundtrip(c); // still connected
+}
+
+test "session: an app of the --lodpi socket is shown scale 1 by the relay's compositor while the others follow the viewer's dpr" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    try rig.start(gpa);
+    defer rig.stop();
+    {
+        rig.session.mutex.lockUncancelable(rig.session.io);
+        defer rig.session.mutex.unlock(rig.session.io);
+        rig.session.comp.setScale(2, 240); // what a retina viewer's set_dpr does
+    }
+    const plain = try rig.connect();
+    const lodpi = try rig.connectScaled(1);
+    var seen: [2]i32 = undefined;
+    for ([_]*Client{ plain, lodpi }, 0..) |c, i| {
+        const registry = c.newId();
+        try c.send(1, comptime op("wl_display", .request, "get_registry"), &.{.{ .new_id = registry }});
+        try rig.roundtrip(c);
+        const output = try bind(c, registry, "wl_output", 2);
+        try rig.roundtrip(c);
+        const ev = c.last(output, comptime op("wl_output", .event, "scale")) orelse return error.NoScale;
+        seen[i] = std.mem.readInt(i32, ev.body[0..4], .little);
+    }
+    try std.testing.expectEqual([2]i32{ 2, 1 }, seen);
 }
 
 test "session: a new viewer takes over — the old one's link is closed, the new one gets the scene; the app never notices" {

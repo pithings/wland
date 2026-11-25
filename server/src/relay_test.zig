@@ -182,6 +182,40 @@ test "loop: registry, memfd pool, commit ships BUFFER after its WIRE, release ex
     try std.testing.expectEqualSlices(u8, &.{ 0xcc, 0xbb, 0xaa, 0xff }, t.pixels);
 }
 
+test "loop: an app of a scaled socket (--lodpi) comes with a CONN_SCALE right after its CONN_OPEN: wl_output.scale 1 on a scale-2 page" {
+    var loop: Loop = undefined;
+    try loop.start(std.testing.allocator, .{ .frame_callbacks = .engine });
+    defer loop.stop();
+    loop.engine.comp.output_scale = 2;
+    const plain = try loop.connect();
+    const lodpi = try loop.connectScaled(1);
+
+    const scale_ev = comptime op("wl_output", .event, "scale");
+    var seen: [2]i32 = undefined;
+    for ([_]*Client{ plain, lodpi }, 0..) |c, i| {
+        const registry = c.newId();
+        try c.send(1, comptime op("wl_display", .request, "get_registry"), &.{.{ .new_id = registry }});
+        try loop.roundtrip(c);
+        const output = try bind(c, registry, "wl_output", 2);
+        try loop.roundtrip(c);
+        const ev = c.last(output, scale_ev) orelse return error.NoScale;
+        seen[i] = std.mem.readInt(i32, ev.body[0..4], .little);
+    }
+    try std.testing.expectEqual([2]i32{ 2, 1 }, seen);
+
+    // one CONN_SCALE, for the lodpi conn, right after its CONN_OPEN (one
+    // message: the engine knows before the app's first request)
+    try std.testing.expectEqual(@as(usize, 1), loop.engine.count(.conn_scale));
+    const frames = loop.engine.frames.items;
+    for (frames, 0..) |f, i| {
+        if (f.type != .conn_scale) continue;
+        const cs = f.parse().conn_scale;
+        try std.testing.expectEqual(@as(u32, 1), cs.scale);
+        try std.testing.expectEqual(stream.FrameType.conn_open, frames[i - 1].type);
+        try std.testing.expectEqual(cs.conn_id, frames[i - 1].parse().conn_open);
+    }
+}
+
 test "loop: relay-paced frame callbacks fire without the engine, never twice, and survive surface destroy" {
     var loop: Loop = undefined;
     try loop.start(std.testing.allocator, .{ .frame_callbacks = .relay });

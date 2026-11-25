@@ -89,6 +89,15 @@ export interface ServerOptions {
    *  first X client: `true` if `xwayland-satellite` is on $PATH, `false`
    *  never, a string that binary. Default: `true`. */
   xwayland?: boolean | string;
+  /** With `xwayland` on: claim exactly X display `:N` (wlandr
+   *  `--xwayland-display`) instead of the first free one; if a live X server
+   *  has it, X11 apps are off (logged, `xDisplay` unset). */
+  xwaylandDisplay?: number;
+  /** Also listen on `<display>-lodpi` (wlandr `--lodpi`): apps there are
+   *  shown output scale 1 whatever the page's devicePixelRatio, so the page
+   *  upscales them — for apps that don't scale themselves (X11 apps under an
+   *  xwayland-satellite of your own). Its name: `lodpiDisplay`. */
+  lodpi?: boolean;
   /** The server's log (its stderr), in chunks. Default: written to this
    *  process's stderr. */
   onLog?(text: string): void;
@@ -104,6 +113,9 @@ export interface ServerInfo {
   /** The X display for X11 apps (`:0`), when the server claimed one (see
    *  the `xwayland` option): what DISPLAY should say. */
   xDisplay?: string;
+  /** The `lodpi` option's socket name (`wayland-0-lodpi`): WAYLAND_DISPLAY
+   *  for an app to be shown scale 1. */
+  lodpiDisplay?: string;
   process: ChildProcess;
 }
 
@@ -123,6 +135,13 @@ function readySocket(log: string): string | undefined {
 /** wlandr's `info: x11 display: :N` line, logged before the ready line. */
 function loggedXDisplay(log: string): string | undefined {
   return /x11 display: (:\d+)/.exec(log)?.[1];
+}
+
+/** wlandr's `info: lodpi socket: <path>` line (`--lodpi`), logged before
+ *  the ready line: the socket's name. */
+function loggedLodpi(log: string): string | undefined {
+  const path = /lodpi socket: (\S+)/.exec(log)?.[1];
+  return path ? basename(path) : undefined;
 }
 
 /** `--xwayland` for an `xwayland` option; nothing for wlandr's own default. */
@@ -173,6 +192,8 @@ export function startServer(options: ServerOptions = {}): Promise<ServerInfo> {
   if (options.host) args.push('--host', options.host);
   if (options.display) args.push('--display', options.display);
   args.push(...xwaylandArgs(options.xwayland));
+  if (options.lodpi) args.push('--lodpi');
+  if (options.xwaylandDisplay !== undefined) args.push('--xwayland-display', String(options.xwaylandDisplay));
 
   return new Promise<ServerInfo>((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'pipe'], env: relayEnv(runtimeDir) });
@@ -195,6 +216,7 @@ export function startServer(options: ServerOptions = {}): Promise<ServerInfo> {
         runtimeDir,
         display: basename(socketPath),
         xDisplay: loggedXDisplay(seen),
+        lodpiDisplay: loggedLodpi(seen),
         process: child,
       });
     });
@@ -217,6 +239,15 @@ export interface RelayOptions {
    *  first X client: `true` if `xwayland-satellite` is on $PATH, `false`
    *  never, a string that binary. Default: `false`. */
   xwayland?: boolean | string;
+  /** With `xwayland` on: claim exactly X display `:N` (wlandr
+   *  `--xwayland-display`) instead of the first free one; if a live X server
+   *  has it, X11 apps are off (logged, `xDisplay` unset). */
+  xwaylandDisplay?: number;
+  /** Also listen on `<display>-lodpi` (wlandr `--lodpi`): apps there are
+   *  shown output scale 1 whatever the page's devicePixelRatio, so the page
+   *  upscales them — for apps that don't scale themselves (X11 apps under an
+   *  xwayland-satellite of your own). Its name: `lodpiDisplay`. */
+  lodpi?: boolean;
   /** The relay's log (its stderr), in chunks. Default: written to this
    *  process's stderr; pass `() => {}` to drop it. */
   onLog?(text: string): void;
@@ -235,6 +266,9 @@ export interface RelayInfo {
   /** The X display for X11 apps (`:0`), when the server claimed one (see
    *  the `xwayland` option): what DISPLAY should say. */
   xDisplay?: string;
+  /** The `lodpi` option's socket name (`wayland-0-lodpi`): WAYLAND_DISPLAY
+   *  for an app to be shown scale 1. */
+  lodpiDisplay?: string;
   process: ChildProcess;
   /** Close the link — the relay exits with it, and its apps lose their
    *  compositor — and remove a runtime directory startRelay created.
@@ -277,6 +311,8 @@ export function startRelay(options: RelayOptions = {}): Promise<RelayInfo> {
   const args = ['--link', 'fd:3'];
   if (options.display) args.push('--display', options.display);
   args.push(...xwaylandArgs(options.xwayland));
+  if (options.lodpi) args.push('--lodpi');
+  if (options.xwaylandDisplay !== undefined) args.push('--xwayland-display', String(options.xwaylandDisplay));
 
   return new Promise<RelayInfo>((resolve, reject) => {
     // fd 3: a 'pipe' is a connected unix stream socketpair, which is what
@@ -319,6 +355,7 @@ export function startRelay(options: RelayOptions = {}): Promise<RelayInfo> {
         runtimeDir,
         display,
         xDisplay,
+        lodpiDisplay: loggedLodpi(seen),
         process: child,
         close() {
           sock.destroy();
